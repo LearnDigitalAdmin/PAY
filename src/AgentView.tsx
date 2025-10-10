@@ -17,7 +17,7 @@ import {
   CheckCircle,
   CreditCard,
 } from 'lucide-react';
-import { auth, AuthService, AgentService, type Invoice, type Payment, type AgentAccount } from './Firebase';
+import { auth, AgentService, type Invoice, type Payment, type AgentAccount } from './Firebase';
 import PaymentModal from './PaymentModal';
 
 const AgentView: React.FC = () => {
@@ -41,55 +41,108 @@ const AgentView: React.FC = () => {
   const [accountNumber, setAccountNumber] = useState('');
   const [savingPaymentInfo, setSavingPaymentInfo] = useState(false);
 
-  useEffect(() => {
-    const unsubscribe = AuthService.onAuthChange(async (user) => {
-      if (!user) {
+  // Updated useEffect for AgentView - No longer relies on Firebase Auth
+
+useEffect(() => {
+  const loadAgentData = async () => {
+    try {
+      setLoading(true);
+      
+      // Check localStorage for agent authentication
+      const agentUserStr = localStorage.getItem('agentAuthUser');
+      
+      if (!agentUserStr) {
+        // No agent authenticated, redirect to login
         navigate('/');
         return;
       }
 
+      let agentUser;
       try {
-        setLoading(true);
-        
-        const agent = await AgentService.getAgent(user.uid);
-        if (!agent) {
-          setError('Agent account not found. Please use your PMS credentials.');
-          setTimeout(() => navigate('/'), 3000);
-          return;
-        }
-        
-        setAgentData(agent);
-
-        const fetchedInvoices = await AgentService.getInvoicesByAgent(user.uid);
-        setInvoices(fetchedInvoices);
-
-        const fetchedPayments = await AgentService.getPaymentsByAgent(user.uid);
-        setPayments(fetchedPayments);
-        
-        if (agent.paymentInfo) {
-          setAccountName(agent.paymentInfo.accountName);
-          setBankCode(agent.paymentInfo.bankCode);
-          setAccountNumber(agent.paymentInfo.accountNumber);
-        }
-        
-      } catch (err: any) {
-        console.error('Error loading agent data:', err);
-        setError(err.message || 'Failed to load data');
-      } finally {
-        setLoading(false);
+        agentUser = JSON.parse(agentUserStr);
+      } catch (parseError) {
+        console.error('Error parsing agent user:', parseError);
+        localStorage.removeItem('agentAuthUser');
+        navigate('/');
+        return;
       }
-    });
 
-    return () => unsubscribe();
-  }, [navigate]);
+      // Validate that we have the necessary data
+      if (!agentUser.id || !agentUser.email) {
+        console.error('Invalid agent user data');
+        localStorage.removeItem('agentAuthUser');
+        navigate('/');
+        return;
+      }
+
+      // Fetch agent data from Firestore
+      const agent = await AgentService.getAgent(agentUser.id);
+      
+      if (!agent) {
+        setError('Agent account not found. Please contact support.');
+        localStorage.removeItem('agentAuthUser');
+        setTimeout(() => navigate('/'), 3000);
+        return;
+      }
+      
+      setAgentData(agent);
+
+      // Fetch invoices
+      const fetchedInvoices = await AgentService.getInvoicesByAgent(agentUser.id);
+      setInvoices(fetchedInvoices);
+
+      // Fetch payments
+      const fetchedPayments = await AgentService.getPaymentsByAgent(agentUser.id);
+      setPayments(fetchedPayments);
+      
+      // Load payment info if available
+      if (agent.paymentInfo) {
+        setAccountName(agent.paymentInfo.accountName);
+        setBankCode(agent.paymentInfo.bankCode);
+        setAccountNumber(agent.paymentInfo.accountNumber);
+      }
+      
+    } catch (err: any) {
+      console.error('Error loading agent data:', err);
+      setError(err.message || 'Failed to load data');
+      
+      // If there's an authentication error, redirect to login
+      if (err.message?.includes('permission') || err.message?.includes('unauthorized')) {
+        localStorage.removeItem('agentAuthUser');
+        navigate('/');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  loadAgentData();
+
+  // Listen for storage changes (logout in another tab)
+  const handleStorageChange = (e: StorageEvent) => {
+    if (e.key === 'agentAuthUser' && !e.newValue) {
+      // Agent logged out in another tab
+      navigate('/');
+    }
+  };
+
+  window.addEventListener('storage', handleStorageChange);
+
+  return () => {
+    window.removeEventListener('storage', handleStorageChange);
+  };
+}, [navigate]);
 
   const handleSignOut = async () => {
     try {
-      await AuthService.signOut();
-      navigate('/');
-    } catch (err) {
-      console.error('Sign out error:', err);
-    }
+    // Clear agent session
+    localStorage.removeItem('agentAuthUser');
+    
+    // Navigate to home
+    navigate('/');
+  } catch (err) {
+    console.error('Error logging out:', err);
+  }
   };
 
   const handleTerminalSearch = async () => {

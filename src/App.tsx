@@ -8,6 +8,7 @@ import AgentView from './AgentView';
 import TenantView from './TenantView';
 import Contact from './Contact';
 import { Loader2 } from 'lucide-react';
+import Welcome from './Welcome';
 
 // Protected Route Component
 interface ProtectedRouteProps {
@@ -15,17 +16,76 @@ interface ProtectedRouteProps {
   requiredRole?: 'agent' | 'tenant';
 }
 
-const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
+const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requiredRole }) => {
   const [loading, setLoading] = useState(true);
-  const [user, setUser] = useState<any>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userRole, setUserRole] = useState<'agent' | 'tenant' | null>(null);
 
   useEffect(() => {
-    const unsubscribe = AuthService.onAuthChange((firebaseUser) => {
-      setUser(firebaseUser);
-      setLoading(false);
-    });
+    // Check both Firebase Auth (for tenants) and localStorage (for agents)
+    const checkAuth = () => {
+      // Check for agent authentication in localStorage
+      const agentUser = localStorage.getItem('agentAuthUser');
+      if (agentUser) {
+        try {
+          const parsed = JSON.parse(agentUser);
+          if (parsed.id && parsed.email) {
+            setIsAuthenticated(true);
+            setUserRole('agent');
+            setLoading(false);
+            return;
+          }
+        } catch (e) {
+          console.error('Error parsing agent user:', e);
+          localStorage.removeItem('agentAuthUser');
+        }
+      }
 
-    return () => unsubscribe();
+      // Check Firebase Auth for tenant authentication
+      const unsubscribe = AuthService.onAuthChange((firebaseUser) => {
+        if (firebaseUser) {
+          setIsAuthenticated(true);
+          setUserRole('tenant');
+        } else {
+          setIsAuthenticated(false);
+          setUserRole(null);
+        }
+        setLoading(false);
+      });
+
+      return unsubscribe;
+    };
+
+    const unsubscribe = checkAuth();
+
+    // Also listen for storage changes (in case user logs out in another tab)
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === 'agentAuthUser') {
+        if (!e.newValue) {
+          // Agent logged out
+          setIsAuthenticated(false);
+          setUserRole(null);
+        } else {
+          // Agent logged in
+          try {
+            const parsed = JSON.parse(e.newValue);
+            if (parsed.id && parsed.email) {
+              setIsAuthenticated(true);
+              setUserRole('agent');
+            }
+          } catch (err) {
+            console.error('Error parsing storage change:', err);
+          }
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+      window.removeEventListener('storage', handleStorageChange);
+    };
   }, []);
 
   if (loading) {
@@ -39,8 +99,15 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
     );
   }
 
-  if (!user) {
+  if (!isAuthenticated) {
     return <Navigate to="/" replace />;
+  }
+
+  // If a specific role is required, check it
+  if (requiredRole && userRole !== requiredRole) {
+    // Redirect to correct dashboard based on actual role
+    const redirectPath = userRole === 'agent' ? '/agent' : '/tenant';
+    return <Navigate to={redirectPath} replace />;
   }
 
   return <>{children}</>;
@@ -74,7 +141,8 @@ const App: React.FC = () => {
 
       <Routes>
         {/* Public Routes */}
-        <Route path="/" element={<Auth />} />
+        <Route path="/" element={<Welcome />} />
+        <Route path="/auth" element={<Auth />} />
         <Route path="/signup" element={<Signup />} />
         <Route path="/contact" element={<Contact />} />
 
@@ -82,7 +150,7 @@ const App: React.FC = () => {
         <Route
           path="/agent"
           element={
-            <ProtectedRoute>
+            <ProtectedRoute requiredRole="agent">
               <AgentView />
             </ProtectedRoute>
           }
@@ -90,7 +158,7 @@ const App: React.FC = () => {
         <Route
           path="/tenant"
           element={
-            <ProtectedRoute>
+            <ProtectedRoute requiredRole="tenant">
               <TenantView />
             </ProtectedRoute>
           }
@@ -103,4 +171,6 @@ const App: React.FC = () => {
   );
 };
 
+
 export default App;
+

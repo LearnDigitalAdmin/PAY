@@ -6,7 +6,8 @@ import {
   signInWithPhoneNumber,
   signOut,
   onAuthStateChanged,
-  type User as FirebaseUser
+  type User as FirebaseUser,
+  signInWithEmailAndPassword
 } from 'firebase/auth';
 import { 
   getFirestore, 
@@ -152,6 +153,16 @@ export class AuthService {
       throw new Error('Invalid verification code');
     }
   }
+
+    static async signInWithEmailPassword(email: string, password: string): Promise<FirebaseUser> {
+      try {
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        return userCredential.user;
+      } catch (error: any) {
+        console.error('Email/Password sign in error:', error);
+        throw error;
+      }
+    }
 
   static async signOut(): Promise<void> {
     await signOut(auth);
