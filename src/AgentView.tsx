@@ -1,4 +1,4 @@
-// AgentView.tsx - Agent Dashboard (Complete)
+// AgentView.tsx - Agent Dashboard (Updated)
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
@@ -17,7 +17,7 @@ import {
   CheckCircle,
   CreditCard,
 } from 'lucide-react';
-import { auth, AgentService, type Invoice, type Payment, type AgentAccount } from './Firebase';
+import { AgentService, type Invoice, type Payment, type AgentAccount } from './Firebase';
 import PaymentModal from './PaymentModal';
 
 const AgentView: React.FC = () => {
@@ -36,113 +36,110 @@ const AgentView: React.FC = () => {
   const [error, setError] = useState('');
 
   // Payment Settings State
-  const [accountName, setAccountName] = useState('');
-  const [bankCode, setBankCode] = useState('');
+  const [businessName, setBusinessName] = useState('');
+  const [settlementBank, setSettlementBank] = useState<'mpesa' | 'airtel-ke'>('mpesa');
   const [accountNumber, setAccountNumber] = useState('');
+  const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
   const [savingPaymentInfo, setSavingPaymentInfo] = useState(false);
 
-  // Updated useEffect for AgentView - No longer relies on Firebase Auth
-
-useEffect(() => {
-  const loadAgentData = async () => {
-    try {
-      setLoading(true);
-      
-      // Check localStorage for agent authentication
-      const agentUserStr = localStorage.getItem('agentAuthUser');
-      
-      if (!agentUserStr) {
-        // No agent authenticated, redirect to login
-        navigate('/');
-        return;
-      }
-
-      let agentUser;
+  useEffect(() => {
+    const loadAgentData = async () => {
       try {
-        agentUser = JSON.parse(agentUserStr);
-      } catch (parseError) {
-        console.error('Error parsing agent user:', parseError);
-        localStorage.removeItem('agentAuthUser');
+        setLoading(true);
+        
+        const agentUserStr = localStorage.getItem('agentAuthUser');
+        
+        if (!agentUserStr) {
+          navigate('/');
+          return;
+        }
+
+        let agentUser;
+        try {
+          agentUser = JSON.parse(agentUserStr);
+        } catch (parseError) {
+          console.error('Error parsing agent user:', parseError);
+          localStorage.removeItem('agentAuthUser');
+          navigate('/');
+          return;
+        }
+
+        if (!agentUser.id || !agentUser.email) {
+          console.error('Invalid agent user data');
+          localStorage.removeItem('agentAuthUser');
+          navigate('/');
+          return;
+        }
+
+        const agent = await AgentService.getAgent(agentUser.id);
+        
+        if (!agent) {
+          setError('Agent account not found. Please contact support.');
+          localStorage.removeItem('agentAuthUser');
+          setTimeout(() => navigate('/'), 3000);
+          return;
+        }
+        
+        setAgentData(agent);
+
+        const fetchedInvoices = await AgentService.getInvoicesByAgent(agentUser.id);
+        setInvoices(fetchedInvoices);
+
+        const fetchedPayments = await AgentService.getPaymentsByAgent(agentUser.id);
+        setPayments(fetchedPayments);
+        
+        // Load payment info if available
+        if (agent.paymentInfo) {
+          setBusinessName(agent.paymentInfo.businessName || '');
+          setSettlementBank(agent.paymentInfo.settlementBank as 'mpesa' | 'airtel-ke' || 'mpesa');
+          setAccountNumber(agent.paymentInfo.accountNumber || '');
+          setEmail(agent.paymentInfo.email || agent.email);
+          setName(agent.paymentInfo.name || agent.name);
+          setPhone(agent.paymentInfo.phone || agent.phone);
+        } else {
+          // Set defaults from agent data
+          setEmail(agent.email);
+          setName(agent.name);
+          setPhone(agent.phone);
+        }
+        
+      } catch (err: any) {
+        console.error('Error loading agent data:', err);
+        setError(err.message || 'Failed to load data');
+        
+        if (err.message?.includes('permission') || err.message?.includes('unauthorized')) {
+          localStorage.removeItem('agentAuthUser');
+          navigate('/');
+        }
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadAgentData();
+
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === 'agentAuthUser' && !e.newValue) {
         navigate('/');
-        return;
       }
+    };
 
-      // Validate that we have the necessary data
-      if (!agentUser.id || !agentUser.email) {
-        console.error('Invalid agent user data');
-        localStorage.removeItem('agentAuthUser');
-        navigate('/');
-        return;
-      }
+    window.addEventListener('storage', handleStorageChange);
 
-      // Fetch agent data from Firestore
-      const agent = await AgentService.getAgent(agentUser.id);
-      
-      if (!agent) {
-        setError('Agent account not found. Please contact support.');
-        localStorage.removeItem('agentAuthUser');
-        setTimeout(() => navigate('/'), 3000);
-        return;
-      }
-      
-      setAgentData(agent);
-
-      // Fetch invoices
-      const fetchedInvoices = await AgentService.getInvoicesByAgent(agentUser.id);
-      setInvoices(fetchedInvoices);
-
-      // Fetch payments
-      const fetchedPayments = await AgentService.getPaymentsByAgent(agentUser.id);
-      setPayments(fetchedPayments);
-      
-      // Load payment info if available
-      if (agent.paymentInfo) {
-        setAccountName(agent.paymentInfo.accountName);
-        setBankCode(agent.paymentInfo.bankCode);
-        setAccountNumber(agent.paymentInfo.accountNumber);
-      }
-      
-    } catch (err: any) {
-      console.error('Error loading agent data:', err);
-      setError(err.message || 'Failed to load data');
-      
-      // If there's an authentication error, redirect to login
-      if (err.message?.includes('permission') || err.message?.includes('unauthorized')) {
-        localStorage.removeItem('agentAuthUser');
-        navigate('/');
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  loadAgentData();
-
-  // Listen for storage changes (logout in another tab)
-  const handleStorageChange = (e: StorageEvent) => {
-    if (e.key === 'agentAuthUser' && !e.newValue) {
-      // Agent logged out in another tab
-      navigate('/');
-    }
-  };
-
-  window.addEventListener('storage', handleStorageChange);
-
-  return () => {
-    window.removeEventListener('storage', handleStorageChange);
-  };
-}, [navigate]);
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+    };
+  }, [navigate]);
 
   const handleSignOut = async () => {
     try {
-    // Clear agent session
-    localStorage.removeItem('agentAuthUser');
-    
-    // Navigate to home
-    navigate('/');
-  } catch (err) {
-    console.error('Error logging out:', err);
-  }
+      localStorage.removeItem('agentAuthUser');
+      navigate('/');
+    } catch (err) {
+      console.error('Error logging out:', err);
+    }
   };
 
   const handleTerminalSearch = async () => {
@@ -177,11 +174,15 @@ useEffect(() => {
   };
 
   const handlePaymentSuccess = async () => {
-    if (agentData && auth.currentUser) {
-      const fetchedInvoices = await AgentService.getInvoicesByAgent(auth.currentUser.uid);
+    if (agentData) {
+      const agentUserStr = localStorage.getItem('agentAuthUser');
+      if (!agentUserStr) return;
+      
+      const agentUser = JSON.parse(agentUserStr);
+      const fetchedInvoices = await AgentService.getInvoicesByAgent(agentUser.id);
       setInvoices(fetchedInvoices);
       
-      const fetchedPayments = await AgentService.getPaymentsByAgent(auth.currentUser.uid);
+      const fetchedPayments = await AgentService.getPaymentsByAgent(agentUser.id);
       setPayments(fetchedPayments);
     }
   };
@@ -189,25 +190,32 @@ useEffect(() => {
   const handleSavePaymentInfo = async (e: React.FormEvent) => {
     e.preventDefault();
     
-    if (!agentData || !auth.currentUser) return;
+    if (!agentData) return;
 
     try {
       setSavingPaymentInfo(true);
       
-      await AgentService.updatePaymentInfo(auth.currentUser.uid, {
-        accountName,
-        bankCode,
-        accountNumber
+      await AgentService.setupPaymentAccount({
+        businessName,
+        settlementBank,
+        accountNumber,
+        email,
+        name,
+        phone,
+        userId: agentData.id
       });
 
-      const updated = await AgentService.getAgent(auth.currentUser.uid);
-      setAgentData(updated);
-      setShowPaymentSettings(false);
+      // Refresh agent data
+      const updated = await AgentService.getAgent(agentData.id);
+      if (updated) {
+        setAgentData(updated);
+      }
       
-      alert('Payment information updated successfully!');
+      setShowPaymentSettings(false);
+      alert('Payment account setup successfully!');
       
     } catch (err: any) {
-      alert(err.message || 'Failed to update payment information');
+      alert(err.message || 'Failed to setup payment account');
     } finally {
       setSavingPaymentInfo(false);
     }
@@ -221,12 +229,25 @@ useEffect(() => {
     }).format(value);
   };
 
-  const formatDate = (dateString: string) => {
-    return new Date(dateString).toLocaleDateString('en-KE', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric'
-    });
+  const formatDate = (dateString: string | any) => {
+    try {
+      let date: Date;
+      if (typeof dateString === 'string') {
+        date = new Date(dateString);
+      } else if (dateString?.toDate) {
+        date = dateString.toDate();
+      } else {
+        return 'N/A';
+      }
+      
+      return date.toLocaleDateString('en-KE', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric'
+      });
+    } catch {
+      return 'N/A';
+    }
   };
 
   if (loading) {
@@ -266,16 +287,6 @@ useEffect(() => {
     .filter(inv => !inv.isPaid)
     .reduce((sum, inv) => sum + (inv.totalAmount - inv.amountPaid), 0);
 
-  const platformFeesTotal = payments
-    .filter(p => p.status === 'success')
-    .reduce((sum, p) => sum + p.platformFee, 0);
-
-  const paystackFeesTotal = payments
-    .filter(p => p.status === 'success')
-    .reduce((sum, p) => sum + p.paystackFee, 0);
-
-  const netRevenue = totalRevenue - platformFeesTotal - paystackFeesTotal;
-
   const paymentStatusData = [
     { name: 'Paid', value: invoices.filter(inv => inv.isPaid).length, color: '#10b981' },
     { name: 'Unpaid', value: invoices.filter(inv => !inv.isPaid).length, color: '#ef4444' }
@@ -284,7 +295,17 @@ useEffect(() => {
   const monthlyData = payments
     .filter(p => p.status === 'success')
     .reduce((acc, payment) => {
-      const month = new Date(payment.createdAt.toDate()).toLocaleDateString('en-KE', { month: 'short' });
+      let month: string;
+      try {
+        if (payment.initiatedAt?.toDate) {
+          month = payment.initiatedAt.toDate().toLocaleDateString('en-KE', { month: 'short' });
+        } else {
+          month = 'Unknown';
+        }
+      } catch {
+        month = 'Unknown';
+      }
+      
       const existing = acc.find(item => item.month === month);
       if (existing) {
         existing.amount += payment.amount;
@@ -302,6 +323,11 @@ useEffect(() => {
             <div>
               <h1 className="text-2xl font-bold text-gray-900">Agent Dashboard</h1>
               <p className="text-sm text-gray-600 mt-1">Welcome, {agentData?.name}</p>
+              {agentData?.tier && (
+                <span className="inline-block mt-1 px-2 py-1 text-xs font-semibold rounded-full bg-indigo-100 text-indigo-800">
+                  {agentData.tier.toUpperCase()} Tier
+                </span>
+              )}
             </div>
             <div className="flex items-center space-x-3">
               <button
@@ -373,17 +399,20 @@ useEffect(() => {
           <div className="bg-white rounded-xl shadow-lg p-6 mb-8">
             <h2 className="text-xl font-bold text-gray-900 mb-4">Payment Account Settings</h2>
             
-            {agentData?.paymentInfo ? (
+            {agentData?.paymentInfo?.accountId ? (
               <div className="mb-4 p-4 bg-green-50 border border-green-200 rounded-lg">
                 <div className="flex items-start space-x-3">
                   <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
                   <div>
                     <p className="text-green-900 font-semibold">Payment Account Active</p>
                     <p className="text-green-700 text-sm mt-1">
-                      Subaccount ID: {agentData.paymentInfo.paystackSubaccountId}
+                      Subaccount Code: {agentData.paymentInfo.accountId}
                     </p>
                     <p className="text-green-700 text-sm">
-                      Split: {agentData.paymentInfo.splitPercentage}%
+                      Commission Rate: {agentData.paymentInfo.split}%
+                    </p>
+                    <p className="text-green-700 text-sm">
+                      Settlement Bank: {agentData.paymentInfo.settlementBank.toUpperCase()}
                     </p>
                   </div>
                 </div>
@@ -391,7 +420,7 @@ useEffect(() => {
             ) : (
               <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
                 <p className="text-yellow-800 text-sm">
-                  No payment account configured. Add your bank details to receive payments.
+                  No payment account configured. Setup your account details to receive payments via split settlement.
                 </p>
               </div>
             )}
@@ -399,12 +428,72 @@ useEffect(() => {
             <form onSubmit={handleSavePaymentInfo} className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Account Name
+                  Business Name
                 </label>
                 <input
                   type="text"
-                  value={accountName}
-                  onChange={(e) => setAccountName(e.target.value)}
+                  value={businessName}
+                  onChange={(e) => setBusinessName(e.target.value)}
+                  required
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                  placeholder="Your Business Name"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Settlement Bank
+                </label>
+                <select
+                  value={settlementBank}
+                  onChange={(e) => setSettlementBank(e.target.value as 'mpesa' | 'airtel-ke')}
+                  required
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="mpesa">M-Pesa</option>
+                  <option value="airtel-ke">Airtel Money (Kenya)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Account Number / Phone Number
+                </label>
+                <input
+                  type="text"
+                  value={accountNumber}
+                  onChange={(e) => setAccountNumber(e.target.value)}
+                  required
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                  placeholder="254712345678"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Enter your M-Pesa/Airtel Money registered phone number
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Contact Email
+                </label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                  placeholder="email@example.com"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Contact Name
+                </label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
                   required
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
                   placeholder="John Doe"
@@ -413,29 +502,15 @@ useEffect(() => {
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Bank Code
+                  Contact Phone
                 </label>
                 <input
-                  type="text"
-                  value={bankCode}
-                  onChange={(e) => setBankCode(e.target.value)}
+                  type="tel"
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
                   required
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
-                  placeholder="e.g., 063 for Diamond Trust Bank"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Account Number
-                </label>
-                <input
-                  type="text"
-                  value={accountNumber}
-                  onChange={(e) => setAccountNumber(e.target.value)}
-                  required
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
-                  placeholder="1234567890"
+                  placeholder="254712345678"
                 />
               </div>
 
@@ -447,24 +522,24 @@ useEffect(() => {
                 {savingPaymentInfo ? (
                   <span className="flex items-center justify-center">
                     <Loader2 className="w-5 h-5 animate-spin mr-2" />
-                    Saving...
+                    Setting up account...
                   </span>
                 ) : (
-                  'Save Payment Information'
+                  agentData?.paymentInfo?.accountId ? 'Update Payment Account' : 'Setup Payment Account'
                 )}
               </button>
             </form>
           </div>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
           <div className="bg-white rounded-xl shadow-lg p-6">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-sm font-medium text-gray-600">Total Revenue</h3>
               <DollarSign className="w-8 h-8 text-green-600" />
             </div>
             <p className="text-2xl font-bold text-gray-900">{formatCurrency(totalRevenue)}</p>
-            <p className="text-xs text-gray-500 mt-2">Net: {formatCurrency(netRevenue)}</p>
+            <p className="text-xs text-gray-500 mt-2">From successful payments</p>
           </div>
 
           <div className="bg-white rounded-xl shadow-lg p-6">
@@ -480,20 +555,11 @@ useEffect(() => {
 
           <div className="bg-white rounded-xl shadow-lg p-6">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-medium text-gray-600">Platform Fees</h3>
+              <h3 className="text-sm font-medium text-gray-600">Total Invoices</h3>
               <Receipt className="w-8 h-8 text-indigo-600" />
             </div>
-            <p className="text-2xl font-bold text-gray-900">{formatCurrency(platformFeesTotal)}</p>
-            <p className="text-xs text-gray-500 mt-2">1.5% of revenue</p>
-          </div>
-
-          <div className="bg-white rounded-xl shadow-lg p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-medium text-gray-600">Paystack Fees</h3>
-              <CreditCard className="w-8 h-8 text-purple-600" />
-            </div>
-            <p className="text-2xl font-bold text-gray-900">{formatCurrency(paystackFeesTotal)}</p>
-            <p className="text-xs text-gray-500 mt-2">Transaction fees</p>
+            <p className="text-2xl font-bold text-gray-900">{invoices.length}</p>
+            <p className="text-xs text-gray-500 mt-2">All time invoices</p>
           </div>
         </div>
 
@@ -542,24 +608,24 @@ useEffect(() => {
               <thead>
                 <tr className="border-b border-gray-200">
                   <th className="text-left py-3 px-4 text-sm font-semibold text-gray-700">Date</th>
-                  <th className="text-left py-3 px-4 text-sm font-semibold text-gray-700">Tenant ID</th>
+                  <th className="text-left py-3 px-4 text-sm font-semibold text-gray-700">Reference</th>
+                  <th className="text-left py-3 px-4 text-sm font-semibold text-gray-700">Tenant</th>
                   <th className="text-left py-3 px-4 text-sm font-semibold text-gray-700">Amount</th>
-                  <th className="text-left py-3 px-4 text-sm font-semibold text-gray-700">Method</th>
                   <th className="text-left py-3 px-4 text-sm font-semibold text-gray-700">Status</th>
                 </tr>
               </thead>
               <tbody>
                 {payments.slice(0, 10).map((payment) => (
-                  <tr key={payment.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <tr key={payment.reference} className="border-b border-gray-100 hover:bg-gray-50">
                     <td className="py-3 px-4 text-sm text-gray-900">
-                      {formatDate(payment.createdAt.toDate().toISOString())}
+                      {formatDate(payment.completedAt || payment.initiatedAt)}
                     </td>
-                    <td className="py-3 px-4 text-sm text-gray-900">{payment.tenantId}</td>
+                    <td className="py-3 px-4 text-sm text-gray-600 font-mono">
+                      {payment.reference.substring(0, 12)}...
+                    </td>
+                    <td className="py-3 px-4 text-sm text-gray-900">{payment.userName || 'N/A'}</td>
                     <td className="py-3 px-4 text-sm font-semibold text-gray-900">
                       {formatCurrency(payment.amount)}
-                    </td>
-                    <td className="py-3 px-4 text-sm text-gray-600">
-                      {payment.paymentMethod === 'mpesa' ? 'M-PESA' : 'Airtel Money'}
                     </td>
                     <td className="py-3 px-4">
                       <span
@@ -597,7 +663,7 @@ useEffect(() => {
             setSelectedInvoice(null);
           }}
           onSuccess={handlePaymentSuccess}
-          initiatorRole="tenant"
+          initiatorRole="agent"
         />
       )}
     </div>

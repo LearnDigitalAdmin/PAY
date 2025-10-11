@@ -1,4 +1,4 @@
-// TenantView.tsx - Tenant Dashboard
+// TenantView.tsx - Tenant Dashboard (Updated)
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
@@ -35,22 +35,22 @@ const TenantView: React.FC = () => {
       try {
         setLoading(true);
         
-        // Get tenant account
         const tenant = await TenantService.getTenant(user.uid);
         if (!tenant) {
-          // Redirect to signup completion if account not found
           navigate('/signup', { state: { fromAuth: true } });
           return;
         }
         
         setTenantData(tenant);
 
-        // Fetch invoices using tenant ID
+        // Fetch invoices using tenant ID from the tenant document
+        // The tenant document should have a field that maps to the localId used in invoices
         const fetchedInvoices = await TenantService.findTenantInvoices(tenant.id);
         setInvoices(fetchedInvoices);
 
-        // Fetch payment history
-        const fetchedPayments = await TenantService.getPaymentHistory(tenant.id);
+        // Fetch payment history - pass agentUserId if available
+        const agentUserId = fetchedInvoices.length > 0 ? fetchedInvoices[0].agentUserId : undefined;
+        const fetchedPayments = await TenantService.getPaymentHistory(tenant.id, agentUserId);
         setPayments(fetchedPayments);
         
       } catch (err: any) {
@@ -79,12 +79,12 @@ const TenantView: React.FC = () => {
   };
 
   const handlePaymentSuccess = async () => {
-    // Refresh invoices and payments
     if (tenantData) {
       const fetchedInvoices = await TenantService.findTenantInvoices(tenantData.id);
       setInvoices(fetchedInvoices);
       
-      const fetchedPayments = await TenantService.getPaymentHistory(tenantData.id);
+      const agentUserId = fetchedInvoices.length > 0 ? fetchedInvoices[0].agentUserId : undefined;
+      const fetchedPayments = await TenantService.getPaymentHistory(tenantData.id, agentUserId);
       setPayments(fetchedPayments);
     }
   };
@@ -97,12 +97,25 @@ const TenantView: React.FC = () => {
     }).format(value);
   };
 
-  const formatDate = (dateString: string) => {
-    return new Date(dateString).toLocaleDateString('en-KE', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric'
-    });
+  const formatDate = (dateString: string | any) => {
+    try {
+      let date: Date;
+      if (typeof dateString === 'string') {
+        date = new Date(dateString);
+      } else if (dateString?.toDate) {
+        date = dateString.toDate();
+      } else {
+        return 'N/A';
+      }
+      
+      return date.toLocaleDateString('en-KE', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric'
+      });
+    } catch {
+      return 'N/A';
+    }
   };
 
   if (loading) {
@@ -138,7 +151,9 @@ const TenantView: React.FC = () => {
     .filter(inv => !inv.isPaid)
     .reduce((sum, inv) => sum + (inv.totalAmount - inv.amountPaid), 0);
 
-  const totalPaid = payments.reduce((sum, payment) => sum + payment.amount, 0);
+  const totalPaid = payments
+    .filter(p => p.status === 'success')
+    .reduce((sum, payment) => sum + payment.amount, 0);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
@@ -378,16 +393,16 @@ const TenantView: React.FC = () => {
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {payments.map((payment) => (
+                  {payments.map((payment, index) => (
                     <div
-                      key={payment.id}
+                      key={payment.reference || index}
                       className="border border-gray-200 rounded-lg p-4 bg-white hover:shadow-md transition-all"
                     >
                       <div className="flex items-start justify-between">
                         <div className="flex-1">
                           <div className="flex items-center space-x-3 mb-2">
                             <h3 className="font-semibold text-gray-900">
-                              Payment #{payment.id.substring(0, 8)}
+                              Payment {payment.reference ? `#${payment.reference.substring(0, 8)}` : `#${index + 1}`}
                             </h3>
                             <span
                               className={`px-2 py-1 text-xs font-semibold rounded-full ${
@@ -410,24 +425,32 @@ const TenantView: React.FC = () => {
                               </p>
                             </div>
                             <div>
-                              <p className="text-gray-600">Payment Method</p>
+                              <p className="text-gray-600">Billing Month</p>
                               <p className="font-semibold text-gray-900">
-                                {payment.paymentMethod === 'mpesa' ? 'M-Pesa' : 'Airtel Money'}
+                                {payment.billingMonth || 'N/A'}
                               </p>
                             </div>
                             <div>
                               <p className="text-gray-600">Date</p>
                               <p className="font-semibold text-gray-900">
-                                {payment.paidAt ? formatDate(payment.paidAt.toDate().toISOString()) : 'Pending'}
+                                {formatDate(payment.completedAt || payment.initiatedAt)}
                               </p>
                             </div>
                             <div>
                               <p className="text-gray-600">Reference</p>
                               <p className="font-mono text-xs text-gray-700">
-                                {payment.paystackReference}
+                                {payment.reference || 'N/A'}
                               </p>
                             </div>
                           </div>
+
+                          {payment.arrears > 0 && (
+                            <div className="mt-2 p-2 bg-orange-50 border border-orange-200 rounded text-sm">
+                              <p className="text-orange-800">
+                                <strong>Note:</strong> Partial payment. Arrears: {formatCurrency(payment.arrears)}
+                              </p>
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>

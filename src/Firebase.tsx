@@ -1,4 +1,4 @@
-// Firebase.tsx - Firebase Configuration and Services
+// Firebase.tsx - Firebase Configuration and Services (Updated)
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -25,6 +25,7 @@ import {
   Timestamp,
   type Unsubscribe
 } from 'firebase/firestore';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 
 // Firebase config
 const firebaseConfig = {
@@ -41,6 +42,7 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export const functions = getFunctions(app, 'africa-south1'); // Match your region
 
 // Types
 export interface TenantAccount {
@@ -59,13 +61,19 @@ export interface AgentAccount {
   email: string;
   name: string;
   role: 'agent';
+  tier?: string;
   paymentInfo?: {
-    paystackSubaccountId: string;
-    splitPercentage: number;
-    accountName: string;
-    bankCode: string;
+    accountId: string; // subaccount_code from Paystack
+    split: number; // commission rate
+    businessName: string;
+    settlementBank: string;
     accountNumber: string;
-    createdAt: string;
+    email: string;
+    name: string;
+    phone: string;
+    createdAt: any;
+    paystackIntegrationCode?: string;
+    active: boolean;
   };
 }
 
@@ -97,21 +105,24 @@ export interface Invoice {
 }
 
 export interface Payment {
-  id: string;
-  invoiceId: number;
-  tenantId: number;
-  agentUserId: string;
+  userName: string;
+  agentId: string;
   amount: number;
   arrears: number;
-  paystackReference: string;
-  paymentMethod: 'mpesa' | 'airtel_money';
+  invoiceId: string;
+  billingMonth: string;
+  currency: string;
   phone: string;
+  provider: string;
+  reference: string;
+  accessCode: string;
   status: 'pending' | 'success' | 'failed';
-  createdAt: Timestamp;
-  paidAt?: Timestamp;
-  platformFee: number;
-  paystackFee: number;
-  netAmount: number;
+  initiatedAt: any;
+  completedAt?: any;
+  paidAmount?: number;
+  fees?: number;
+  subaccountCode: string;
+  commissionRate: number;
 }
 
 // Auth Service
@@ -154,15 +165,15 @@ export class AuthService {
     }
   }
 
-    static async signInWithEmailPassword(email: string, password: string): Promise<FirebaseUser> {
-      try {
-        const userCredential = await signInWithEmailAndPassword(auth, email, password);
-        return userCredential.user;
-      } catch (error: any) {
-        console.error('Email/Password sign in error:', error);
-        throw error;
-      }
+  static async signInWithEmailPassword(email: string, password: string): Promise<FirebaseUser> {
+    try {
+      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      return userCredential.user;
+    } catch (error: any) {
+      console.error('Email/Password sign in error:', error);
+      throw error;
     }
+  }
 
   static async signOut(): Promise<void> {
     await signOut(auth);
@@ -215,7 +226,6 @@ export class TenantService {
     try {
       const invoices: Invoice[] = [];
       
-      // Search across all users using collectionGroup
       const q = query(
         collectionGroup(db, 'tenants'),
         where('localId', '==', parseInt(tenantId))
@@ -227,12 +237,10 @@ export class TenantService {
         return [];
       }
 
-      // Get the tenant document to extract userId
       const tenantDoc = querySnapshot.docs[0];
-      const tenantPath = tenantDoc.ref.path; // e.g., "users/123/tenants/456"
-      const userId = tenantPath.split('/')[1]; // Extract userId
+      const tenantPath = tenantDoc.ref.path;
+      const userId = tenantPath.split('/')[1];
 
-      // Now fetch invoices for this user and tenant
       const invoicesQuery = query(
         collection(db, 'users', userId, 'invoices'),
         where('tenantId', '==', parseInt(tenantId)),
@@ -278,16 +286,61 @@ export class TenantService {
     }
   }
 
-  static async getPaymentHistory(tenantId: string): Promise<Payment[]> {
+  static async getPaymentHistory(tenantId: string, agentUserId?: string): Promise<Payment[]> {
     try {
-      const paymentsQuery = query(
-        collection(db, 'payments'),
-        where('tenantId', '==', parseInt(tenantId)),
-        orderBy('createdAt', 'desc')
-      );
-
-      const snapshot = await getDocs(paymentsQuery);
-      return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Payment));
+      const payments: Payment[] = [];
+      
+      if (agentUserId) {
+        // Fetch from payments subcollection using billingMonths structure
+        const paymentsSnapshot = await getDocs(
+          collection(db, 'payments', tenantId, 'billingMonths')
+        );
+        
+        for (const monthDoc of paymentsSnapshot.docs) {
+          const monthData = monthDoc.data();
+          if (monthData.payments && Array.isArray(monthData.payments)) {
+            payments.push(...monthData.payments);
+          }
+        }
+      } else {
+        // Fallback: search transactions collection
+        const transactionsQuery = query(
+          collection(db, 'transactions'),
+          where('userId', '==', tenantId),
+          orderBy('createdAt', 'desc')
+        );
+        
+        const snapshot = await getDocs(transactionsQuery);
+        for (const doc of snapshot.docs) {
+          const data = doc.data();
+          payments.push({
+            userName: data.userName || '',
+            agentId: data.agentId || '',
+            amount: data.amount || 0,
+            arrears: data.arrears || 0,
+            invoiceId: data.invoiceId || '',
+            billingMonth: data.billingMonth || '',
+            currency: 'KES',
+            phone: '',
+            provider: '',
+            reference: data.reference || doc.id,
+            accessCode: '',
+            status: data.status || 'pending',
+            initiatedAt: data.createdAt,
+            completedAt: data.completedAt,
+            subaccountCode: '',
+            commissionRate: 0
+          });
+        }
+      }
+      
+      // Sort by date
+      return payments.sort((a, b) => {
+        const dateA = a.completedAt || a.initiatedAt;
+        const dateB = b.completedAt || b.initiatedAt;
+        if (!dateA || !dateB) return 0;
+        return dateB.toMillis() - dateA.toMillis();
+      });
     } catch (error) {
       console.error('Error fetching payment history:', error);
       return [];
@@ -309,6 +362,7 @@ export class AgentService {
         email: data.email || '',
         name: data.name || '',
         role: 'agent',
+        tier: data.tier,
         paymentInfo: data.paymentInfo
       };
     } catch (error) {
@@ -330,7 +384,6 @@ export class AgentService {
       for (const docSnapshot of snapshot.docs) {
         const data = docSnapshot.data();
         
-        // Fetch tenant name
         let tenantName = 'Unknown';
         try {
           const tenantDocRef = doc(
@@ -380,110 +433,152 @@ export class AgentService {
 
   static async getPaymentsByAgent(userId: string): Promise<Payment[]> {
     try {
-      const paymentsQuery = query(
-        collection(db, 'payments'),
-        where('agentUserId', '==', userId),
+      const payments: Payment[] = [];
+      
+      // Fetch from transactions collection
+      const transactionsQuery = query(
+        collection(db, 'transactions'),
+        where('agentId', '==', userId),
         orderBy('createdAt', 'desc')
       );
 
-      const snapshot = await getDocs(paymentsQuery);
-      return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Payment));
+      const snapshot = await getDocs(transactionsQuery);
+      for (const doc of snapshot.docs) {
+        const data = doc.data();
+        payments.push({
+          userName: data.userName || '',
+          agentId: data.agentId || userId,
+          amount: data.amount || 0,
+          arrears: data.arrears || 0,
+          invoiceId: data.invoiceId || '',
+          billingMonth: data.billingMonth || '',
+          currency: 'KES',
+          phone: '',
+          provider: '',
+          reference: data.reference || doc.id,
+          accessCode: '',
+          status: data.status || 'pending',
+          initiatedAt: data.createdAt,
+          completedAt: data.completedAt,
+          subaccountCode: '',
+          commissionRate: 0
+        });
+      }
+
+      return payments;
     } catch (error) {
       console.error('Error fetching agent payments:', error);
       return [];
     }
   }
 
-  static async updatePaymentInfo(userId: string, paymentData: {
-    accountName: string;
-    bankCode: string;
+  static async setupPaymentAccount(data: {
+    businessName: string;
+    settlementBank: 'mpesa' | 'airtel-ke';
     accountNumber: string;
+    email: string;
+    name: string;
+    phone: string;
+    userId: string;
   }): Promise<void> {
     try {
-      // Call Cloud Run function to create/update subaccount
-      const response = await fetch('https://YOUR_CLOUD_RUN_URL/createOrUpdatePaymentInfo', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId, ...paymentData })
-      });
-
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.message || 'Failed to update payment info');
-      }
-
-      const result = await response.json();
+      const setupAccount = httpsCallable(functions, 'setupAccount');
+      const result = await setupAccount(data);
       
-      // Update Firestore
-      await setDoc(doc(db, 'users', userId), {
-        paymentInfo: {
-          paystackSubaccountId: result.subaccountId,
-          splitPercentage: result.splitPercentage,
-          accountName: paymentData.accountName,
-          bankCode: paymentData.bankCode,
-          accountNumber: paymentData.accountNumber,
-          createdAt: new Date().toISOString()
-        }
-      }, { merge: true });
+      console.log('Payment account setup result:', result.data);
     } catch (error: any) {
-      console.error('Error updating payment info:', error);
-      throw new Error(error.message || 'Failed to update payment information');
+      console.error('Error setting up payment account:', error);
+      throw new Error(error.message || 'Failed to setup payment account');
     }
   }
 }
 
 // Payment Service
 export class PaymentService {
-  private static readonly PLATFORM_FEE_PERCENTAGE = 1.5;
+  private static readonly PLATFORM_FEE_PERCENTAGE = 0.8;
 
-  static calculateFees(amount: number): {
+  static calculateFees(amount: number, invoiceBalance: number): {
     platformFee: number;
     paystackFee: number;
     total: number;
     netAmount: number;
+    arrears: number;
   } {
-    // Paystack fee: 1.5% + KES 100 (capped at KES 2500)
-    const paystackFee = Math.min((amount * 0.015) + 100, 2500);
     const platformFee = amount * (this.PLATFORM_FEE_PERCENTAGE / 100);
-    const total = amount + paystackFee + platformFee;
-    const netAmount = amount - platformFee;
+    const total = amount + platformFee;
+    const paystackFee = 0; // Calculated by Paystack backend
+    const netAmount = amount;
+    const arrears = amount < invoiceBalance ? invoiceBalance - amount : 0;
 
     return {
       platformFee: Math.round(platformFee * 100) / 100,
       paystackFee: Math.round(paystackFee * 100) / 100,
       total: Math.round(total * 100) / 100,
-      netAmount: Math.round(netAmount * 100) / 100
+      netAmount: Math.round(netAmount * 100) / 100,
+      arrears: Math.round(arrears * 100) / 100
     };
+  }
+
+  static formatPhoneNumber(phone: string): string {
+    const digits = phone.replace(/\D/g, '');
+    
+    if (digits.startsWith('254')) {
+      return digits.length === 12 ? digits : '';
+    } else if (digits.startsWith('0')) {
+      return digits.length === 10 ? `254${digits.substring(1)}` : '';
+    } else if (digits.startsWith('7') || digits.startsWith('1')) {
+      return digits.length === 9 ? `254${digits}` : '';
+    }
+    
+    return '';
   }
 
   static async initiatePayment(data: {
     invoiceId: number;
-    tenantId: number;
-    agentUserId: string;
+    invoice: Invoice;
+    tenantName: string;
     amount: number;
-    arrears: number;
     phone: string;
     paymentMethod: 'mpesa' | 'airtel_money';
-  }): Promise<{ reference: string; message: string }> {
+  }): Promise<{ reference: string; accessCode: string; authorizationUrl: string; message: string }> {
     try {
-      const fees = this.calculateFees(data.amount);
-
-      const response = await fetch('https://YOUR_CLOUD_RUN_URL/processPayment', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...data,
-          ...fees
-        })
-      });
-
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.message || 'Payment initiation failed');
+      const formattedPhone = this.formatPhoneNumber(data.phone);
+      if (!formattedPhone) {
+        throw new Error('Invalid phone number format');
       }
 
-      const result = await response.json();
-      return result;
+      const fees = this.calculateFees(data.amount, data.invoice.totalAmount - data.invoice.amountPaid);
+      
+      // Map payment method to provider
+      const provider = data.paymentMethod === 'mpesa' ? 'mpesa' : 'atl';
+
+      const processPayment = httpsCallable(functions, 'processPayment');
+      const result: any = await processPayment({
+        email: `tenant${data.invoice.tenantId}@plot.app`, // Generate email
+        amount: data.amount,
+        currency: 'KES',
+        phone: formattedPhone,
+        provider: provider,
+        metadata: {
+          userId: data.invoice.tenantId.toString(),
+          userName: data.tenantName,
+          invoiceId: data.invoice.id,
+          billingMonth: data.invoice.billingMonth,
+          arrears: fees.arrears,
+          agentId: data.invoice.agentUserId
+        }
+      });
+
+      if (!result.data.success) {
+        throw new Error(result.data.message || 'Payment initiation failed');
+      }
+
+      return {
+        reference: result.data.data.reference,
+        accessCode: result.data.data.accessCode,
+        authorizationUrl: result.data.data.authorizationUrl,
+        message: result.data.message
+      };
     } catch (error: any) {
       console.error('Error initiating payment:', error);
       throw new Error(error.message || 'Failed to initiate payment');
@@ -491,13 +586,13 @@ export class PaymentService {
   }
 
   static listenToPaymentStatus(
-    reference: string, 
-    callback: (payment: Payment) => void
+    reference: string,
+    callback: (payment: any) => void
   ): Unsubscribe {
-    const paymentRef = doc(db, 'payments', reference);
-    return onSnapshot(paymentRef, (doc) => {
+    const transactionRef = doc(db, 'transactions', reference);
+    return onSnapshot(transactionRef, (doc) => {
       if (doc.exists()) {
-        callback({ id: doc.id, ...doc.data() } as Payment);
+        callback({ id: doc.id, ...doc.data() });
       }
     });
   }
@@ -506,6 +601,7 @@ export class PaymentService {
 export default {
   auth,
   db,
+  functions,
   AuthService,
   TenantService,
   AgentService,
