@@ -16,8 +16,9 @@ import {
   AlertCircle,
   CheckCircle,
   CreditCard,
+  HelpCircle,
 } from 'lucide-react';
-import { AgentService, type Invoice, type Payment, type AgentAccount } from './Firebase';
+import { AgentService, type Invoice, type Payment, type AgentAccount, AuthService } from './Firebase';
 import PaymentModal from './PaymentModal';
 
 const AgentView: React.FC = () => {
@@ -135,10 +136,20 @@ const AgentView: React.FC = () => {
 
   const handleSignOut = async () => {
     try {
+      AuthService.signOut();
       localStorage.removeItem('agentAuthUser');
       navigate('/');
     } catch (err) {
+      navigate('/contact')
       console.error('Error logging out:', err);
+    }
+  };
+
+  const handleHelp = async () => {
+    try {
+      navigate('/faq');
+    } catch (err) {
+      console.error(err);
     }
   };
 
@@ -349,6 +360,14 @@ const AgentView: React.FC = () => {
               >
                 <LogOut className="w-5 h-5" />
                 <span>Sign Out</span>
+              </button>
+
+              <button
+                onClick={handleHelp}
+                className="flex items-center space-x-2 px-4 py-2 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <HelpCircle className="w-5 h-5" />
+                <span>Need Help?</span>
               </button>
             </div>
           </div>

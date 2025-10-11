@@ -4,26 +4,26 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { AuthService, db } from './Firebase';
 import { Loader2, Phone, Hash, ArrowLeft, Mail, Lock } from 'lucide-react';
 import { collection, getDocs, query, where } from 'firebase/firestore';
-import { argon2Verify } from 'hash-wasm';
+// import { argon2Verify } from 'hash-wasm';
 
 const Auth: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
 
 
-  const verifyHashedPass = async (password: string, hash: string): Promise<boolean> => {
-  try {
-      const result = await argon2Verify({
-        password: password,
-        hash: hash
-      });
+//   const verifyHashedPass = async (password: string, hash: string): Promise<boolean> => {
+//   try {
+//       const result = await argon2Verify({
+//         password: password,
+//         hash: hash
+//       });
 
-      return result === true;
-    } catch (error) {
-      console.error('Error verifying password:', error);
-      return false;
-    }
-};
+//       return result === true;
+//     } catch (error) {
+//       console.error('Error verifying password:', error);
+//       return false;
+//     }
+// };
   
   // Get userType from location state (passed from Welcome screen)
   const userType = (location.state as any)?.userType as 'agent' | 'tenant' | undefined;
@@ -131,113 +131,148 @@ const Auth: React.FC = () => {
   };
 
   // AGENT AUTHENTICATION - Email/Password - CHANGE TO USE THE HASH VERIFICATION METHOD
-//   const handleEmailPasswordLogin = async (e: React.FormEvent) => {
-//     e.preventDefault();
-//     setError('');
-//     setLoading(true);
-
-//     try {
-//       if (!email || !password) {
-//         throw new Error('Please enter your email and password');
-//       }
-
-//       if (password.length < 6) {
-//         throw new Error('Password must be at least 6 characters');
-//       }
-
-//       await AuthService.signInWithEmailPassword(email, password);
-      
-      
-//       // Navigate to agent dashboard
-//       navigate('/agent');
-      
-//     } catch (err: any) {
-//       console.error('Error signing in:', err);
-      
-//       // Provide user-friendly error messages
-//       let errorMessage = 'Failed to sign in. Please check your credentials.';
-      
-//       if (err.code === 'auth/user-not-found') {
-//         errorMessage = 'No account found with this email. Please contact your administrator.';
-//       } else if (err.code === 'auth/wrong-password') {
-//         errorMessage = 'Incorrect password. Please try again.';
-//       } else if (err.code === 'auth/invalid-email') {
-//         errorMessage = 'Invalid email address format.';
-//       } else if (err.code === 'auth/too-many-requests') {
-//         errorMessage = 'Too many failed attempts. Please try again later.';
-//       }
-      
-//       setError(errorMessage);
-//     } finally {
-//       setLoading(false);
-//     }
-//   };
-
   const handleEmailPasswordLogin = async (e: React.FormEvent) => {
-  e.preventDefault();
-  setError('');
-  setLoading(true);
+    e.preventDefault();
+    setError('');
+    setLoading(true);
 
-  try {
-    if (!email || !password) {
-      throw new Error('Please enter your email and password');
+    try {
+      if (!email || !password) {
+        throw new Error('Please enter your email and password');
+      }
+
+      if (password.length < 6) {
+        throw new Error('Password must be at least 6 characters');
+      }
+
+      await AuthService.signInWithEmailPassword(email, password);
+
+      const usersRef = collection(db, 'users');
+      const q = query(usersRef, where('email', '==', email.trim()));
+      const snapshot = await getDocs(q);
+
+      if (snapshot.empty) {
+        throw new Error('No account found with this email. Please contact your administrator.');
+      }
+
+      const userDoc = snapshot.docs[0];
+      const userData = userDoc.data();
+
+      // Verify hashed password
+      // const passwordMatch = await verifyHashedPass(password, userData.passwordHash);
+
+      // if (!passwordMatch) {
+      //   throw new Error('Incorrect password. Please try again.');
+      // }
+
+      // Optional: Check access level / role
+      if (userData.type !== 'paid') {
+        throw new Error('Access restricted to agent accounts.');
+      }
+
+      // Save session
+      const agentUser = {
+        id: userDoc.id,
+        email: userData.email,
+        name: userData.name || '',
+        type: userData.type,
+        tier: userData.tier || '',
+      };
+
+      localStorage.setItem('agentAuthUser', JSON.stringify(agentUser));
+
+      
+      
+      // Navigate to agent dashboard
+      navigate('/agent');
+      
+    } catch (err: any) {
+      console.error('Error signing in:', err);
+      
+      // Provide user-friendly error messages
+      let errorMessage = 'Failed to sign in. Please check your credentials.';
+      
+      if (err.code === 'auth/user-not-found') {
+        errorMessage = 'No account found with this email. Please contact your administrator.';
+      } else if (err.code === 'auth/wrong-password') {
+        errorMessage = 'Incorrect password. Please try again.';
+      } else if (err.code === 'auth/invalid-email') {
+        errorMessage = 'Invalid email address format.';
+      } else if (err.code === 'auth/too-many-requests') {
+        errorMessage = 'Too many failed attempts. Please try again later.';
+      }
+      
+      setError(errorMessage);
+    } finally {
+      setLoading(false);
     }
+  };
 
-    // Find agent by email
-    const usersRef = collection(db, 'users');
-    const q = query(usersRef, where('email', '==', email.trim()));
-    const snapshot = await getDocs(q);
+//   const handleEmailPasswordLogin = async (e: React.FormEvent) => {
+//   e.preventDefault();
+//   setError('');
+//   setLoading(true);
 
-    if (snapshot.empty) {
-      throw new Error('No account found with this email. Please contact your administrator.');
-    }
+//   try {
+//     if (!email || !password) {
+//       throw new Error('Please enter your email and password');
+//     }
 
-    const userDoc = snapshot.docs[0];
-    const userData = userDoc.data();
+//     // Find agent by email
+//     const usersRef = collection(db, 'users');
+//     const q = query(usersRef, where('email', '==', email.trim()));
+//     const snapshot = await getDocs(q);
 
-    // Verify hashed password
-    const passwordMatch = await verifyHashedPass(password, userData.passwordHash);
+//     if (snapshot.empty) {
+//       throw new Error('No account found with this email. Please contact your administrator.');
+//     }
 
-    if (!passwordMatch) {
-      throw new Error('Incorrect password. Please try again.');
-    }
+//     const userDoc = snapshot.docs[0];
+//     const userData = userDoc.data();
 
-    // Optional: Check access level / role
-    if (userData.type !== 'paid') {
-      throw new Error('Access restricted to agent accounts.');
-    }
+//     // Verify hashed password
+//     const passwordMatch = await verifyHashedPass(password, userData.passwordHash);
 
-    // Save session
-    const agentUser = {
-      id: userDoc.id,
-      email: userData.email,
-      name: userData.name || '',
-      type: userData.type,
-      tier: userData.tier || '',
-    };
+//     if (!passwordMatch) {
+//       throw new Error('Incorrect password. Please try again.');
+//     }
 
-    localStorage.setItem('agentAuthUser', JSON.stringify(agentUser));
-    //setIsAuthenticated(true);
+//     // Optional: Check access level / role
+//     if (userData.type !== 'paid') {
+//       throw new Error('Access restricted to agent accounts.');
+//     }
 
-    // Navigate to agent dashboard
-    navigate('/agent');
+//     // Save session
+//     const agentUser = {
+//       id: userDoc.id,
+//       email: userData.email,
+//       name: userData.name || '',
+//       type: userData.type,
+//       tier: userData.tier || '',
+//     };
 
-  } catch (err: any) {
-    console.error('Error signing in:', err);
+//     localStorage.setItem('agentAuthUser', JSON.stringify(agentUser));
+//     //setIsAuthenticated(true);
 
-    let message = err.message || 'Failed to sign in. Please check your credentials.';
+//     // Navigate to agent dashboard
+//     navigate('/agent');
 
-    if (message.includes('user-not-found')) {
-      message = 'No account found with this email. Please contact your administrator.';
-    } else if (message.includes('password')) {
-      message = 'Incorrect password. Please try again.';
-    }
+//   } catch (err: any) {
+//     console.error('Error signing in:', err);
 
-    setError(message);
-  } finally {
-    setLoading(false);
-  }
-};
+//     let message = err.message || 'Failed to sign in. Please check your credentials.';
+
+//     if (message.includes('user-not-found')) {
+//       message = 'No account found with this email. Please contact your administrator.';
+//     } else if (message.includes('password')) {
+//       message = 'Incorrect password. Please try again.';
+//     }
+
+//     setError(message);
+//   } finally {
+//     setLoading(false);
+//   }
+// };
 
   const handleBack = () => {
     if (userType === 'tenant' && phoneStep === 'code') {

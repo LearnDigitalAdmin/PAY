@@ -9,6 +9,7 @@ import TenantView from './TenantView';
 import Contact from './Contact';
 import { Loader2 } from 'lucide-react';
 import Welcome from './Welcome';
+import FAQPage from './Faq';
 
 // Protected Route Component
 interface ProtectedRouteProps {
@@ -144,6 +145,7 @@ const App: React.FC = () => {
         <Route path="/" element={<Welcome />} />
         <Route path="/auth" element={<Auth />} />
         <Route path="/signup" element={<Signup />} />
+        <Route path="/faq" element={<FAQPage />} />
         <Route path="/contact" element={<Contact />} />
 
         {/* Protected Routes */}
