@@ -79,7 +79,7 @@ const TenantView: React.FC = () => {
 
         // Fetch screening data from Firestore
         try {
-          const screeningRef = doc(db, 'screening', tenant.id.toString());
+          const screeningRef = doc(db, 'screening', tenant.idNumber.toString());
           const screeningSnap = await getDoc(screeningRef);
           
           if (screeningSnap.exists()) {
@@ -89,11 +89,11 @@ const TenantView: React.FC = () => {
           console.log('No screening data available yet');
         }
 
-        const fetchedInvoices = await TenantService.findTenantInvoices(tenant.id);
+        const fetchedInvoices = await TenantService.findTenantInvoices(tenant.idNumber);
         setInvoices(fetchedInvoices);
 
         const agentUserId = fetchedInvoices.length > 0 ? fetchedInvoices[0].agentUserId : undefined;
-        const fetchedPayments = await TenantService.getPaymentHistory(tenant.id, agentUserId);
+        const fetchedPayments = await TenantService.getPaymentHistory(tenant.idNumber, agentUserId);
         setPayments(fetchedPayments);
         
       } catch (err: any) {
@@ -123,11 +123,11 @@ const TenantView: React.FC = () => {
 
   const handlePaymentSuccess = async () => {
     if (tenantData) {
-      const fetchedInvoices = await TenantService.findTenantInvoices(tenantData.id);
+      const fetchedInvoices = await TenantService.findTenantInvoices(tenantData.idNumber);
       setInvoices(fetchedInvoices);
       
       const agentUserId = fetchedInvoices.length > 0 ? fetchedInvoices[0].agentUserId : undefined;
-      const fetchedPayments = await TenantService.getPaymentHistory(tenantData.id, agentUserId);
+      const fetchedPayments = await TenantService.getPaymentHistory(tenantData.idNumber, agentUserId);
       setPayments(fetchedPayments);
       
       // Refresh screening data after payment

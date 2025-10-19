@@ -191,11 +191,23 @@ export class TenantService {
     email: string;
     fullName: string;
     idNumber: string;
-  }): Promise<string> {
+  }): Promise<{ tenantId: string; isNewUser: boolean }> {
     try {
       const user = auth.currentUser;
       if (!user) throw new Error('Not authenticated');
 
+      // Check if tenant already exists
+      const existingTenant = await this.getTenant(user.uid);
+      
+      if (existingTenant) {
+        // Returning user - don't overwrite their data
+        return { 
+          tenantId: user.uid, 
+          isNewUser: false 
+        };
+      }
+
+      // New user - create their account
       const tenantDoc = doc(db, 'tenants', user.uid);
       await setDoc(tenantDoc, {
         ...data,
@@ -204,12 +216,39 @@ export class TenantService {
         createdAt: serverTimestamp()
       });
 
-      return user.uid;
+      return { 
+        tenantId: user.uid, 
+        isNewUser: true 
+      };
     } catch (error: any) {
-      console.error('Error creating tenant:', error);
-      throw new Error(error.message || 'Failed to create tenant account');
+      console.error('Error creating/fetching tenant:', error);
+      throw new Error(error.message || 'Failed to process tenant account');
     }
   }
+  // static async createTenant(data: {
+  //   phone: string;
+  //   email: string;
+  //   fullName: string;
+  //   idNumber: string;
+  // }): Promise<string> {
+  //   try {
+  //     const user = auth.currentUser;
+  //     if (!user) throw new Error('Not authenticated');
+
+  //     const tenantDoc = doc(db, 'tenants', user.uid);
+  //     await setDoc(tenantDoc, {
+  //       ...data,
+  //       id: user.uid,
+  //       role: 'tenant',
+  //       createdAt: serverTimestamp()
+  //     });
+
+  //     return user.uid;
+  //   } catch (error: any) {
+  //     console.error('Error creating tenant:', error);
+  //     throw new Error(error.message || 'Failed to create tenant account');
+  //   }
+  // }
 
   static async getTenant(uid: string): Promise<TenantAccount | null> {
     try {
@@ -334,18 +373,117 @@ export class TenantService {
         }
       }
       
-      // Sort by date
+      // Sort by date - safely handle different timestamp formats
       return payments.sort((a, b) => {
         const dateA = a.completedAt || a.initiatedAt;
         const dateB = b.completedAt || b.initiatedAt;
+        
         if (!dateA || !dateB) return 0;
-        return dateB.toMillis() - dateA.toMillis();
+        
+        // Convert to milliseconds safely
+        const timeA = this.getTimestamp(dateA);
+        const timeB = this.getTimestamp(dateB);
+        
+        return timeB - timeA;
       });
     } catch (error) {
       console.error('Error fetching payment history:', error);
       return [];
     }
   }
+
+  // Helper method to safely extract timestamp in milliseconds
+  private static getTimestamp(date: any): number {
+    if (!date) return 0;
+    
+    // Firestore Timestamp
+    if (date.toMillis && typeof date.toMillis === 'function') {
+      return date.toMillis();
+    }
+    
+    // Firestore Timestamp with seconds/nanoseconds
+    if (date.seconds) {
+      return date.seconds * 1000 + (date.nanoseconds || 0) / 1000000;
+    }
+    
+    // JavaScript Date
+    if (date instanceof Date) {
+      return date.getTime();
+    }
+    
+    // Unix timestamp (number)
+    if (typeof date === 'number') {
+      return date;
+    }
+    
+    // ISO string
+    if (typeof date === 'string') {
+      return new Date(date).getTime();
+    }
+    
+    return 0;
+  }
+
+  // static async getPaymentHistory(tenantId: string, agentUserId?: string): Promise<Payment[]> {
+  //   try {
+  //     const payments: Payment[] = [];
+      
+  //     if (agentUserId) {
+  //       // Fetch from payments subcollection using billingMonths structure
+  //       const paymentsSnapshot = await getDocs(
+  //         collection(db, 'payments', tenantId, 'billingMonths')
+  //       );
+        
+  //       for (const monthDoc of paymentsSnapshot.docs) {
+  //         const monthData = monthDoc.data();
+  //         if (monthData.payments && Array.isArray(monthData.payments)) {
+  //           payments.push(...monthData.payments);
+  //         }
+  //       }
+  //     } else {
+  //       // Fallback: search transactions collection
+  //       const transactionsQuery = query(
+  //         collection(db, 'transactions'),
+  //         where('userId', '==', tenantId),
+  //         orderBy('createdAt', 'desc')
+  //       );
+        
+  //       const snapshot = await getDocs(transactionsQuery);
+  //       for (const doc of snapshot.docs) {
+  //         const data = doc.data();
+  //         payments.push({
+  //           userName: data.userName || '',
+  //           agentId: data.agentId || '',
+  //           amount: data.amount || 0,
+  //           arrears: data.arrears || 0,
+  //           invoiceId: data.invoiceId || '',
+  //           billingMonth: data.billingMonth || '',
+  //           currency: 'KES',
+  //           phone: '',
+  //           provider: '',
+  //           reference: data.reference || doc.id,
+  //           accessCode: '',
+  //           status: data.status || 'pending',
+  //           initiatedAt: data.createdAt,
+  //           completedAt: data.completedAt,
+  //           subaccountCode: '',
+  //           commissionRate: 0
+  //         });
+  //       }
+  //     }
+      
+  //     // Sort by date
+  //     return payments.sort((a, b) => {
+  //       const dateA = a.completedAt || a.initiatedAt;
+  //       const dateB = b.completedAt || b.initiatedAt;
+  //       if (!dateA || !dateB) return 0;
+  //       return dateB.toMillis() - dateA.toMillis();
+  //     });
+  //   } catch (error) {
+  //     console.error('Error fetching payment history:', error);
+  //     return [];
+  //   }
+  // }
 }
 
 // Agent Service
