@@ -4,6 +4,8 @@ import { defineSecret } from "firebase-functions/params";
 import * as admin from "firebase-admin";
 import axios from "axios";
 import * as crypto from "crypto";
+import { hash } from "@node-rs/argon2";
+
 
 // Initialize Firebase Admin only if not already initialized
 if (!admin.apps.length) {
@@ -92,6 +94,29 @@ interface ProcessPaymentRequest {
     arrears: number;
     agentId: string;
   };
+}
+
+interface CreateUserRequest {
+  email: string;
+  password: string;
+  userData: {
+    localId?: string; // OPTIONAL - if provided, use as custom UID
+    name: string;
+    phone: string;
+    tier?: string;
+    type?: string;
+    storage?: boolean;
+    isPremium?: boolean;
+    assetType?: 'landlord' | 'agent';
+    cyberId?: string; // OPTIONAL - only for agent-created users
+    company?: {
+      name: string;
+      address: string;
+      phone: string;
+      email: string;
+    } | null;
+  };
+  creationType?: 'self' | 'agent'; // Identify who's creating the account
 }
 
 // ============= FUNCTION 1: SETUP SUBACCOUNT =============
@@ -1771,6 +1796,462 @@ export const listBanks = onCall({
     throw new HttpsError(
       "internal",
       `Failed to list banks: ${error.message}`
+    );
+  }
+});
+
+
+
+/**
+ * Hash password using argon2id (server-side)
+ */
+async function hashPassword(password: string): Promise<string> {
+  try {
+    const passwordHash = await hash(password, {
+      memoryCost: 65536, // 64 MB
+      timeCost: 3,
+      parallelism: 1,
+      outputLen: 32,
+    });
+    return passwordHash;
+  } catch (error) {
+    console.error("Error hashing password:", error);
+    throw new Error("Failed to hash password");
+  }
+}
+
+/**
+ * UNIFIED Cloud Function for creating Firebase Auth users
+ * Works for BOTH:
+ * 1. Self sign-up (Firebase generates UID)
+ * 2. Agent-created accounts (Custom UID = National ID)
+ */
+// export const createUserWithFirebaseAuth = onCall({
+//   timeoutSeconds: 60,
+//   memory: "512MiB",
+//   maxInstances: 10,
+//   region: "africa-south1",
+//   cors: true,
+// }, async (request: CallableRequest<CreateUserRequest>) => {
+//   try {
+//     // Validate authentication
+//     // For self sign-up, user might not be authenticated
+//     // For agent creation, user must be authenticated
+//     const { email, password, userData, creationType } = request.data;
+
+//     // For agent-created accounts, require authentication
+//     if (creationType === 'agent' && !request.auth) {
+//       throw new HttpsError(
+//         "unauthenticated",
+//         "Authentication required to create accounts on behalf of users"
+//       );
+//     }
+
+//     // Validate required fields
+//     if (!email || !password || !userData) {
+//       throw new HttpsError(
+//         "invalid-argument",
+//         "Email, password, and userData are required"
+//       );
+//     }
+
+//     if (!userData.name || !userData.phone) {
+//       throw new HttpsError(
+//         "invalid-argument",
+//         "Name and phone are required in userData"
+//       );
+//     }
+
+//     // For agent-created accounts, require localId and cyberId
+//     if (creationType === 'agent' && (!userData.localId || !userData.cyberId)) {
+//       throw new HttpsError(
+//         "invalid-argument",
+//         "localId and cyberId are required for agent-created accounts"
+//       );
+//     }
+
+//     // Format phone number to E.164 format
+//     let formattedPhone = userData.phone.replace(/[\s-]/g, '');
+    
+//     if (!formattedPhone.startsWith('+')) {
+//       if (formattedPhone.startsWith('254')) {
+//         formattedPhone = '+' + formattedPhone;
+//       } else if (formattedPhone.startsWith('0')) {
+//         formattedPhone = '+254' + formattedPhone.substring(1);
+//       } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
+//         formattedPhone = '+254' + formattedPhone;
+//       } else {
+//         formattedPhone = '+' + formattedPhone;
+//       }
+//     }
+
+//     console.log(`Creating user - Type: ${creationType}, Email: ${email}, Phone: ${formattedPhone}`);
+
+//     // Hash the password on the server
+//     const passwordHash = await hashPassword(password);
+//     console.log(`Password hashed successfully`);
+
+//     // Prepare Firebase Auth creation options
+//     const authUserOptions: any = {
+//       email: email,
+//       password: password,
+//       phoneNumber: formattedPhone,
+//       displayName: userData.name,
+//       emailVerified: false,
+//       disabled: false,
+//     };
+
+//     // If custom UID provided (agent-created), use it
+//     if (userData.localId) {
+//       authUserOptions.uid = userData.localId;
+//       console.log(`Using custom UID: ${userData.localId}`);
+//     }
+
+//     // Create user in Firebase Auth
+//     const userRecord = await admin.auth().createUser(authUserOptions);
+//     console.log(`✅ Firebase Auth user created with UID: ${userRecord.uid}`);
+
+//     // Determine document ID: use localId if provided, otherwise use generated UID
+//     const documentId = userData.localId || userRecord.uid;
+
+//     // Create Firestore document
+//     const db = admin.firestore();
+//     const userDocRef = db.collection('users').doc(documentId);
+    
+//     const firestoreUserData: any = {
+//       id: documentId,
+//       localId: documentId,
+//       name: userData.name,
+//       email: email,
+//       phone: formattedPhone,
+//       passwordHash: passwordHash,
+//       tier: userData.tier || 'free',
+//       type: userData.type || 'free',
+//       storage: userData.storage || false,
+//       isPremium: userData.isPremium || false,
+//       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+//       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+//       userId: documentId,
+//       status: 'active',
+//       firebaseAuthUid: userRecord.uid,
+//       creationType: creationType || 'self',
+//     };
+
+//     // Add cyberId for agent-created accounts
+//     if (userData.cyberId) {
+//       firestoreUserData.cyberId = userData.cyberId;
+//     }
+
+//     // Add assetType for agent-created accounts
+//     if (userData.assetType) {
+//       firestoreUserData.assetType = userData.assetType;
+//     }
+
+//     // Add company info if provided
+//     if (userData.company) {
+//       firestoreUserData.company = userData.company;
+//     }
+
+//     // Write to Firestore
+//     await userDocRef.set(firestoreUserData, { merge: true });
+//     console.log(`✅ Firestore user document created: ${documentId}`);
+
+//     // Return appropriate response
+//     return {
+//       success: true,
+//       message: creationType === 'agent' 
+//         ? "User account created successfully by agent"
+//         : "Account created successfully",
+//       data: {
+//         uid: userRecord.uid,
+//         documentId: documentId,
+//         email: userRecord.email,
+//         phone: userRecord.phoneNumber,
+//         displayName: userRecord.displayName,
+//         tier: userData.tier || 'free',
+//         assetType: userData.assetType,
+//         isCustomUid: !!userData.localId,
+//       },
+//     };
+
+//   } catch (error: any) {
+//     console.error("Error in createUserWithFirebaseAuth:", error);
+
+//     // Handle specific Firebase Auth errors
+//     if (error.code === 'auth/email-already-in-use') {
+//       throw new HttpsError(
+//         "already-exists",
+//         "A user with this email already exists"
+//       );
+//     }
+
+//     if (error.code === 'auth/phone-number-already-exists') {
+//       throw new HttpsError(
+//         "already-exists",
+//         "A user with this phone number already exists"
+//       );
+//     }
+
+//     if (error.code === 'auth/invalid-email') {
+//       throw new HttpsError(
+//         "invalid-argument",
+//         "Invalid email address"
+//       );
+//     }
+
+//     if (error.code === 'auth/invalid-password') {
+//       throw new HttpsError(
+//         "invalid-argument",
+//         "Password must be at least 6 characters"
+//       );
+//     }
+
+//     if (error.code === 'auth/invalid-phone-number') {
+//       throw new HttpsError(
+//         "invalid-argument",
+//         "Invalid phone number format"
+//       );
+//     }
+
+//     if (error.code === 'auth/uid-already-exists') {
+//       throw new HttpsError(
+//         "already-exists",
+//         "A user with this ID already exists"
+//       );
+//     }
+
+//     if (error instanceof HttpsError) {
+//       throw error;
+//     }
+
+//     throw new HttpsError(
+//       "internal",
+//       `Failed to create user: ${error.message}`
+//     );
+//   }
+// });
+
+export const createUserWithFirebaseAuth = onCall({
+  timeoutSeconds: 60,
+  memory: "512MiB",
+  maxInstances: 10,
+  region: "africa-south1",
+  cors: true,
+}, async (request: CallableRequest<CreateUserRequest>) => {
+  try {
+    // Validate authentication
+    // For self sign-up, user might not be authenticated
+    // For agent creation, user must be authenticated
+    const { email, password, userData, creationType } = request.data;
+
+    // For agent-created accounts, require authentication
+    if (creationType === 'agent' && !request.auth) {
+      throw new HttpsError(
+        "unauthenticated",
+        "Authentication required to create accounts on behalf of users"
+      );
+    }
+
+    // Validate required fields
+    if (!email || !password || !userData) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Email, password, and userData are required"
+      );
+    }
+
+    if (!userData.name || !userData.phone) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Name and phone are required in userData"
+      );
+    }
+
+    // For agent-created accounts, require localId and cyberId
+    if (creationType === 'agent' && (!userData.localId || !userData.cyberId)) {
+      throw new HttpsError(
+        "invalid-argument",
+        "localId and cyberId are required for agent-created accounts"
+      );
+    }
+
+    // Format phone number to E.164 format
+    let formattedPhone = userData.phone.replace(/[\s-]/g, '');
+    
+    if (!formattedPhone.startsWith('+')) {
+      if (formattedPhone.startsWith('254')) {
+        formattedPhone = '+' + formattedPhone;
+      } else if (formattedPhone.startsWith('0')) {
+        formattedPhone = '+254' + formattedPhone.substring(1);
+      } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
+        formattedPhone = '+254' + formattedPhone;
+      } else {
+        formattedPhone = '+' + formattedPhone;
+      }
+    }
+
+    console.log(`Creating user - Type: ${creationType}, Email: ${email}, Phone: ${formattedPhone}`);
+
+    // Hash the password on the server
+    const passwordHash = await hashPassword(password);
+    console.log(`Password hashed successfully`);
+
+    // Prepare Firebase Auth creation options
+    const authUserOptions: any = {
+      email: email,
+      password: password,
+      phoneNumber: formattedPhone,
+      displayName: userData.name,
+      emailVerified: false,
+      disabled: false,
+    };
+
+    // If custom UID provided (agent-created), use it
+    if (userData.localId) {
+      authUserOptions.uid = userData.localId;
+      console.log(`Using custom UID: ${userData.localId}`);
+    }
+
+    // Create user in Firebase Auth
+    const userRecord = await admin.auth().createUser(authUserOptions);
+    console.log(`✅ Firebase Auth user created with UID: ${userRecord.uid}`);
+
+    // Determine document ID: use localId if provided, otherwise use generated UID
+    const documentId = userData.localId || userRecord.uid;
+
+    // Calculate subscription expiry (30 days from now)
+    const expiryDate = new Date();
+    expiryDate.setDate(expiryDate.getDate() + 30);
+    const subscriptionExpiry = admin.firestore.Timestamp.fromDate(expiryDate);
+
+    // Create Firestore document
+    const db = admin.firestore();
+    const userDocRef = db.collection('users').doc(documentId);
+    
+    const firestoreUserData: any = {
+      id: documentId,
+      localId: documentId,
+      name: userData.name,
+      email: email,
+      phone: formattedPhone,
+      passwordHash: passwordHash,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      userId: documentId,
+      status: 'active',
+      firebaseAuthUid: userRecord.uid,
+      creationType: creationType || 'self',
+      subscriptionExpiry: subscriptionExpiry,
+    };
+
+    // Set user properties based on creationType
+    if (creationType === 'self') {
+      // Self sign-ups get premium features
+      firestoreUserData.tier = 'pro';
+      firestoreUserData.type = 'paid';
+      firestoreUserData.storage = true;
+      firestoreUserData.isPremium = true;
+    } else {
+      // Agent-created accounts use provided values or defaults
+      firestoreUserData.tier = userData.tier || 'free';
+      firestoreUserData.type = userData.type || 'free';
+      firestoreUserData.storage = userData.storage || false;
+      firestoreUserData.isPremium = userData.isPremium || false;
+    }
+
+    // Add cyberId for agent-created accounts
+    if (userData.cyberId) {
+      firestoreUserData.cyberId = userData.cyberId;
+    }
+
+    // Add assetType for agent-created accounts
+    if (userData.assetType) {
+      firestoreUserData.assetType = userData.assetType;
+    }
+
+    // Add company info if provided
+    if (userData.company) {
+      firestoreUserData.company = userData.company;
+    }
+
+    // Write to Firestore
+    await userDocRef.set(firestoreUserData, { merge: true });
+    console.log(`✅ Firestore user document created: ${documentId}`);
+
+    // Return appropriate response
+    return {
+      success: true,
+      message: creationType === 'agent' 
+        ? "User account created successfully by agent"
+        : "Account created successfully",
+      data: {
+        uid: userRecord.uid,
+        documentId: documentId,
+        email: userRecord.email,
+        phone: userRecord.phoneNumber,
+        displayName: userRecord.displayName,
+        tier: firestoreUserData.tier,
+        type: firestoreUserData.type,
+        isPremium: firestoreUserData.isPremium,
+        assetType: userData.assetType,
+        isCustomUid: !!userData.localId,
+        subscriptionExpiry: subscriptionExpiry.toDate(),
+      },
+    };
+
+  } catch (error: any) {
+    console.error("Error in createUserWithFirebaseAuth:", error);
+
+    // Handle specific Firebase Auth errors
+    if (error.code === 'auth/email-already-in-use') {
+      throw new HttpsError(
+        "already-exists",
+        "A user with this email already exists"
+      );
+    }
+
+    if (error.code === 'auth/phone-number-already-exists') {
+      throw new HttpsError(
+        "already-exists",
+        "A user with this phone number already exists"
+      );
+    }
+
+    if (error.code === 'auth/invalid-email') {
+      throw new HttpsError(
+        "invalid-argument",
+        "Invalid email address"
+      );
+    }
+
+    if (error.code === 'auth/invalid-password') {
+      throw new HttpsError(
+        "invalid-argument",
+        "Password must be at least 6 characters"
+      );
+    }
+
+    if (error.code === 'auth/invalid-phone-number') {
+      throw new HttpsError(
+        "invalid-argument",
+        "Invalid phone number format"
+      );
+    }
+
+    if (error.code === 'auth/uid-already-exists') {
+      throw new HttpsError(
+        "already-exists",
+        "A user with this ID already exists"
+      );
+    }
+
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+
+    throw new HttpsError(
+      "internal",
+      `Failed to create user: ${error.message}`
     );
   }
 });
