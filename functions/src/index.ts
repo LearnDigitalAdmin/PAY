@@ -5,6 +5,7 @@ import * as admin from "firebase-admin";
 import axios from "axios";
 import * as crypto from "crypto";
 import { hash } from "@node-rs/argon2";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 
 
 
@@ -140,7 +141,7 @@ export const chargeSmsTopUp = onCall({
     const reference = `SMS_${userId}_${Date.now()}`;
 
     const chargePayload = {
-      email: `${userId}@myregister.local`,
+      email: `${userId}@cogvana.co.ke`,
       amount: amountInCents,
       currency: "KES",
       mobile_money: {
@@ -2374,7 +2375,8 @@ async function handlePlotYanguSubscriptionCharge(
       lastPaymentDate: admin.firestore.FieldValue.serverTimestamp(),
       lastPaymentReference: reference,
       lastPaymentAmount: data.amount / 100,
-      planName: planName
+      planName: planName,
+      isTrial: false
     }, { merge: true });
 
     console.log(`Successfully activated subscription for user ${userId}`);
@@ -2964,18 +2966,14 @@ export const createUserWithFirebaseAuth = onCall({
     const userRecord = await admin.auth().createUser(authUserOptions);
     console.log(`✅ Firebase Auth user created with UID: ${userRecord.uid}`);
 
+    // ... unchanged code above stays the same until the expiry/tier section ...
+
     // Determine document ID: use localId if provided, otherwise use generated UID
     const documentId = userData.localId || userRecord.uid;
 
-    // Calculate subscription expiry (30 days from now)
-    const expiryDate = new Date();
-    expiryDate.setDate(expiryDate.getDate() + 30);
-    const subscriptionExpiry = admin.firestore.Timestamp.fromDate(expiryDate);
-
-    // Create Firestore document
     const db = admin.firestore();
     const userDocRef = db.collection('users').doc(documentId);
-    
+
     const firestoreUserData: any = {
       id: documentId,
       localId: documentId,
@@ -2989,22 +2987,30 @@ export const createUserWithFirebaseAuth = onCall({
       status: 'active',
       firebaseAuthUid: userRecord.uid,
       creationType: creationType || 'self',
-      subscriptionExpiry: subscriptionExpiry,
     };
 
     // Set user properties based on creationType
     if (creationType === 'self') {
-      // Self sign-ups get premium features
-      firestoreUserData.tier = 'pro';
+      // Self sign-ups get a free 3-month Business tier trial + signup bonus tokens
+      const trialEnd = new Date();
+      trialEnd.setMonth(trialEnd.getMonth() + 3);
+
+      firestoreUserData.tier = 'business';
       firestoreUserData.type = 'paid';
       firestoreUserData.storage = true;
       firestoreUserData.isPremium = true;
+      firestoreUserData.isTrial = true; // marks this as an unpaid trial grant, not a real subscription
+      firestoreUserData.subscriptionExpiry = admin.firestore.Timestamp.fromDate(trialEnd);
+      firestoreUserData.trialStartedAt = admin.firestore.FieldValue.serverTimestamp();
+      firestoreUserData.tokens = 100; // signup bonus
     } else {
       // Agent-created accounts use provided values or defaults
       firestoreUserData.tier = userData.tier || 'free';
       firestoreUserData.type = userData.type || 'free';
       firestoreUserData.storage = userData.storage || false;
       firestoreUserData.isPremium = userData.isPremium || false;
+      firestoreUserData.isTrial = false;
+      firestoreUserData.tokens = 0;
     }
 
     // Add cyberId for agent-created accounts
@@ -3029,7 +3035,7 @@ export const createUserWithFirebaseAuth = onCall({
     // Return appropriate response
     return {
       success: true,
-      message: creationType === 'agent' 
+      message: creationType === 'agent'
         ? "User account created successfully by agent"
         : "Account created successfully",
       data: {
@@ -3041,9 +3047,11 @@ export const createUserWithFirebaseAuth = onCall({
         tier: firestoreUserData.tier,
         type: firestoreUserData.type,
         isPremium: firestoreUserData.isPremium,
+        isTrial: firestoreUserData.isTrial,
+        tokens: firestoreUserData.tokens,
         assetType: userData.assetType,
         isCustomUid: !!userData.localId,
-        subscriptionExpiry: subscriptionExpiry.toDate(),
+        subscriptionExpiry: firestoreUserData.subscriptionExpiry?.toDate() ?? null,
       },
     };
 
@@ -3103,3 +3111,54 @@ export const createUserWithFirebaseAuth = onCall({
     );
   }
 });
+
+
+
+export const expireBusinessTrials = onSchedule({
+  schedule: "0 8 * * 1",
+  timeZone: "Africa/Nairobi",
+  region: "us-central1",
+  memory: "256MiB",
+  timeoutSeconds: 300,
+}, async () => {
+  const db = admin.firestore();
+  const now = admin.firestore.Timestamp.now();
+  const PAGE_SIZE = 400; // headroom under Firestore's 500-write batch limit
+
+  let totalExpired = 0;
+
+  // Loop in case there are more expired trials than one batch can hold
+  while (true) {
+    const snapshot = await db.collection('users')
+      .where('isTrial', '==', true)
+      .where('subscriptionExpiry', '<=', now)
+      .limit(PAGE_SIZE)
+      .get();
+
+    if (snapshot.empty) break;
+
+    const batch = db.batch();
+    snapshot.docs.forEach((docSnap) => {
+      batch.update(docSnap.ref, {
+        tier: 'free',
+        type: 'free',
+        storage: false,
+        isPremium: false,
+        isTrial: false,
+        trialEndedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    await batch.commit();
+    totalExpired += snapshot.size;
+    console.log(`Downgraded ${snapshot.size} expired trial(s), running total: ${totalExpired}`);
+
+    if (snapshot.size < PAGE_SIZE) break; // no more pages
+  }
+
+  console.log(`✅ expireBusinessTrials done — ${totalExpired} account(s) downgraded to free.`);
+});
+
+
+
+
