@@ -23,6 +23,30 @@ const project2App = admin.initializeApp({
   credential: admin.credential.cert("./project2keys.json"),
 }, "project2");
 
+// ─── MyChama (mychama1) — lazy, IAM-based secondary app ────────────────────
+// Mirrors CYBER's functions/src/config/mychama.config.ts exactly: this
+// project's default compute service account must be granted "Firebase
+// Admin" on the mychama1 Google Cloud project via IAM (same grant CYBER
+// already has) — no service-account JSON, no extra secret to rotate.
+// Initialisation is lazy + idempotent so a cold start that never touches a
+// MyChama charge pays nothing for it.
+const MYCHAMA_PROJECT_ID = "mychama1";
+const MYCHAMA_APP_NAME = "mychama";
+let mychamaDbCached: admin.firestore.Firestore | null = null;
+
+function mychamaDb(): admin.firestore.Firestore {
+  if (mychamaDbCached) return mychamaDbCached;
+  const existing = admin.apps.find((a) => a && a.name === MYCHAMA_APP_NAME);
+  const mychamaApp = existing || admin.initializeApp(
+    { credential: admin.credential.applicationDefault(), projectId: MYCHAMA_PROJECT_ID },
+    MYCHAMA_APP_NAME
+  );
+  mychamaDbCached = mychamaApp.firestore();
+  mychamaDbCached.settings({ ignoreUndefinedProperties: true });
+  return mychamaDbCached;
+}
+
+
 // ============= CONFIGURATION =============
 const PAYSTACK_SECRET_KEY = defineSecret('PAYSTACK_SECRET_KEY');
 const PAYSTACK_API_BASE = "https://api.paystack.co";
@@ -523,8 +547,274 @@ function determineChargeType(reference: string): string {
   if (reference.startsWith("MOV_"))    return "movies_payment";
   if (reference.startsWith("BOOK_"))   return "pns_booking_payment";
   if (reference.startsWith("STORE_"))  return "pns_storage_purchase";
+  // MyChama — MCW- (WhatsApp bot, CYBER) and MCA- (app, mychama1's own
+  // functions) are both member payments and share one handler; MCS- (SMS
+  // credit top-up) and MCP- (plan billing) are separate. See
+  // docs/CONVENTIONS.md §5 in the Chama repo for the full registry — this
+  // is the one place outside that repo the registry has to be kept in sync.
+  if (reference.startsWith("MCW-") || reference.startsWith("MCA-")) return "mychama_payment";
+  if (reference.startsWith("MCS-")) return "mychama_sms_topup";
+  if (reference.startsWith("MCP-")) return "mychama_plan_billing";
   return "unknown";
 }
+
+// ============================================================================
+// MYCHAMA — payment application, SMS top-up, plan billing
+//
+// This is the ONLY place any of these three things happen. mychama1's own
+// Python functions (functions/mychama/{contributions,loans,mgr}.py) and
+// CYBER's WhatsApp bot both only ever CREATE a paymentIntents doc and
+// trigger a Paystack charge — neither one ever marks money as received.
+// The spill-forward math below is a deliberate line-for-line port of
+// functions/shared/money.py's counterparts in the Chama repo; if either
+// side's formula changes, change both in the same commit (see that repo's
+// docs/CONVENTIONS.md).
+// ============================================================================
+
+async function applyMyChamaContributionPayment(
+  db: admin.firestore.Firestore,
+  chamaId: string,
+  memberId: string,
+  startContributionId: string,
+  amount: number
+): Promise<void> {
+  const contribRef = db.collection(`chamas/${chamaId}/contributions`);
+  const snap = await contribRef.where("memberId", "==", memberId).get();
+  const all = snap.docs.sort((a, b) => (a.data().periodKey || "").localeCompare(b.data().periodKey || ""));
+  const startIdx = Math.max(0, all.findIndex((d) => d.id === startContributionId));
+
+  let remaining = amount;
+  let appliedTotal = 0;
+  const batch = db.batch();
+  const now = Date.now();
+
+  for (const doc of all.slice(startIdx)) {
+    if (remaining <= 0.009) break;
+    const data = doc.data();
+    const due = (data.amount || 0) - (data.paidAmount || 0);
+    if (due <= 0.009) continue;
+    const applied = Math.min(due, remaining);
+    const newPaid = (data.paidAmount || 0) + applied;
+    remaining -= applied;
+    appliedTotal += applied;
+    const newStatus = newPaid >= data.amount - 0.01 ? "paid" : "partial";
+    const update: Record<string, unknown> = { paidAmount: newPaid, status: newStatus, updatedAt: now };
+    if (newStatus === "paid" && !data.paidOn) update.paidOn = new Date().toISOString().slice(0, 10);
+    batch.update(doc.ref, update);
+  }
+
+  const memberRef = db.doc(`chamas/${chamaId}/members/${memberId}`);
+  const memberSnap = await memberRef.get();
+  const member = memberSnap.data() || {};
+  const creditDelta = remaining > 0.009 ? Math.round(remaining * 100) / 100 : 0;
+
+  batch.update(memberRef, {
+    creditBalance: (member.creditBalance || 0) + creditDelta,
+    totalContributed: (member.totalContributed || 0) + appliedTotal,
+    updatedAt: now,
+  });
+  await batch.commit();
+}
+
+async function applyMyChamaLoanRepayment(
+  db: admin.firestore.Firestore,
+  chamaId: string,
+  loanId: string,
+  amount: number
+): Promise<void> {
+  const loanRef = db.doc(`chamas/${chamaId}/loans/${loanId}`);
+  const loanSnap = await loanRef.get();
+  if (!loanSnap.exists) return;
+  const loan = loanSnap.data()!;
+  if (!["active", "overdue"].includes(loan.status)) return;
+
+  const schedule = [...loan.schedule];
+  let remaining = amount;
+  for (const inst of schedule) {
+    if (remaining <= 0.009) break;
+    const due = inst.due - (inst.paidAmount || 0);
+    if (due <= 0.009) continue;
+    const applied = Math.min(due, remaining);
+    inst.paidAmount = (inst.paidAmount || 0) + applied;
+    remaining -= applied;
+    inst.paid = inst.paidAmount >= inst.due - 0.01;
+  }
+
+  const newStatus = schedule.every((s) => s.paid) ? "completed" : "active";
+  const now = Date.now();
+  const batch = db.batch();
+  batch.update(loanRef, { schedule, status: newStatus, updatedAt: now });
+
+  if (remaining > 0.009) {
+    const memberRef = db.doc(`chamas/${chamaId}/members/${loan.memberId}`);
+    const memberSnap = await memberRef.get();
+    const member = memberSnap.data() || {};
+    const creditDelta = Math.round(remaining * 100) / 100;
+    batch.update(memberRef, { creditBalance: (member.creditBalance || 0) + creditDelta, updatedAt: now });
+  }
+  await batch.commit();
+}
+
+async function applyMyChamaMgrContribution(
+  db: admin.firestore.Firestore,
+  chamaId: string,
+  potId: string,
+  memberId: string,
+  amount: number,
+  ref: string
+): Promise<void> {
+  const potRef = db.doc(`chamas/${chamaId}/mgrPots/${potId}`);
+  const potSnap = await potRef.get();
+  if (!potSnap.exists) return;
+  const pot = potSnap.data()!;
+  if (pot.status !== "active") return;
+
+  const now = Date.now();
+  const today = new Date().toISOString().slice(0, 10);
+  const existing = await db
+    .collection(`chamas/${chamaId}/mgrPots/${potId}/records`)
+    .where("memberId", "==", memberId)
+    .where("period", "==", pot.period)
+    .limit(1)
+    .get();
+
+  if (!existing.empty) {
+    await existing.docs[0].ref.update({ status: "paid", amount, date: today, method: "paystack", ref, updatedAt: now });
+  } else {
+    await db.collection(`chamas/${chamaId}/mgrPots/${potId}/records`).add({
+      period: pot.period, memberId, status: "paid", amount, date: today, method: "paystack", ref, createdAt: now, updatedAt: now,
+    });
+  }
+}
+
+/**
+ * Applies an MCW-/MCA- payment once Paystack confirms it. `reference` is
+ * both the Paystack reference and the mychama1 paymentIntents document ID
+ * — that doubles as the idempotency check: if the intent is already
+ * `success`, this is a replayed webhook event and we do nothing further.
+ */
+async function handleMyChamaPayment(reference: string, chamaIdHint?: string): Promise<void> {
+  const db2 = mychamaDb();
+
+  // reference format: MCW-{chamaId}-{purposeCode}-{ts}-{rand} — chamaId is
+  // also usually available in the webhook payload's metadata, used as a
+  // cross-check / fallback if the reference format ever changes.
+  const parts = reference.split("-");
+  const chamaId = chamaIdHint || parts[1];
+  if (!chamaId) {
+    console.error("MyChama payment: could not determine chamaId from reference", reference);
+    return;
+  }
+
+  const intentRef = db2.doc(`chamas/${chamaId}/paymentIntents/${reference}`);
+  const intentSnap = await intentRef.get();
+  if (!intentSnap.exists) {
+    console.error("MyChama payment: no matching paymentIntent for reference", reference);
+    return;
+  }
+  const intent = intentSnap.data()!;
+  if (intent.status === "success") return; // already applied — replayed webhook event
+
+  if (intent.purpose === "contribution" && intent.contributionId) {
+    await applyMyChamaContributionPayment(db2, chamaId, intent.memberId, intent.contributionId, intent.amount);
+  } else if (intent.purpose === "loan_repayment" && intent.loanId) {
+    await applyMyChamaLoanRepayment(db2, chamaId, intent.loanId, intent.amount);
+  } else if (intent.purpose === "mgr_contribution" && intent.potId) {
+    await applyMyChamaMgrContribution(db2, chamaId, intent.potId, intent.memberId, intent.amount, reference);
+  }
+
+  const now = Date.now();
+  await db2.collection(`chamas/${chamaId}/transactions`).add({
+    type: intent.purpose,
+    memberId: intent.memberId,
+    amount: intent.amount,
+    grossAmount: intent.grossAmount,
+    paystackFee: intent.paystackFee,
+    ourFee: intent.ourFee,
+    method: "paystack",
+    ref: reference,
+    date: new Date().toISOString().slice(0, 10),
+    settled: false,
+    direction: "in",
+    channel: intent.channel || "app",
+    intentId: reference,
+    createdAt: now,
+  });
+
+  await intentRef.update({ status: "success", updatedAt: now });
+
+  // Best-effort confirmation SMS via MyChama's own HostPinnacle sender —
+  // failure here must never fail the webhook (Paystack will retry the
+  // whole event if this handler throws, and the payment is already
+  // applied above).
+  try {
+    const memberSnap = await db2.doc(`chamas/${chamaId}/members/${intent.memberId}`).get();
+    const phone = memberSnap.data()?.phoneNormalized;
+    if (phone) {
+      await sendMyChamaSms(phone, `MyChama: payment of KES ${Math.round(intent.amount)} received. Thank you.`);
+    }
+  } catch (e) {
+    console.error("MyChama payment confirmation SMS failed (non-fatal):", e);
+  }
+}
+
+async function handleMyChamaSmsTopup(reference: string, chamaIdHint?: string): Promise<void> {
+  const db2 = mychamaDb();
+  const chamaId = chamaIdHint || reference.split("-")[1];
+  if (!chamaId) return;
+
+  const topupRef = db2.doc(`chamas/${chamaId}/smsTopUps/${reference}`);
+  const topupSnap = await topupRef.get();
+  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
+  const topup = topupSnap.data()!;
+
+  const chamaRef = db2.doc(`chamas/${chamaId}`);
+  const chamaSnap = await chamaRef.get();
+  const chama = chamaSnap.data() || {};
+  await chamaRef.update({ smsCredits: (chama.smsCredits || 0) + topup.amountKes, updatedAt: Date.now() });
+  await topupRef.update({ status: "success", updatedAt: Date.now() });
+}
+
+async function handleMyChamaPlanBilling(reference: string, chamaIdHint?: string, plan?: string): Promise<void> {
+  const db2 = mychamaDb();
+  const chamaId = chamaIdHint || reference.split("-")[1];
+  if (!chamaId || !plan) return;
+
+  const billingRef = db2.doc(`chamas/${chamaId}/planBilling/${reference}`);
+  const billingSnap = await billingRef.get();
+  if (billingSnap.exists && billingSnap.data()?.status === "success") return;
+
+  const now = Date.now();
+  const expiry = new Date();
+  expiry.setDate(expiry.getDate() + 30);
+  await db2.doc(`chamas/${chamaId}`).update({ plan, planExpiry: expiry.toISOString().slice(0, 10), updatedAt: now });
+  await billingRef.set({ status: "success", plan, updatedAt: now }, { merge: true });
+}
+
+// MyChama's own HostPinnacle credentials — separate from PAY's shared
+// SMS_CONFIG so MyChama's sender ID/branding never gets mixed with another
+// product's. Set with:
+//   firebase functions:secrets:set MYCHAMA_HP_SMS_USERID (and _PASSWORD/_APIKEY/_SENDERID)
+const MYCHAMA_HP_USERID = defineSecret("MYCHAMA_HP_SMS_USERID");
+const MYCHAMA_HP_PASSWORD = defineSecret("MYCHAMA_HP_SMS_PASSWORD");
+const MYCHAMA_HP_APIKEY = defineSecret("MYCHAMA_HP_SMS_APIKEY");
+const MYCHAMA_HP_SENDERID = defineSecret("MYCHAMA_HP_SMS_SENDERID");
+
+async function sendMyChamaSms(phoneE164: string, message: string): Promise<void> {
+  await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", {
+    userid: MYCHAMA_HP_USERID.value(),
+    password: MYCHAMA_HP_PASSWORD.value(),
+    apikey: MYCHAMA_HP_APIKEY.value(),
+    senderid: MYCHAMA_HP_SENDERID.value(),
+    mobile: phoneE164.replace(/^\+/, ""),
+    msg: message.slice(0, 400),
+    sendMethod: "quick",
+    msgType: "text",
+    output: "json",
+    duplicatecheck: "true",
+  });
+}
+
 
 
 // ============================================================================
@@ -1961,6 +2251,19 @@ export const paystackCallback = onRequest({
         await handlePNSStoragePurchase(reference, data, metadata);
       }
 
+      // ============================================
+      // 8. MYCHAMA — payment (WhatsApp bot or app), SMS top-up, plan billing
+      // ============================================
+      else if (chargeType === 'mychama_payment' || reference.startsWith('MCW-') || reference.startsWith('MCA-')) {
+        await handleMyChamaPayment(reference, metadata.chamaId);
+      }
+      else if (chargeType === 'mychama_sms_topup' || reference.startsWith('MCS-')) {
+        await handleMyChamaSmsTopup(reference, metadata.chamaId);
+      }
+      else if (chargeType === 'mychama_plan_billing' || reference.startsWith('MCP-')) {
+        await handleMyChamaPlanBilling(reference, metadata.chamaId, metadata.plan);
+      }
+
       else {
         console.warn(`Unknown reference type: ${reference}`);
       }
@@ -2048,6 +2351,23 @@ export const paystackCallback = onRequest({
           await db.collection("storagePurchases").doc(purchaseId).update({
             status: "failed",
           }).catch(e => console.error("Failed to update storage purchase failure:", e));
+        }
+      }
+
+      else if (reference.startsWith('MCW-') || reference.startsWith('MCA-') || reference.startsWith('MCS-') || reference.startsWith('MCP-')) {
+        // MyChama — mark whichever collection this reference belongs to as
+        // failed, so the app/bot stop showing "pending" forever. chamaId is
+        // the second hyphen-delimited segment of the reference.
+        const chamaId = data.metadata?.chamaId || reference.split('-')[1];
+        if (chamaId) {
+          const db2 = mychamaDb();
+          const collection = reference.startsWith('MCS-') ? 'smsTopUps'
+            : reference.startsWith('MCP-') ? 'planBilling'
+            : 'paymentIntents';
+          await db2.doc(`chamas/${chamaId}/${collection}/${reference}`).update({
+            status: "failed",
+            updatedAt: Date.now(),
+          }).catch(e => console.error("Failed to update MyChama failure:", e));
         }
       }
 

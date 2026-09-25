@@ -1,0 +1,101 @@
+diff --git a/functions/.env b/functions/.env
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/functions/.gitignore b/functions/.gitignore
+index ef86096..283183c 100644
+--- a/functions/.gitignore
++++ b/functions/.gitignore
+@@ -9,4 +9,5 @@ typings/
+ node_modules/
+ *.local
+ 
+-project2keys.json
+\ No newline at end of file
++project2keys.json
++.env
+\ No newline at end of file
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index 15971cb..c36d25f 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -534,12 +534,17 @@ function determineChargeType(reference: string): string {
+ // with a templateKey + params; nothing here is PNS-specific.
+ // ============================================================================
+ 
++// HostPinnacle credentials now come from Secret Manager instead of a committed
++// .env file. paystackCallback (the only exported function that reaches
++// sendHostPinnacleSms, via notifyPnsPhotographerOfBookingPayment) lists these
++// four in its `secrets: [...]` array below.
++const HP_SMS_USERID   = defineSecret('HP_SMS_USERID');
++const HP_SMS_PASSWORD = defineSecret('HP_SMS_PASSWORD');
++const HP_SMS_APIKEY   = defineSecret('HP_SMS_APIKEY');
++const HP_SMS_SENDERID = defineSecret('HP_SMS_SENDERID');
++
+ const SMS_CONFIG = {
+     API_URL:   "https://smsportal.hostpinnacle.co.ke/SMSApi/send",
+-    USERID:    process.env.HP_SMS_USERID    || "",   // set in .env / functions config
+-    PASSWORD:  process.env.HP_SMS_PASSWORD  || "",
+-    APIKEY:    process.env.HP_SMS_APIKEY    || "",
+-    SENDER_ID: process.env.HP_SMS_SENDERID  || "",   // your approved sender ID
+     MAX_LENGTH: 400,
+ };
+ 
+@@ -685,18 +690,23 @@ interface SmsSendResult {
+  */
+ async function sendHostPinnacleSms(opts: SmsSendOptions): Promise<SmsSendResult> {
+     try {
+-        if (!SMS_CONFIG.USERID || !SMS_CONFIG.APIKEY) {
++        const userid   = HP_SMS_USERID.value();
++        const password = HP_SMS_PASSWORD.value();
++        const apikey   = HP_SMS_APIKEY.value();
++        const senderId = opts.senderId || HP_SMS_SENDERID.value();
++
++        if (!userid || !apikey) {
+             console.warn("HostPinnacle SMS credentials not configured — skipping SMS.");
+             return { success: false, error: "SMS credentials not configured" };
+         }
+ 
+         const params = new URLSearchParams({
+-            userid:         SMS_CONFIG.USERID,
+-            password:       SMS_CONFIG.PASSWORD,
++            userid,
++            password,
+             sendMethod:     "quick",
+             mobile:         opts.mobile,
+             msg:            opts.message,
+-            senderid:       opts.senderId || SMS_CONFIG.SENDER_ID,
++            senderid:       senderId,
+             msgType:        "text",
+             duplicatecheck: opts.duplicateCheck === false ? "false" : "true",
+             output:         "json",
+@@ -707,7 +717,7 @@ async function sendHostPinnacleSms(opts: SmsSendOptions): Promise<SmsSendResult>
+             params.toString(),
+             {
+                 headers: {
+-                    "apikey":       SMS_CONFIG.APIKEY,
++                    "apikey":       apikey,
+                     "Content-Type": "application/x-www-form-urlencoded",
+                 },
+                 timeout: 10_000,
+@@ -1857,7 +1867,7 @@ export const paystackCallback = onRequest({
+   cors: false,
+   maxInstances: 10,
+   region: "africa-south1",
+-  secrets: [PAYSTACK_SECRET_KEY],
++  secrets: [PAYSTACK_SECRET_KEY, HP_SMS_USERID, HP_SMS_PASSWORD, HP_SMS_APIKEY, HP_SMS_SENDERID],
+ }, async (req, res) => {
+   console.log(`Webhook request received: ${req.method}`);
+ 
+diff --git a/src/Firebase.tsx b/src/Firebase.tsx
+index 6a445e4..73d63df 100644
+--- a/src/Firebase.tsx
++++ b/src/Firebase.tsx
+@@ -29,7 +29,7 @@ import { getFunctions, httpsCallable } from 'firebase/functions';
+ 
+ // Firebase config
+ const firebaseConfig = {
+-  apiKey: "AIzaSyD1hg7YLv08vyR2kSWi2ymxSu2pYCRwPq8",
++  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+   authDomain: "plot-9fd6e.firebaseapp.com",
+   projectId: "plot-9fd6e",
+   storageBucket: "plot-9fd6e.firebasestorage.app",
