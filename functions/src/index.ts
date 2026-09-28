@@ -1,3 +1,7 @@
+//////PAYMENT PLATFORM FOR ALL PROJECTS
+
+
+
 import { onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
 import { onRequest } from "firebase-functions/v2/https";
 import { defineSecret } from "firebase-functions/params";
@@ -18,10 +22,21 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
+const MYREGISTER_PROJECT_ID = "my-register-728ff";
+const MYREGISTER_APP_NAME = "my-register";
+let myregisterDbCached: admin.firestore.Firestore | null = null;
 
-const project2App = admin.initializeApp({
-  credential: admin.credential.cert("./project2keys.json"),
-}, "project2");
+function myregisterDb(): admin.firestore.Firestore {
+  if (myregisterDbCached) return myregisterDbCached;
+  const existing = admin.apps.find((a) => a && a.name === MYREGISTER_APP_NAME);
+  const myregisterApp = existing || admin.initializeApp(
+    { credential: admin.credential.applicationDefault(), projectId: MYREGISTER_PROJECT_ID },
+    MYREGISTER_APP_NAME
+  );
+  myregisterDbCached = myregisterApp.firestore();
+  myregisterDbCached.settings({ ignoreUndefinedProperties: true });
+  return myregisterDbCached;
+}
 
 // ─── MyChama (mychama1) — lazy, IAM-based secondary app ────────────────────
 // Mirrors CYBER's functions/src/config/mychama.config.ts exactly: this
@@ -61,7 +76,7 @@ const TIER_RATES = {
 
 
 //declare const project2App: admin.app.App;
-const db2 = project2App.firestore(); // project-2 Firestore
+const db2 = myregisterDb(); // project-2 Firestore
  
  
 // ============= NEW: CHARGE SMS TOP-UP =============
@@ -549,12 +564,16 @@ function determineChargeType(reference: string): string {
   if (reference.startsWith("STORE_"))  return "pns_storage_purchase";
   // MyChama — MCW- (WhatsApp bot, CYBER) and MCA- (app, mychama1's own
   // functions) are both member payments and share one handler; MCS- (SMS
-  // credit top-up) and MCP- (plan billing) are separate. See
-  // docs/CONVENTIONS.md §5 in the Chama repo for the full registry — this
-  // is the one place outside that repo the registry has to be kept in sync.
+  // credit top-up), MCP- (plan billing), MCX- (reports-engine wallet
+  // top-up) and MCR- (Starter/Basic one-off premium report purchase) are
+  // separate. See docs/CONVENTIONS.md §5 in the Chama repo for the full
+  // registry — this is the one place outside that repo the registry has
+  // to be kept in sync.
   if (reference.startsWith("MCW-") || reference.startsWith("MCA-")) return "mychama_payment";
   if (reference.startsWith("MCS-")) return "mychama_sms_topup";
   if (reference.startsWith("MCP-")) return "mychama_plan_billing";
+  if (reference.startsWith("MCX-")) return "mychama_report_credit_topup";
+  if (reference.startsWith("MCR-")) return "mychama_report_alacarte";
   return "unknown";
 }
 
@@ -789,6 +808,60 @@ async function handleMyChamaPlanBilling(reference: string, chamaIdHint?: string,
   expiry.setDate(expiry.getDate() + 30);
   await db2.doc(`chamas/${chamaId}`).update({ plan, planExpiry: expiry.toISOString().slice(0, 10), updatedAt: now });
   await billingRef.set({ status: "success", plan, updatedAt: now }, { merge: true });
+}
+
+/**
+ * Reports-engine prepaid wallet top-up (MCX-). Unlike smsCredits, this
+ * wallet is CREDIT-denominated, not KES-denominated — mychama1's own
+ * functions/shared/reports_engine.py spends it in credits, so this must
+ * increment `reportCreditsBalance` by `topup.credits`, never by
+ * `topup.amountKes`. See that repo's functions/mychama/reports.py::
+ * purchaseReportCredits, which is what creates this pending doc.
+ */
+async function handleMyChamaReportCreditTopup(reference: string, chamaIdHint?: string): Promise<void> {
+  const db2 = mychamaDb();
+  const chamaId = chamaIdHint || reference.split("-")[1];
+  if (!chamaId) return;
+
+  const topupRef = db2.doc(`chamas/${chamaId}/reportCreditTopUps/${reference}`);
+  const topupSnap = await topupRef.get();
+  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
+  const topup = topupSnap.data()!;
+
+  const credits = Number(topup.credits);
+  if (!Number.isFinite(credits) || credits <= 0) {
+    console.error(`handleMyChamaReportCreditTopup: invalid credits value "${topup.credits}" for ${reference}`);
+    return;
+  }
+
+  const chamaRef = db2.doc(`chamas/${chamaId}`);
+  const chamaSnap = await chamaRef.get();
+  const chama = chamaSnap.data() || {};
+  await chamaRef.update({ reportCreditsBalance: (chama.reportCreditsBalance || 0) + credits, updatedAt: Date.now() });
+  await topupRef.update({ status: "success", updatedAt: Date.now() });
+}
+
+/**
+ * Starter/Basic one-off premium-report purchase (MCR-). Deliberately does
+ * NOT touch any balance on the chama doc — mychama1's own generateReport /
+ * generateStatement callables consume this purchase directly by its
+ * reference once its status flips to "success" (see that repo's
+ * functions/shared/reports_engine.py::consume_alacarte_purchase), so all
+ * this webhook needs to do is flip pending -> success, exactly like plan
+ * billing's status-only branch. The monthly à la carte CAP was already
+ * reserved when the purchase doc was created (mychama1's own
+ * purchasePremiumReportAlaCarte), not here.
+ */
+async function handleMyChamaReportAlacarte(reference: string, chamaIdHint?: string): Promise<void> {
+  const db2 = mychamaDb();
+  const chamaId = chamaIdHint || reference.split("-")[1];
+  if (!chamaId) return;
+
+  const purchaseRef = db2.doc(`chamas/${chamaId}/reportAlacartePurchases/${reference}`);
+  const purchaseSnap = await purchaseRef.get();
+  if (!purchaseSnap.exists || purchaseSnap.data()?.status === "success") return;
+
+  await purchaseRef.update({ status: "success", updatedAt: Date.now() });
 }
 
 // MyChama's own HostPinnacle credentials — separate from PAY's shared
@@ -2263,6 +2336,12 @@ export const paystackCallback = onRequest({
       else if (chargeType === 'mychama_plan_billing' || reference.startsWith('MCP-')) {
         await handleMyChamaPlanBilling(reference, metadata.chamaId, metadata.plan);
       }
+      else if (chargeType === 'mychama_report_credit_topup' || reference.startsWith('MCX-')) {
+        await handleMyChamaReportCreditTopup(reference, metadata.chamaId);
+      }
+      else if (chargeType === 'mychama_report_alacarte' || reference.startsWith('MCR-')) {
+        await handleMyChamaReportAlacarte(reference, metadata.chamaId);
+      }
 
       else {
         console.warn(`Unknown reference type: ${reference}`);
@@ -2354,7 +2433,7 @@ export const paystackCallback = onRequest({
         }
       }
 
-      else if (reference.startsWith('MCW-') || reference.startsWith('MCA-') || reference.startsWith('MCS-') || reference.startsWith('MCP-')) {
+      else if (reference.startsWith('MCW-') || reference.startsWith('MCA-') || reference.startsWith('MCS-') || reference.startsWith('MCP-') || reference.startsWith('MCX-') || reference.startsWith('MCR-')) {
         // MyChama — mark whichever collection this reference belongs to as
         // failed, so the app/bot stop showing "pending" forever. chamaId is
         // the second hyphen-delimited segment of the reference.
@@ -2363,6 +2442,8 @@ export const paystackCallback = onRequest({
           const db2 = mychamaDb();
           const collection = reference.startsWith('MCS-') ? 'smsTopUps'
             : reference.startsWith('MCP-') ? 'planBilling'
+            : reference.startsWith('MCX-') ? 'reportCreditTopUps'
+            : reference.startsWith('MCR-') ? 'reportAlacartePurchases'
             : 'paymentIntents';
           await db2.doc(`chamas/${chamaId}/${collection}/${reference}`).update({
             status: "failed",
