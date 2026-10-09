@@ -590,134 +590,277 @@ function determineChargeType(reference: string): string {
 // docs/CONVENTIONS.md).
 // ============================================================================
 
-async function applyMyChamaContributionPayment(
-  db: admin.firestore.Firestore,
+// ---------------------------------------------------------------------------
+// Applying a confirmed payment
+//
+// EVERYTHING for one payment happens inside ONE Firestore transaction: the
+// balance change, the transactions row, and flipping the intent to 'success'.
+// Before, these were separate writes, so a crash or a Paystack retry landing
+// between them could apply the money twice, or record it as received without
+// applying it. Firestore requires all reads before any write in a
+// transaction, so each purpose below has a `read*` half (gathers docs) and
+// an `apply*` half (stages writes).
+//
+// Rules that never bend:
+//   - Money received is NEVER dropped. If the target can no longer take the
+//     payment (loan already completed by a cash entry, pot closed, etc.) the
+//     whole amount becomes member credit and the intent says so in
+//     `applyNote`, instead of being marked 'success' with nothing applied.
+//   - The Paystack amount must equal the intent's grossAmount (contract in
+//     the Chama repo's firestoreData.json → whatsappContract).
+//   - Line-for-line parity with the app's recordCash* functions.
+// ---------------------------------------------------------------------------
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+type MyChamaTx = admin.firestore.Transaction;
+type MyChamaDb = admin.firestore.Firestore;
+
+interface ApplyOutcome {
+  /** Extra fields for the intent document (e.g. why money became credit). */
+  intentPatch: Record<string, unknown>;
+  /** Extra fields for the transactions document. */
+  txnPatch: Record<string, unknown>;
+}
+
+/** Contribution spill-forward, oldest period first from the paid one. */
+async function applyContributionInTx(
+  tx: MyChamaTx,
+  db: MyChamaDb,
   chamaId: string,
-  memberId: string,
-  startContributionId: string,
-  amount: number
-): Promise<void> {
-  const contribRef = db.collection(`chamas/${chamaId}/contributions`);
-  const snap = await contribRef.where("memberId", "==", memberId).get();
+  intent: admin.firestore.DocumentData,
+  amount: number,
+  now: number
+): Promise<ApplyOutcome> {
+  const memberRef = db.doc(`chamas/${chamaId}/members/${intent.memberId}`);
+  const snap = await tx.get(
+    db.collection(`chamas/${chamaId}/contributions`).where("memberId", "==", intent.memberId)
+  );
+  const memberSnap = await tx.get(memberRef);
+  const member = memberSnap.data() || {};
+
   const all = snap.docs.sort((a, b) => (a.data().periodKey || "").localeCompare(b.data().periodKey || ""));
-  const startIdx = Math.max(0, all.findIndex((d) => d.id === startContributionId));
+  const startIdx = Math.max(0, all.findIndex((d) => d.id === intent.contributionId));
 
   let remaining = amount;
   let appliedTotal = 0;
-  const batch = db.batch();
-  const now = Date.now();
-
   for (const doc of all.slice(startIdx)) {
     if (remaining <= 0.009) break;
     const data = doc.data();
     const due = (data.amount || 0) - (data.paidAmount || 0);
     if (due <= 0.009) continue;
     const applied = Math.min(due, remaining);
-    const newPaid = (data.paidAmount || 0) + applied;
-    remaining -= applied;
-    appliedTotal += applied;
+    const newPaid = round2((data.paidAmount || 0) + applied);
+    remaining = round2(remaining - applied);
+    appliedTotal = round2(appliedTotal + applied);
     const newStatus = newPaid >= data.amount - 0.01 ? "paid" : "partial";
     const update: Record<string, unknown> = { paidAmount: newPaid, status: newStatus, updatedAt: now };
     if (newStatus === "paid" && !data.paidOn) update.paidOn = new Date().toISOString().slice(0, 10);
-    batch.update(doc.ref, update);
+    tx.update(doc.ref, update);
   }
 
-  const memberRef = db.doc(`chamas/${chamaId}/members/${memberId}`);
-  const memberSnap = await memberRef.get();
-  const member = memberSnap.data() || {};
-  const creditDelta = remaining > 0.009 ? Math.round(remaining * 100) / 100 : 0;
-
-  batch.update(memberRef, {
-    creditBalance: (member.creditBalance || 0) + creditDelta,
-    totalContributed: (member.totalContributed || 0) + appliedTotal,
+  const creditDelta = remaining > 0.009 ? round2(remaining) : 0;
+  tx.update(memberRef, {
+    creditBalance: round2((member.creditBalance || 0) + creditDelta),
+    totalContributed: round2((member.totalContributed || 0) + appliedTotal),
     updatedAt: now,
   });
-  await batch.commit();
+
+  return {
+    intentPatch: creditDelta ? { applyNote: `KES ${creditDelta} exceeded what was due and was credited to the member` } : {},
+    txnPatch: {},
+  };
 }
 
-async function applyMyChamaLoanRepayment(
-  db: admin.firestore.Firestore,
+/** Loan schedule spill-forward; leftover after the last instalment → credit. */
+async function applyLoanInTx(
+  tx: MyChamaTx,
+  db: MyChamaDb,
   chamaId: string,
-  loanId: string,
-  amount: number
-): Promise<void> {
-  const loanRef = db.doc(`chamas/${chamaId}/loans/${loanId}`);
-  const loanSnap = await loanRef.get();
-  if (!loanSnap.exists) return;
-  const loan = loanSnap.data()!;
-  if (!["active", "overdue"].includes(loan.status)) return;
+  intent: admin.firestore.DocumentData,
+  amount: number,
+  now: number
+): Promise<ApplyOutcome> {
+  const memberRef = db.doc(`chamas/${chamaId}/members/${intent.memberId}`);
+  const loanRef = intent.loanId ? db.doc(`chamas/${chamaId}/loans/${intent.loanId}`) : null;
+  const loanSnap = loanRef ? await tx.get(loanRef) : null;
+  const memberSnap = await tx.get(memberRef);
+  const member = memberSnap.data() || {};
+  const loan = loanSnap?.exists ? loanSnap.data()! : null;
 
-  const schedule = [...loan.schedule];
+  const creditAll = (why: string): ApplyOutcome => {
+    tx.update(memberRef, { creditBalance: round2((member.creditBalance || 0) + amount), updatedAt: now });
+    return { intentPatch: { applyNote: why }, txnPatch: {} };
+  };
+
+  if (!loan) return creditAll("loan not found — full amount credited to the member");
+  if (loan.memberId !== intent.memberId) return creditAll("loan belongs to another member — full amount credited to the payer");
+  if (!["active", "overdue"].includes(loan.status)) {
+    return creditAll(`loan is ${loan.status} — full amount credited to the member`);
+  }
+
+  const schedule = (loan.schedule || []).map((s: any) => ({ ...s }));
   let remaining = amount;
   for (const inst of schedule) {
     if (remaining <= 0.009) break;
     const due = inst.due - (inst.paidAmount || 0);
     if (due <= 0.009) continue;
     const applied = Math.min(due, remaining);
-    inst.paidAmount = (inst.paidAmount || 0) + applied;
-    remaining -= applied;
+    inst.paidAmount = round2((inst.paidAmount || 0) + applied);
+    remaining = round2(remaining - applied);
     inst.paid = inst.paidAmount >= inst.due - 0.01;
   }
 
-  const newStatus = schedule.every((s) => s.paid) ? "completed" : "active";
-  const now = Date.now();
-  const batch = db.batch();
-  batch.update(loanRef, { schedule, status: newStatus, updatedAt: now });
+  const newStatus = schedule.every((s: any) => s.paid) ? "completed" : "active";
+  tx.update(loanRef!, { schedule, status: newStatus, updatedAt: now });
 
+  let note: string | undefined;
   if (remaining > 0.009) {
-    const memberRef = db.doc(`chamas/${chamaId}/members/${loan.memberId}`);
-    const memberSnap = await memberRef.get();
-    const member = memberSnap.data() || {};
-    const creditDelta = Math.round(remaining * 100) / 100;
-    batch.update(memberRef, { creditBalance: (member.creditBalance || 0) + creditDelta, updatedAt: now });
+    const creditDelta = round2(remaining);
+    tx.update(memberRef, { creditBalance: round2((member.creditBalance || 0) + creditDelta), updatedAt: now });
+    note = `KES ${creditDelta} exceeded the loan balance and was credited to the member`;
   }
-  await batch.commit();
+  return { intentPatch: note ? { applyNote: note } : {}, txnPatch: {} };
 }
 
-async function applyMyChamaMgrContribution(
-  db: admin.firestore.Firestore,
+/**
+ * MGR contribution — for the pot's CURRENT period, accumulating part
+ * payments exactly like the app's recordCashMgrPayment — or, when the intent
+ * carries an `arrearId`, a payment toward that member's open arrear.
+ */
+async function applyMgrInTx(
+  tx: MyChamaTx,
+  db: MyChamaDb,
   chamaId: string,
-  potId: string,
-  memberId: string,
+  intent: admin.firestore.DocumentData,
   amount: number,
-  ref: string
-): Promise<void> {
-  const potRef = db.doc(`chamas/${chamaId}/mgrPots/${potId}`);
-  const potSnap = await potRef.get();
-  if (!potSnap.exists) return;
-  const pot = potSnap.data()!;
-  if (pot.status !== "active") return;
-
-  const now = Date.now();
+  reference: string,
+  now: number
+): Promise<ApplyOutcome> {
+  const memberRef = db.doc(`chamas/${chamaId}/members/${intent.memberId}`);
+  const potRef = db.doc(`chamas/${chamaId}/mgrPots/${intent.potId}`);
   const today = new Date().toISOString().slice(0, 10);
-  const existing = await db
-    .collection(`chamas/${chamaId}/mgrPots/${potId}/records`)
-    .where("memberId", "==", memberId)
-    .where("period", "==", pot.period)
-    .limit(1)
-    .get();
 
-  if (!existing.empty) {
-    await existing.docs[0].ref.update({ status: "paid", amount, date: today, method: "paystack", ref, updatedAt: now });
+  const potSnap = await tx.get(potRef);
+  const memberSnap = await tx.get(memberRef);
+  const member = memberSnap.data() || {};
+  const pot = potSnap.exists ? potSnap.data()! : null;
+
+  const creditAll = (why: string): ApplyOutcome => {
+    tx.update(memberRef, { creditBalance: round2((member.creditBalance || 0) + amount), updatedAt: now });
+    return { intentPatch: { applyNote: why }, txnPatch: {} };
+  };
+  const ledger = (kind: string, amt: number, note: string) => {
+    tx.set(db.collection(`chamas/${chamaId}/mgrPots/${intent.potId}/ledger`).doc(), {
+      kind, memberId: intent.memberId, amount: amt, note, createdAt: now,
+    });
+  };
+
+  if (!pot) return creditAll("pot not found — full amount credited to the member");
+
+  // ---------------------------------------------------------- arrear ----
+  if (intent.arrearId) {
+    const arrearRef = db.doc(`chamas/${chamaId}/mgrPots/${intent.potId}/arrears/${intent.arrearId}`);
+    const arrearSnap = await tx.get(arrearRef);
+    const arrear = arrearSnap.exists ? arrearSnap.data()! : null;
+
+    if (!arrear || arrear.memberId !== intent.memberId || arrear.status !== "open") {
+      return creditAll("arrear is no longer open — full amount credited to the member");
+    }
+
+    const payAmount = Math.min(amount, arrear.amount);
+    const remaining = round2(arrear.amount - payAmount);
+    tx.update(arrearRef, {
+      amount: remaining,
+      status: remaining <= 0 ? "settled" : "open",
+      settledAmount: round2((arrear.settledAmount || 0) + payAmount),
+      updatedAt: now,
+    });
+    ledger("arrear_settled", payAmount, "paystack");
+
+    const excess = round2(amount - payAmount);
+    if (excess > 0.009) {
+      tx.update(memberRef, { creditBalance: round2((member.creditBalance || 0) + excess), updatedAt: now });
+    }
+    return {
+      intentPatch: excess > 0.009 ? { applyNote: `KES ${excess} exceeded the arrear and was credited to the member` } : {},
+      txnPatch: { potId: intent.potId, note: `${pot.name} arrear settlement` },
+    };
+  }
+
+  // ------------------------------------------------- current period ----
+  if (pot.status !== "active") {
+    return creditAll("pot is not collecting — full amount credited to the member");
+  }
+  if (typeof intent.potPeriod === "number" && intent.potPeriod !== pot.period) {
+    // The period rolled over between charge and confirmation. Do NOT pay the
+    // new period with money meant for the old one — credit it instead.
+    return creditAll(`period ${intent.potPeriod} closed before payment arrived — full amount credited to the member`);
+  }
+
+  const recQ = await tx.get(
+    db.collection(`chamas/${chamaId}/mgrPots/${intent.potId}/records`)
+      .where("memberId", "==", intent.memberId)
+      .where("period", "==", pot.period)
+      .limit(1)
+  );
+  const existing = recQ.empty ? null : recQ.docs[0];
+  const ex = existing?.data();
+
+  // Same accumulation rule as the app: only a 'partial' record's amount
+  // counts as already paid. A 'paid' record means the period is done.
+  if (ex?.status === "paid") {
+    return creditAll("period was already fully paid — full amount credited to the member");
+  }
+  const alreadyPaid = ex?.status === "partial" ? ex.amount || 0 : 0;
+  const room = Math.max(0, round2(pot.amount - alreadyPaid));
+  const applied = Math.min(amount, room);
+  const newTotal = round2(alreadyPaid + applied);
+  const newStatus = newTotal >= pot.amount - 0.01 ? "paid" : "partial";
+
+  const recPatch = { status: newStatus, amount: newTotal, date: today, method: "paystack", ref: reference, updatedAt: now };
+  if (existing) {
+    tx.update(existing.ref, recPatch);
   } else {
-    await db.collection(`chamas/${chamaId}/mgrPots/${potId}/records`).add({
-      period: pot.period, memberId, status: "paid", amount, date: today, method: "paystack", ref, createdAt: now, updatedAt: now,
+    tx.set(db.collection(`chamas/${chamaId}/mgrPots/${intent.potId}/records`).doc(), {
+      period: pot.period, memberId: intent.memberId, createdAt: now, ...recPatch,
     });
   }
+  ledger("contribution", applied, "paystack" + (newStatus === "partial" ? " (partial)" : ""));
+
+  // Excess beyond the period: open arrear first (that's what the member
+  // owes), otherwise member credit. Never silently dropped.
+  const excess = round2(amount - applied);
+  let note: string | undefined;
+  if (excess > 0.009) {
+    tx.update(memberRef, { creditBalance: round2((member.creditBalance || 0) + excess), updatedAt: now });
+    note = `KES ${excess} exceeded what was due this period and was credited to the member`;
+  }
+  return {
+    intentPatch: note ? { applyNote: note } : {},
+    txnPatch: { potId: intent.potId, note: pot.name + (newStatus === "partial" ? " (partial)" : "") },
+  };
 }
 
 /**
  * Applies an MCW-/MCA- payment once Paystack confirms it. `reference` is
- * both the Paystack reference and the mychama1 paymentIntents document ID
- * — that doubles as the idempotency check: if the intent is already
- * `success`, this is a replayed webhook event and we do nothing further.
+ * both the Paystack reference and the mychama1 paymentIntents document ID.
+ *
+ * Idempotent: the 'success' check happens INSIDE the transaction, so two
+ * concurrent deliveries of the same event (webhook retry + the reconcile
+ * sweep below) cannot both apply.
+ *
+ * `paidKobo` is the amount Paystack reports (event.data.amount). When given,
+ * it must equal the intent's grossAmount — a mismatch means a tampered or
+ * stale reference and nothing is applied.
  */
-async function handleMyChamaPayment(reference: string, chamaIdHint?: string): Promise<void> {
+async function handleMyChamaPayment(
+  reference: string,
+  chamaIdHint?: string,
+  paidKobo?: number
+): Promise<void> {
   const db2 = mychamaDb();
 
-  // reference format: MCW-{chamaId}-{purposeCode}-{ts}-{rand} — chamaId is
-  // also usually available in the webhook payload's metadata, used as a
-  // cross-check / fallback if the reference format ever changes.
   const parts = reference.split("-");
   const chamaId = chamaIdHint || parts[1];
   if (!chamaId) {
@@ -726,51 +869,88 @@ async function handleMyChamaPayment(reference: string, chamaIdHint?: string): Pr
   }
 
   const intentRef = db2.doc(`chamas/${chamaId}/paymentIntents/${reference}`);
-  const intentSnap = await intentRef.get();
-  if (!intentSnap.exists) {
+  const txnRef = db2.doc(`chamas/${chamaId}/transactions/${reference}`);
+
+  const outcome = await db2.runTransaction(async (tx) => {
+    const intentSnap = await tx.get(intentRef);
+    if (!intentSnap.exists) return { kind: "missing" as const };
+    const intent = intentSnap.data()!;
+    if (intent.status === "success") return { kind: "already" as const };
+
+    if (typeof paidKobo === "number" && paidKobo !== Math.round((intent.grossAmount || 0) * 100)) {
+      return { kind: "mismatch" as const, expected: Math.round((intent.grossAmount || 0) * 100), got: paidKobo };
+    }
+
+    const now = Date.now();
+    const amount: number = intent.amount;
+    let result: ApplyOutcome;
+
+    if (intent.purpose === "contribution") {
+      result = await applyContributionInTx(tx, db2, chamaId, intent, amount, now);
+    } else if (intent.purpose === "loan_repayment") {
+      result = await applyLoanInTx(tx, db2, chamaId, intent, amount, now);
+    } else if (intent.purpose === "mgr_contribution" && intent.potId) {
+      result = await applyMgrInTx(tx, db2, chamaId, intent, amount, reference, now);
+    } else {
+      // Unknown or untargeted purpose. Money WAS received, so credit it and
+      // say so — never mark an untargeted payment as cleanly applied.
+      const memberRef = db2.doc(`chamas/${chamaId}/members/${intent.memberId}`);
+      const member = (await tx.get(memberRef)).data() || {};
+      tx.update(memberRef, { creditBalance: round2((member.creditBalance || 0) + amount), updatedAt: now });
+      result = { intentPatch: { applyNote: "payment had no valid target — full amount credited to the member" }, txnPatch: {} };
+    }
+
+    tx.set(txnRef, {
+      type: intent.purpose,
+      memberId: intent.memberId,
+      amount,
+      grossAmount: intent.grossAmount,
+      paystackFee: intent.paystackFee,
+      ourFee: intent.ourFee,
+      method: "paystack",
+      ref: reference,
+      date: new Date().toISOString().slice(0, 10),
+      settled: false,
+      direction: "in",
+      channel: intent.channel || "app",
+      intentId: reference,
+      createdAt: now,
+      ...result.txnPatch,
+    });
+    tx.update(intentRef, { status: "success", updatedAt: now, ...result.intentPatch });
+
+    return { kind: "applied" as const, memberId: intent.memberId as string, amount };
+  });
+
+  if (outcome.kind === "missing") {
     console.error("MyChama payment: no matching paymentIntent for reference", reference);
     return;
   }
-  const intent = intentSnap.data()!;
-  if (intent.status === "success") return; // already applied — replayed webhook event
-
-  if (intent.purpose === "contribution" && intent.contributionId) {
-    await applyMyChamaContributionPayment(db2, chamaId, intent.memberId, intent.contributionId, intent.amount);
-  } else if (intent.purpose === "loan_repayment" && intent.loanId) {
-    await applyMyChamaLoanRepayment(db2, chamaId, intent.loanId, intent.amount);
-  } else if (intent.purpose === "mgr_contribution" && intent.potId) {
-    await applyMyChamaMgrContribution(db2, chamaId, intent.potId, intent.memberId, intent.amount, reference);
+  if (outcome.kind === "mismatch") {
+    console.error("MyChama payment: amount mismatch — NOT applied", reference, outcome);
+    try {
+      await db2.collection("whatsappAuditLog").add({
+        action: "payment.apply",
+        outcome: "denied",
+        chamaId,
+        reference,
+        detail: { expectedKobo: outcome.expected, paidKobo: outcome.got },
+        createdAt: Date.now(),
+      });
+    } catch (e) {
+      console.error("MyChama payment: audit write failed (non-fatal):", e);
+    }
+    return;
   }
+  if (outcome.kind === "already") return; // replayed event or sweep — nothing to do
 
-  const now = Date.now();
-  await db2.collection(`chamas/${chamaId}/transactions`).add({
-    type: intent.purpose,
-    memberId: intent.memberId,
-    amount: intent.amount,
-    grossAmount: intent.grossAmount,
-    paystackFee: intent.paystackFee,
-    ourFee: intent.ourFee,
-    method: "paystack",
-    ref: reference,
-    date: new Date().toISOString().slice(0, 10),
-    settled: false,
-    direction: "in",
-    channel: intent.channel || "app",
-    intentId: reference,
-    createdAt: now,
-  });
-
-  await intentRef.update({ status: "success", updatedAt: now });
-
-  // Best-effort confirmation SMS via MyChama's own HostPinnacle sender —
-  // failure here must never fail the webhook (Paystack will retry the
-  // whole event if this handler throws, and the payment is already
-  // applied above).
+  // Best-effort confirmation SMS — never fail the webhook for this (the
+  // payment is already applied above and Paystack would retry the event).
   try {
-    const memberSnap = await db2.doc(`chamas/${chamaId}/members/${intent.memberId}`).get();
+    const memberSnap = await db2.doc(`chamas/${chamaId}/members/${outcome.memberId}`).get();
     const phone = memberSnap.data()?.phoneNormalized;
     if (phone) {
-      await sendMyChamaSms(phone, `MyChama: payment of KES ${Math.round(intent.amount)} received. Thank you.`);
+      await sendMyChamaSms(phone, `My Chama: payment of KES ${Math.round(outcome.amount)} received. Thank you.`);
     }
   } catch (e) {
     console.error("MyChama payment confirmation SMS failed (non-fatal):", e);
@@ -887,6 +1067,65 @@ async function sendMyChamaSms(phoneE164: string, message: string): Promise<void>
     duplicatecheck: "true",
   });
 }
+
+/**
+ * Safety net for missed or delayed webhooks. M-Pesa STK confirmations can
+ * reach Paystack well before (or long after) their webhook is delivered; when
+ * one never arrives the member has been charged but the chama has nothing.
+ * Every 10 minutes we look at intents still 'pending' after 5 minutes and ask
+ * Paystack directly. Applying goes through the SAME transactional handler as
+ * the webhook, so a late webhook and this sweep can never double-apply.
+ */
+export const reconcileMyChamaIntents = onSchedule({
+  schedule: "every 10 minutes",
+  timeZone: "Africa/Nairobi",
+  region: "us-central1",
+  memory: "256MiB",
+  timeoutSeconds: 300,
+  secrets: [PAYSTACK_SECRET_KEY, MYCHAMA_HP_USERID, MYCHAMA_HP_PASSWORD, MYCHAMA_HP_APIKEY, MYCHAMA_HP_SENDERID],
+}, async () => {
+  const db2 = mychamaDb();
+  const now = Date.now();
+  const snap = await db2.collectionGroup("paymentIntents").where("status", "==", "pending").limit(200).get();
+
+  for (const doc of snap.docs) {
+    const intent = doc.data();
+    const age = now - (intent.createdAt || 0);
+    if (age < 5 * 60 * 1000) continue;                 // give the webhook a chance first
+    const reference: string = doc.id;
+    if (!reference.startsWith("MCW-") && !reference.startsWith("MCA-")) continue;
+
+    const chamaId = doc.ref.parent.parent?.id;
+    if (!chamaId) continue;
+
+    try {
+      const res = await axios.get(`${PAYSTACK_API_BASE}/transaction/verify/${encodeURIComponent(reference)}`, {
+        headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}` },
+        timeout: 15000,
+      });
+      const tData = res.data?.data;
+      const status = tData?.status;
+
+      if (status === "success") {
+        console.log(`MyChama reconcile: applying missed payment ${reference}`);
+        await handleMyChamaPayment(reference, chamaId, tData.amount);
+      } else if (status === "failed" || status === "reversed") {
+        await doc.ref.update({ status: "failed", paystackMessage: tData?.gateway_response || status, updatedAt: now });
+      } else if (age > 60 * 60 * 1000) {
+        // Never confirmed within the hour — the member never entered a PIN.
+        await doc.ref.update({ status: "expired", updatedAt: now });
+      }
+    } catch (e: any) {
+      console.error(`MyChama reconcile: verify failed for ${reference}`, e?.message || e);
+      // Paystack has no record of it and it's over an hour old: the STK
+      // prompt never reached a charge. Retire it so it stops being re-checked.
+      if (e?.response?.status === 404 && age > 60 * 60 * 1000) {
+        await doc.ref.update({ status: "expired", updatedAt: now });
+      }
+    }
+  }
+});
+
 
 
 
@@ -2328,7 +2567,7 @@ export const paystackCallback = onRequest({
       // 8. MYCHAMA — payment (WhatsApp bot or app), SMS top-up, plan billing
       // ============================================
       else if (chargeType === 'mychama_payment' || reference.startsWith('MCW-') || reference.startsWith('MCA-')) {
-        await handleMyChamaPayment(reference, metadata.chamaId);
+        await handleMyChamaPayment(reference, metadata.chamaId, data.amount);
       }
       else if (chargeType === 'mychama_sms_topup' || reference.startsWith('MCS-')) {
         await handleMyChamaSmsTopup(reference, metadata.chamaId);

@@ -1,0 +1,1716 @@
+diff --git a/docs/mychama/CONNECTOR_CONTRACT.md b/docs/mychama/CONNECTOR_CONTRACT.md
+new file mode 100644
+index 0000000..cedfd8f
+--- /dev/null
++++ b/docs/mychama/CONNECTOR_CONTRACT.md
+@@ -0,0 +1,64 @@
++# MyChama ⇄ PAY connector — CONTRACT v1 (P0)
++
++Base commits: **PAY `6547b3a`**, **Chama `1c83e40`**. Patches are applied in this order:
++`P0` → `A` → `B` → `C` (A/B/C touch disjoint files, so any order after P0 works).
++Gate for every patch: `git apply --check` on a tree with P0 (and, in the integration run, the other two) applied;
++`cd functions && npx tsc --noEmit`; `npm run check:mychama-contract`.
++
++## 1. Goal
++1. MyChama gets its **own Paystack account** (new key, new webhook) — independent of PAY's shared account.
++2. PAY landlords/tenants get a **chama connector**: auto-linked chama memberships, MyChama payments (contributions, loans, MGR), and chama-side obligation/balance data persisted in the plot project.
++3. Rental data is **never read or written** by any new backend code. Deductions are computed in the *client* by combining rent totals the UI already has with the snapshot.
++
++## 2. Ownership (who may edit what)
++| Path | Owner |
++|---|---|
++| `functions/src/mychama/{contract,config,errors,paths,sms}.ts`, `src/mychama/{contract,api,index}.ts`, `tools/`, `docs/mychama/CONNECTOR_CONTRACT.md`, `firestore.rules.fragment` | **P0 (frozen)** — change via §10 |
++| `functions/src/mychama/link/**`, `functions/src/mychama/sync/**` (+ Chama patch: `idKey`) | **Track A** |
++| `functions/src/mychama/pay/**`, `functions/src/mychama/webhook/**` (incl. `handlers.ts`), `scripts/mychama/**`, `docs/mychama/cutover.md` | **Track B** |
++| `src/**` (except `src/mychama/{contract,api,index}.ts`), `functions/src/auth/**`, `index.html`, `public/**` | **Track C** |
++| `functions/src/index.ts` | P0 only (one wiring line added). Hardening of existing rent callables = a separate later patch |
++
++## 3. What P0 changed in existing code (behaviour-neutral)
++* `functions/src/index.ts`: MyChama payment handlers + HostPinnacle SMS **moved verbatim** to `mychama/webhook/handlers.ts` and `mychama/sms.ts`; `mychamaDb()` moved to `mychama/config.ts`; legacy `paystackCallback` still uses them (it keeps handling MyChama references until cutover). Two wiring lines appended: `export * from "./mychama"; export * from "./auth";`.
++* New deployable functions (stubs return `not_implemented` / HTTP 501): `mychamaSync`, `mychamaLinkRequestCode`, `mychamaLinkVerifyCode`, `mychamaPayInitiate`, `mychamaPaystackCallback` (all `africa-south1`).
++
++## 4. Data model (plot project) — see `contract.ts`
++`chamaSnapshots/{uid}` (UI listens; client read-only) · `chamaLinks/{uid}/links/{chamaId__memberId}` (client read-only) · `chamaLinkChallenges/{id}` and `chamaSyncState/{uid}` (server only). Rules: `firestore.rules.fragment` (the plot rules file is not in this repo — merge manually).
++Snapshot semantics: a section that could not be read is `null` (never `0`); `dataStatus`/`missing[]` say why; a failed sync **never wipes** the last good data (only `status`/`lastError`/`lastAttemptAt` change). `status`: `ok` | `stale` (no success for `SNAPSHOT_STALE_AFTER_SECONDS`, or last attempt failed while old data exists) | `unavailable` (never had data and mychama1 unreachable) | `never_linked` | `needs_reverify`.
++
++## 5. Identity & linking (decided)
++* Key = **ID number**. mychama1 stores `members.idNumber` but that field is **index-exempt** (Chama `firestore.indexes.json`/`INDEXES.md`), so it cannot be queried. Contract: every member doc gets **`idKey = HMAC_SHA256_hex(MYCHAMA_ID_PEPPER, "id:" + normalizeIdNumber(idNumber))`**, with a collection-group index on `members.idKey`. `normalizeIdNumber` = uppercase + strip all non-alphanumerics (see `config.ts`). Same pepper value in **both** projects. (Track A ships the Chama-side trigger + backfill + index.)
++* Phone proof key = `computePhoneKey(E.164)` = HMAC(pepper, `"ph:"+e164`); phones normalised exactly like Chama `phone.py::normalize_phone`.
++* Rules: (1) find all members with the caller's `idKey`; (2) **silent link** a record when the caller's *verified* Firebase phone (`request.auth.token.phone_number`) equals that member's `phoneNormalized`; (3) otherwise the record goes to `pending[]` (masked phone shown) and the user taps **Send code** → SMS code (HostPinnacle, MyChama sender) to the *MyChama-registered* phone → `mychamaLinkVerifyCode` links **only the chamas registered on that phone** (per-phone grants); (4) email/password landlords have no verified phone → always path 3; (5) no automatic SMS on login (tap-to-send, abuse limits in `MYCHAMA_LIMITS`); (6) ambiguous IDs (two members with one idKey in the *same* chama) never link — flagged; (7) a link is bound to `boundPhoneKey`; if the member's phone later stops matching → `needs_reverify`, chama data hidden until re-verified. PMS/PAY phone and MyChama phone are never edited.
++* Landlord identity after Track C: Firebase Auth user with custom claims `{ role: "landlord", agentId }` (profile doc `agents/{agentId}`); tenants: `users/*` docs, `role` claim optional. Track A must resolve caller → `{uid, role, idNumber, verifiedPhone|null}` in one function (`sync/identity.ts`).
++
++## 6. Callables (I/O in `contract.ts`)
++`mychamaSync({reason, force?})` — first login forces a sync; later calls inside `SYNC_COOLDOWN_SECONDS` return stored data with `throttled:true`; manual floor `SYNC_MANUAL_COOLDOWN_SECONDS`. `mychamaLinkRequestCode({pendingId})`, `mychamaLinkVerifyCode({challengeId, code})`, `mychamaPayInitiate({...})` (self-pay only; targets validated server-side; idempotent on `clientRequestId`). Errors: `HttpsError.details = {code: MyChamaErrorCode}`; clients use `mychamaErrorCode(err)`.
++
++## 7. Deductions boundary
++Backend snapshot = chama-side numbers only (`items` with due dates, `totals.overdue/dueThisMonth/expectedInflowThisMonth`, MGR `wins`). The pure functions in `src/mychama/calc.ts` (Track C) take rent totals as **arguments** (landlord: collected rent for a period; tenant: rent + bills due) and return deductions/“need this month”. No new backend code touches rental collections.
++
++## 8. Payments (money plane)
++* References: `MCA-{chamaId}-{CNT|LNR|MGR}-{epochMs}-{rand6}` (purpose codes from Chama `IntentPurposeCode`; note loan = **LNR**). PAY-portal payments use `channel:"app"` (the Chama `IntentChannel` type only allows `whatsapp|app`) plus extra audit fields `via:"pay_portal"`, `initiatedBy:{uid,role}`.
++* Intent doc = same shape as Chama `mychama/payments.py::initiatePayment` (amount NET, grossAmount, paystackFee, ourFee, currency KES, phone, provider, status pending, splitCode, expiresAt = +30 min, …). Fee engine mirrors Chama `functions/shared/money.py` / `src/lib/money.ts` (Paystack 1.5% capped KES 3000; markups: contribution/MGR 0.5%, loan per plan).
++* Only the webhook marks money received (existing handlers). New account → **new webhook** `mychamaPaystackCallback`: HMAC-SHA512 of the raw body with `MYCHAMA_PAYSTACK_SECRET_KEY`, MyChama references only (`MCW- MCA- MCS- MCP- MCX- MCR-`), same handlers as legacy. Legacy `paystackCallback` keeps its MyChama branch until cutover (in-flight refs from the old account).
++* Secrets: `MYCHAMA_PAYSTACK_SECRET_KEY`, `MYCHAMA_ID_PEPPER` (declared once in `config.ts`), HostPinnacle `MYCHAMA_HP_SMS_*` (declared once in `sms.ts`; **bind `...MYCHAMA_HP_SECRETS` on any function that sends SMS**).
++
++## 9. Known facts & gotchas (verified in the repos)
++* Legacy `paystackCallback` binds only `PAYSTACK_SECRET_KEY`; `sendMyChamaSms` inside `handleMyChamaPayment` is try/catch-wrapped, so the confirmation SMS has probably been **failing silently**. The new webhook must bind `MYCHAMA_HP_SECRETS`.
++* The PAY repo has **no `firestore.rules`**; rules for plot live elsewhere.
++* Landlords currently authenticate with a custom login stored in `localStorage` (`agentAuthUser`), profile in `agents/{id}`; tenants use Firebase phone auth. Existing rent callables take `agentId` from the client — hardening is a later separate patch.
++* Split codes/subaccounts (`chama.settlementSplitCode`) belong to the **old** Paystack account and cannot be moved: they must be re-created under the new key before any MyChama charge uses the new key (Track B script / re-onboarding).
++* CYBER (WhatsApp bot, not provided) creates `MCW-` intents and charges with a key: its MyChama flow must switch to the new key; its other `CYBER_` flows stay on the old account.
++* Repo-root `pay_security.patch` and `PAY_reports_engine_webhook.patch` are **already applied** at the base commit.
++
++## 10. Change protocol
++`contract.ts` is frozen. If a track needs a change: stop, write `CONTRACT_CHANGE_REQUEST.md` (what/why/proposed diff) in your patch notes, and continue against the *current* contract with a documented workaround. The integrator re-cuts P0 (`contract.ts` is mirrored by `tools/check-mychama-contract.mjs`).
++
++## 11. Deploy / cutover checklist (summary — Track B writes `cutover.md`)
++1. Create secrets: `MYCHAMA_PAYSTACK_SECRET_KEY` (plot + mychama1 for the Chama functions), `MYCHAMA_ID_PEPPER` (identical in plot + mychama1).
++2. Deploy mychama1 (idKey trigger, backfill, index) → backfill → verify.
++3. Merge rules fragment into plot rules; deploy PAY functions + hosting.
++4. Re-create chama split codes under the new account; register `mychamaPaystackCallback` URL in the new Paystack dashboard (test keys first).
++5. Switch Chama + CYBER MyChama flow to the new key; live smoke test; keep the legacy MyChama webhook branch until old in-flight references clear; then remove it in a final patch.
+diff --git a/docs/mychama/firestore.rules.fragment b/docs/mychama/firestore.rules.fragment
+new file mode 100644
+index 0000000..d0420e7
+--- /dev/null
++++ b/docs/mychama/firestore.rules.fragment
+@@ -0,0 +1,12 @@
++// MERGE into the plot project's firestore.rules (that file is NOT in this repo).
++// Clients may only READ their own snapshot/links. Cloud Functions (Admin SDK) write everything.
++match /chamaSnapshots/{uid} {
++  allow read: if request.auth != null && request.auth.uid == uid;
++  allow write: if false;
++}
++match /chamaLinks/{uid}/links/{linkId} {
++  allow read: if request.auth != null && request.auth.uid == uid;
++  allow write: if false;
++}
++match /chamaLinkChallenges/{id} { allow read, write: if false; }
++match /chamaSyncState/{uid}     { allow read, write: if false; }
+diff --git a/docs/mychama/prompts/TRACK_A_DATA_PLANE.md b/docs/mychama/prompts/TRACK_A_DATA_PLANE.md
+new file mode 100644
+index 0000000..88c48e3
+--- /dev/null
++++ b/docs/mychama/prompts/TRACK_A_DATA_PLANE.md
+@@ -0,0 +1,39 @@
++# TRACK A — Data plane (linking + sync + snapshot) — PROMPT
++
++You are **Track A** of three AIs building the MyChama⇄PAY connector in parallel. Tracks B (money plane) and C (experience) work on disjoint files; a foundation patch **P0** already fixed every shared contract. Your output must drop in next to theirs without conflicts.
++
++## Repos & base
++* **PAY** (company payments hub, TypeScript, Firebase Functions v2, region `africa-south1`) at commit `6547b3a`, with **P0 applied** (`git apply mychama-connector-P0-foundation.patch`).
++* **Chama** (MyChama app, Python Cloud Functions, project `mychama1`) at commit `1c83e40` — you ship one small patch here.
++**Read first, fully:** `docs/mychama/CONNECTOR_CONTRACT.md` and `functions/src/mychama/contract.ts`. `contract.ts`, `config.ts`, `errors.ts`, `sms.ts`, `paths.ts` are FROZEN (use them; don't edit). If you truly need a change, follow §10 of the contract (write `CONTRACT_CHANGE_REQUEST.md`, keep going with a workaround).
++
++## Deliverables (two patches, `git diff` format, applyable with `git apply`)
++1. `track-A-pay-data-plane.patch` (PAY) — touches ONLY `functions/src/mychama/link/**` and `functions/src/mychama/sync/**` (new files + replacing the P0 stub bodies; keep the exported function names and request/response types).
++2. `track-A-chama-idkey.patch` (Chama) — touches ONLY: a new Firestore trigger + backfill, `functions/shared/secrets.py` (add `MYCHAMA_ID_PEPPER`), `firestore.indexes.json`, and the docs (`docs/ARCHITECTURE.md`, `INDEXES.md`, `TOUCH_BASE.md` — short notes). Do NOT remove the `members.idNumber` index exemption.
++Also deliver `docs/mychama/track-A-notes.md` (inside the PAY patch): manual test matrix + emulator steps + anything the integrator must know.
++
++## What to build
++### A1. Chama: `idKey` on member docs
++* Why: `members.idNumber` is index-exempt, so PAY cannot query it. Add `idKey = HMAC_SHA256_hex(pepper, "id:" + normalizeIdNumber(idNumber))` on every `chamas/{c}/members/{m}` doc; `normalizeIdNumber` = uppercase and strip every non-alphanumeric. **Byte-for-byte identical** to `functions/src/mychama/config.ts::computeIdKey` — ship shared test vectors (≥5 incl. spaces/hyphens/lowercase/passport-style IDs) in both patches' notes.
++* Firestore trigger (Python, 2nd gen `on_document_written`, same `REGION`/secret conventions as the repo) that sets `idKey` (and removes it if `idNumber` is empty). Write only when the value changes (no trigger loops). CYBER also writes members, so a trigger (not call-site changes) is required.
++* One-off backfill (admin-only callable or `scripts/` Python run with ADC) — idempotent, batched, dry-run flag, logs counts. Never log raw ID numbers.
++* Index: single-field **collection-group** index on `members.idKey` (ASCENDING) in `firestore.indexes.json`.
++### A2. PAY: caller identity (`sync/identity.ts`)
++`resolveCaller(request) → {uid, role, idNumber, verifiedPhoneE164|null}`. Tenants: PAY profile docs in `users/*` (inspect `createUserWithFirebaseAuth` for the exact doc id/fields); landlords: `agents/{agentId}` where `agentId` comes from the custom claim set by Track C (`{role:"landlord", agentId}`). Verified phone = `request.auth.token.phone_number` only. Read ONLY profile docs (ID number, phone) — never rent/payment/booking collections.
++### A3. PAY: linking (`link/*`)
++Implement exactly the rules in contract §5: match by `idKey` via collection-group query on mychama1 (`mychamaDb()`, read-only), silent-link on verified-phone match, `pending[]` for other phones (stable opaque `pendingId`, masked phone, `chamaCount`), `mychamaLinkRequestCode` (tap-to-send; HostPinnacle via `sendMyChamaSms`; **bind `...MYCHAMA_HP_SECRETS`**; SMS text e.g. "Samuhia Payments: your MyChama linking code is 123456. Valid for 10 minutes. Never share it."), `mychamaLinkVerifyCode`. Security: 6-digit CSPRNG code, store only an HMAC, constant-time compare, TTL, `CODE_MAX_ATTEMPTS`, resend cooldown, per-phone/day and per-user/day send caps (counters in server-only docs, transactional), challenge deleted on success, never reveal the full phone or the ID number, ambiguous-ID handling, per-phone grants only (a verified phone links only chamas registered on that phone), `boundPhoneKey` binding and `needs_reverify` transitions. Links are written under `chamaLinks/{uid}/links/{chamaId__memberId}`.
++### A4. PAY: sync (`sync/*`) — `mychamaSync`
++* Auth required. Cooldown/lease via `chamaSyncState/{uid}` (transactional; concurrent calls must not double-sync). `reason:"login"` with no prior snapshot ⇒ forced. Respect `SYNC_COOLDOWN_SECONDS` / `SYNC_MANUAL_COOLDOWN_SECONDS`; throttled calls return stored status without touching mychama1.
++* Order: resolve identity → refresh links (run the silent-link pass; re-check `boundPhoneKey` ⇒ `needs_reverify`) → for each ACTIVE link read member/chama/contributions/loans/MGR from mychama1 → write `chamaSnapshots/{uid}` (`ChamaSnapshotDoc`).
++* Per-section `try/catch`: a failing section ⇒ that field `null` + `missing[]` + `dataStatus:"partial"|"unavailable"`; never `0`. If everything fails: keep the last good `chamas[]`, update only `status/lastAttemptAt/lastError` (`stale` if old data exists, else `unavailable`).
++* Data to compute (all KES, `round2`, dates in Africa/Nairobi): **contributions** (unpaid/partial for the member, capped at `SNAPSHOT_MAX_ITEMS_PER_LIST`); **loans** (active/disbursed loans: outstanding = sum of unpaid installment amounts, next installment, remaining count — mirror Chama `shared/loan_schedule.py`); **MGR** per pot where the member is in `memberIds`: current-period paid? (`records`), `dueNow`, open `arrears` (use the arrear id), `nextDueDate`, and **wins** — `won` from `payouts` (this member, current cycle) and `scheduled` from `queue` position × `recipientsPerRound` × `frequency` (mirror `shared/mgr_engine.py::pool_for_round/pool_estimate`; if the amount/date can't be known set `null` — never guess). `onlineCollectionEnabled` = plan has `onlineCollection` (Chama `constants.PLANS`) **and** `settlementSplitCode` present. Totals per contract (`overdue`, `dueThisMonth`, `expectedInflowThisMonth`; no double counting).
++* Read only from mychama1. **Never write to mychama1** (your only mychama1 change is the Chama patch). **Never read or write rental data.**
++
++## Hard rules
++* Files outside `link/**`, `sync/**` are off-limits (other tracks own them); don't touch `functions/src/index.ts`, the contract, or frontend.
++* No new npm dependencies unless unavoidable (then list them explicitly).
++* Don't log ID numbers, full phones, codes, or keys.
++* Keep pure logic (id/phone normalising, totals, MGR wins, date maths) in side-effect-free modules so they are unit-testable.
++
++## Acceptance (run and paste results in your notes)
++`cd functions && npx tsc --noEmit` · `npm run check:mychama-contract` · `git apply --check` on a P0-only tree and again with B and C applied · cross-language `idKey` vectors match · emulator walkthrough: silent link, pending → code → verify, wrong-code lockout, cooldown, partial/unavailable data.
+diff --git a/docs/mychama/prompts/TRACK_B_MONEY_PLANE.md b/docs/mychama/prompts/TRACK_B_MONEY_PLANE.md
+new file mode 100644
+index 0000000..5207839
+--- /dev/null
++++ b/docs/mychama/prompts/TRACK_B_MONEY_PLANE.md
+@@ -0,0 +1,39 @@
++# TRACK B — Money plane (new Paystack account, webhook, payments, cutover) — PROMPT
++
++You are **Track B** of three AIs building the MyChama⇄PAY connector in parallel (A = data plane, C = experience). A foundation patch **P0** fixed all shared contracts; your patch must drop in next to theirs without conflicts.
++
++## Repos & base
++**PAY** at `6547b3a` + **P0 applied** (TypeScript, Firebase Functions v2, `africa-south1`). **Chama** at `1c83e40` (Python, project `mychama1`) — read-only for you unless a change is unavoidable. **CYBER** (WhatsApp bot) is NOT provided.
++**Read first:** `docs/mychama/CONNECTOR_CONTRACT.md`, `functions/src/mychama/contract.ts`. Frozen: `contract.ts`, `config.ts`, `errors.ts`, `sms.ts`, `paths.ts` (§10 of the contract for change requests).
++
++## Deliverables
++1. `track-B-pay-money-plane.patch` (PAY) — touching ONLY `functions/src/mychama/pay/**`, `functions/src/mychama/webhook/**` (including `handlers.ts`, which P0 moved verbatim out of `index.ts` — you own it now; keep exported signatures), `scripts/mychama/**`, `docs/mychama/cutover.md`, `docs/mychama/cyber-key-swap.md`.
++2. Optional `track-B-chama.patch` only if you find the Chama app still needs a change for the new key (it already reads `MYCHAMA_PAYSTACK_SECRET_KEY` — verify by reading `functions/shared/secrets.py`, `shared/paystack.py`, `mychama/payments.py`, billing/SMS/report purchase code). Prefer config-only (document it).
++
++## B1. New webhook `mychamaPaystackCallback` (replace the P0 stub in `webhook/index.ts`)
++* Mirror the legacy `paystackCallback` in `functions/src/index.ts` (read it: signature check = HMAC-**SHA512** of `req.rawBody` vs `x-paystack-signature`, 400 on mismatch, 405 on non-POST) but with `MYCHAMA_PAYSTACK_SECRET_KEY`, constant-time compare, and **MyChama references only** (`MCW- MCA- MCS- MCP- MCX- MCR-`; reuse the prefix→handler mapping logic). Non-MyChama references: log, return 200 (so Paystack doesn't retry), apply nothing.
++* Dispatch to the existing handlers in `handlers.ts` (`handleMyChamaPayment`, `…SmsTopup`, `…PlanBilling`, `…ReportCreditTopup`, `…ReportAlacarte`) and replicate the legacy `charge.failed` handling (mark the matching intent/top-up/billing/purchase doc `failed`).
++* **Bind `...MYCHAMA_HP_SECRETS`** in `secrets` (the legacy webhook does not, so the confirmation SMS has likely been failing silently — fix it here and mention it in your notes; do not edit legacy code).
++* Hardening you own in `handlers.ts`: before applying, verify Paystack `data.currency === "KES"` and that `data.amount/100` matches the stored expectation (`intent.grossAmount` for MCA/MCW; the corresponding amount field for MCS/MCP/MCX/MCR — read the Chama code that creates those docs). On mismatch: do NOT apply, set an `applyNote`, log, return 200 (permanent error ≠ retry). Transient errors → 500 so Paystack retries. Keep idempotency (`status==="success"` ⇒ no-op) and the existing spill-forward behaviour untouched.
++* Do not modify the legacy `paystackCallback` or `index.ts` — it keeps handling MyChama references until cutover (old-account in-flight payments).
++
++## B2. `mychamaPayInitiate` (replace the P0 stub in `pay/index.ts`)
++Self-pay for an authenticated PAY user who is linked to a chama (links are written by Track A under `chamaLinks/{uid}/links/*` in the plot DB — read them; only `state:"active"` links may pay; map `chamaId → memberId` from the link, **never from the client**).
++* Validate against mychama1 (read via `mychamaDb()`): chama exists/active, plan allows online collection (`PLANS[plan].onlineCollection`), `settlementSplitCode` set (else `online_collection_disabled`), member active, amount > 0 and sane, and purpose targets (`contributionId` / `loanId`+`installmentNo` / `potId`+`potPeriod` / `arrearId`) belong to that member and are payable.
++* Rate limit: mirror `MAX_INTENTS_PER_HOUR = 10` per member over `paymentIntents`; idempotency on `clientRequestId` using the **same mechanism/collection as Chama `shared/idempotency.py`** so a retry from any surface dedupes (read it carefully).
++* Fees: port Chama `functions/shared/money.py` (and check it against `Chama/src/lib/money.ts`) — `PAYSTACK_FEE_RATE 0.015`, `PAYSTACK_FEE_CAP 3000`, `CONTRIBUTION_MARKUP_RATE 0.005`, loan markup per plan, MGR = contribution markup. Put the port in `pay/fees.ts` as pure functions with test vectors in your notes (compare against several Python outputs).
++* Create the intent doc **exactly** like Chama `mychama/payments.py::initiatePayment` (field-for-field; `reference = MCA-{chamaId}-{CNT|LNR|MGR}-{epochMs}-{rand6}`; `channel:"app"`; extras `via:"pay_portal"`, `initiatedBy:{uid, role}`; `expiresAt = +30 min`), then charge mobile money via Paystack `/charge` with **`MYCHAMA_PAYSTACK_SECRET_KEY`** (port `shared/paystack.py::charge_mobile_money`; metadata `chargeType:"mychama_payment"`, `targetProject:"mychama1"`, `chamaId`, `memberId`, `purpose`, `splitCode`). On Paystack failure mark the intent `failed` and throw `upstream_failure`. Default phone = member's phone on file; an explicit valid KE `phone` is allowed and recorded as `phoneOverridden`.
++* Return `PayInitiateResponse` (reference, grossAmount, paystackFee, ourFee, Paystack `display_text` as `message`).
++
++## B3. Split/subaccount migration (`scripts/mychama/`)
++Existing chamas' `settlementSplitCode`s belong to the OLD Paystack account. Investigate how settlement accounts are created in Chama (`mychama/settlement*`, `shared/paystack.py::create_split`/subaccount code, `settlementAccountRequests`) and what bank details are persisted in Firestore. If enough data is stored: write an idempotent script with `--dry-run` / `--apply`, using the NEW key, that recreates subaccount+split per chama, keeps the old code in `legacySettlementSplitCode`, writes the new `settlementSplitCode`, and reports per-chama results. If bank details are NOT stored (only inside Paystack), say so clearly and design the re-onboarding path instead (chairs re-submit settlement details; `initiatePayment` and `mychamaPayInitiate` must refuse until a new-account split exists). Note the user's finding that Paystack doesn't support their dynamic split logic, so amounts are computed in code before reaching the subaccount — keep that unchanged.
++
++## B4. Docs
++`docs/mychama/cutover.md`: ordered runbook (secrets, deploy order, test-key rehearsal, registering the new webhook URL in the new account's dashboard, split migration, switching mychama1 + CYBER to the new key, smoke tests, in-flight handling, rollback, and the exact legacy MyChama branches to delete afterwards — as a description, not applied). `docs/mychama/cyber-key-swap.md`: what to change in the CYBER repo (its MyChama flow: `MCW-` intents + charge; keep `CYBER_` flows on the old key; new secret name; split codes must exist first).
++
++## Hard rules
++* Off-limits: `contract.ts`, `config.ts`, `errors.ts`, `sms.ts`, `paths.ts`, `link/**`, `sync/**`, `index.ts`, all frontend/auth.
++* No logging of secrets/phones/ID numbers. No new npm deps unless unavoidable (list them).
++* No payment for another member, no client-supplied memberId, no trust of client-supplied fees.
++## Acceptance
++`cd functions && npx tsc --noEmit` · `npm run check:mychama-contract` · `git apply --check` (P0-only tree, and with A and C applied) · local signature test (valid/invalid/replayed event) · fee test vectors match the Python engine · emulator run of an MCA intent through to handler application.
+diff --git a/docs/mychama/prompts/TRACK_C_EXPERIENCE.md b/docs/mychama/prompts/TRACK_C_EXPERIENCE.md
+new file mode 100644
+index 0000000..cb7195e
+--- /dev/null
++++ b/docs/mychama/prompts/TRACK_C_EXPERIENCE.md
+@@ -0,0 +1,33 @@
++# TRACK C — Experience (Samuhia Payments UI, landlord Firebase Auth, chama connector UI) — PROMPT
++
++You are **Track C** of three AIs building the MyChama⇄PAY connector in parallel (A = data plane, B = money plane). A foundation patch **P0** fixed all shared contracts; your patch must drop in next to theirs without conflicts.
++
++## Repos & base
++**PAY** at `6547b3a` + **P0 applied**: React 19 + TypeScript + Vite + Tailwind v4 (`@tailwindcss/vite`), Firebase (hosting site `payments-1x`, functions region `africa-south1`). No other repo is needed.
++**Read first:** `docs/mychama/CONNECTOR_CONTRACT.md`, `src/mychama/contract.ts`, `src/mychama/api.ts`. Frozen: `src/mychama/{contract,api,index}.ts` (use `mychamaApi`, never raw `httpsCallable`). Contract changes via §10.
++**You need from the user (ask if missing):** the Samuhia brand HTML (logos/colours/typography — it is attached in the user's chat, not in the repo).
++
++## Deliverable
++`track-C-pay-experience.patch` (PAY) — touching ONLY `src/**` (except the frozen files), `functions/src/auth/**`, `index.html`, `public/**`, plus `docs/mychama/track-C-notes.md`. Do not touch `functions/src/index.ts` or `functions/src/mychama/**`.
++
++## C1. Samuhia Payments rebrand
++Rename the product everywhere user-visible to **Samuhia Payments** (Welcome, Auth, Signup, headers, titles, `index.html`, manifest/meta, receipts shown in UI) and apply the logos/colours from the HTML. Put tokens in `src/theme/` (CSS variables + Tailwind v4 `@theme`), then restyle shared components via tokens rather than per-screen colour edits. The UI may be refined later — keep tokens central. No rental logic changes.
++
++## C2. Landlord login → Firebase Auth
++* Today landlords use a custom login (`Auth.tsx`, `localStorage` key `agentAuthUser`, profile `agents/{agentId}`, password hash verified with `hash-wasm`/argon2); tenants use Firebase **phone** auth. Target: landlords sign in with Firebase Auth **phone OR email/password**; tenants stay phone-only.
++* Backend (you own `functions/src/auth/index.ts`, wired already by P0): a **lazy migration** callable (e.g. `agentMigrateLogin`) — verify legacy credentials server-side against the agent doc (determine the exact hash type first; Firebase `importUsers` can't import argon2), create/link the Firebase Auth user, set custom claims **`{ role: "landlord", agentId }`** (Track A depends on these), return a custom token. Also support phone-linking for landlords. Rate-limit and never reveal which part of the credentials failed.
++* Frontend: auth guard on `onAuthStateChanged` + claims; provide a compatibility hook (e.g. `useAgentSession()`) so `AgentView` keeps working with the same `agentId` it uses today; stop treating `localStorage` as the source of truth. **Do not change existing rent callables** (they still receive `agentId` from the client — server-side hardening is a separate later patch). No regression in rent collection flows.
++
++## C3. Connector UI (landlord + tenant)
++* On the first authenticated session call `mychamaApi.sync({reason:"login"})`; on reload `reason:"reload"`; a Refresh button uses `"manual"`. The server throttles — the UI **always renders from `onSnapshot(chamaSnapshots/{uid})`** (`mychamaSnapshotPath(uid)`), never from callable return values.
++* States to design: `never_linked` (explain linking is automatic by ID), **`pending[]`** cards (masked phone, "Send code" → `requestCode` → code entry → `verifyCode`, show `remainingAttempts`, resend countdown from `resendAfter`, handle `send_limit_reached`/`code_*` errors via `mychamaErrorCode`), `ok`, `stale` (banner with "as of" time), `unavailable` (never blank-screen; explain, offer manual refresh), `needs_reverify`, per-chama `dataStatus: partial|unavailable` (a `null` section means "unavailable", NOT zero — render it as unavailable).
++* Pay: new `MyChamaPayModal` (don't modify the rent `PaymentModal`) for contributions, loan instalments and MGR (incl. arrears) → `mychamaApi.payInitiate` with a fresh `clientRequestId`, show the STK-push waiting state, then a "Check status" action that triggers a manual sync (the webhook updates mychama1, the snapshot catches up on sync). Only offer pay when `onlineCollectionEnabled`.
++* **Calculations — `src/mychama/calc.ts` (pure, unit-tested):** `landlordPeriodSummary({rentCollected, from, to}, chamas)` → deductions for contributions, loan repayments and MGR contributions with due dates inside the period, plus expected MGR wins (`wins`, `expectedInflowThisMonth`) and net; `tenantMonthSummary({rentDue, billsDue, …}, chamas)` → "this month I need KES X: rent, bills, chama (contributions, loans, MGR)" minus expected wins. Components pass in rent totals they ALREADY load; **calc.ts and the connector code never query rental collections**. Rent screens stay unchanged; chama figures appear in a separate, clearly labelled MyChama section/tab (routes such as `/agent/chama`, `/tenant/chama` or embedded tabs — your choice).
++* Money formatting KES, EAT dates, accessible, mobile-first.
++
++## Hard rules
++* Do not edit frozen files, `functions/src/index.ts`, or anything under `functions/src/mychama/**`.
++* No direct Firestore reads of rental collections from the new code; no writes to chama* collections (rules forbid it).
++* Keep the build green: `npm run build` (tsc -b + vite) and `npm run check:mychama-contract`.
++## Acceptance
++Build passes · `git apply --check` (P0-only tree, and with A and B applied) · screenshots/notes for each state above · unit tests (or documented worked examples if no runner is added) for `calc.ts` · confirmation that no rental query/collection is referenced from `src/mychama/**`.
+diff --git a/functions/src/auth/index.ts b/functions/src/auth/index.ts
+new file mode 100644
+index 0000000..c3897ab
+--- /dev/null
++++ b/functions/src/auth/index.ts
+@@ -0,0 +1,3 @@
++// TRACK C — owns this directory (landlord Firebase Auth migration callables).
++// Wired once from ../index.ts (`export * from "./auth"`). Empty in P0.
++export {};
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index df73dd8..03e3b8c 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -38,28 +38,15 @@ function myregisterDb(): admin.firestore.Firestore {
+   return myregisterDbCached;
+ }
+ 
+-// ─── MyChama (mychama1) — lazy, IAM-based secondary app ────────────────────
+-// Mirrors CYBER's functions/src/config/mychama.config.ts exactly: this
+-// project's default compute service account must be granted "Firebase
+-// Admin" on the mychama1 Google Cloud project via IAM (same grant CYBER
+-// already has) — no service-account JSON, no extra secret to rotate.
+-// Initialisation is lazy + idempotent so a cold start that never touches a
+-// MyChama charge pays nothing for it.
+-const MYCHAMA_PROJECT_ID = "mychama1";
+-const MYCHAMA_APP_NAME = "mychama";
+-let mychamaDbCached: admin.firestore.Firestore | null = null;
+-
+-function mychamaDb(): admin.firestore.Firestore {
+-  if (mychamaDbCached) return mychamaDbCached;
+-  const existing = admin.apps.find((a) => a && a.name === MYCHAMA_APP_NAME);
+-  const mychamaApp = existing || admin.initializeApp(
+-    { credential: admin.credential.applicationDefault(), projectId: MYCHAMA_PROJECT_ID },
+-    MYCHAMA_APP_NAME
+-  );
+-  mychamaDbCached = mychamaApp.firestore();
+-  mychamaDbCached.settings({ ignoreUndefinedProperties: true });
+-  return mychamaDbCached;
+-}
++import { mychamaDb } from "./mychama/config";
++import {
++  handleMyChamaPayment,
++  handleMyChamaSmsTopup,
++  handleMyChamaPlanBilling,
++  handleMyChamaReportCreditTopup,
++  handleMyChamaReportAlacarte,
++} from "./mychama/webhook/handlers";
++
+ 
+ 
+ // ============= CONFIGURATION =============
+@@ -577,316 +564,9 @@ function determineChargeType(reference: string): string {
+   return "unknown";
+ }
+ 
+-// ============================================================================
+-// MYCHAMA — payment application, SMS top-up, plan billing
+-//
+-// This is the ONLY place any of these three things happen. mychama1's own
+-// Python functions (functions/mychama/{contributions,loans,mgr}.py) and
+-// CYBER's WhatsApp bot both only ever CREATE a paymentIntents doc and
+-// trigger a Paystack charge — neither one ever marks money as received.
+-// The spill-forward math below is a deliberate line-for-line port of
+-// functions/shared/money.py's counterparts in the Chama repo; if either
+-// side's formula changes, change both in the same commit (see that repo's
+-// docs/CONVENTIONS.md).
+-// ============================================================================
+-
+-async function applyMyChamaContributionPayment(
+-  db: admin.firestore.Firestore,
+-  chamaId: string,
+-  memberId: string,
+-  startContributionId: string,
+-  amount: number
+-): Promise<void> {
+-  const contribRef = db.collection(`chamas/${chamaId}/contributions`);
+-  const snap = await contribRef.where("memberId", "==", memberId).get();
+-  const all = snap.docs.sort((a, b) => (a.data().periodKey || "").localeCompare(b.data().periodKey || ""));
+-  const startIdx = Math.max(0, all.findIndex((d) => d.id === startContributionId));
+-
+-  let remaining = amount;
+-  let appliedTotal = 0;
+-  const batch = db.batch();
+-  const now = Date.now();
+-
+-  for (const doc of all.slice(startIdx)) {
+-    if (remaining <= 0.009) break;
+-    const data = doc.data();
+-    const due = (data.amount || 0) - (data.paidAmount || 0);
+-    if (due <= 0.009) continue;
+-    const applied = Math.min(due, remaining);
+-    const newPaid = (data.paidAmount || 0) + applied;
+-    remaining -= applied;
+-    appliedTotal += applied;
+-    const newStatus = newPaid >= data.amount - 0.01 ? "paid" : "partial";
+-    const update: Record<string, unknown> = { paidAmount: newPaid, status: newStatus, updatedAt: now };
+-    if (newStatus === "paid" && !data.paidOn) update.paidOn = new Date().toISOString().slice(0, 10);
+-    batch.update(doc.ref, update);
+-  }
+-
+-  const memberRef = db.doc(`chamas/${chamaId}/members/${memberId}`);
+-  const memberSnap = await memberRef.get();
+-  const member = memberSnap.data() || {};
+-  const creditDelta = remaining > 0.009 ? Math.round(remaining * 100) / 100 : 0;
+-
+-  batch.update(memberRef, {
+-    creditBalance: (member.creditBalance || 0) + creditDelta,
+-    totalContributed: (member.totalContributed || 0) + appliedTotal,
+-    updatedAt: now,
+-  });
+-  await batch.commit();
+-}
+-
+-async function applyMyChamaLoanRepayment(
+-  db: admin.firestore.Firestore,
+-  chamaId: string,
+-  loanId: string,
+-  amount: number
+-): Promise<void> {
+-  const loanRef = db.doc(`chamas/${chamaId}/loans/${loanId}`);
+-  const loanSnap = await loanRef.get();
+-  if (!loanSnap.exists) return;
+-  const loan = loanSnap.data()!;
+-  if (!["active", "overdue"].includes(loan.status)) return;
+-
+-  const schedule = [...loan.schedule];
+-  let remaining = amount;
+-  for (const inst of schedule) {
+-    if (remaining <= 0.009) break;
+-    const due = inst.due - (inst.paidAmount || 0);
+-    if (due <= 0.009) continue;
+-    const applied = Math.min(due, remaining);
+-    inst.paidAmount = (inst.paidAmount || 0) + applied;
+-    remaining -= applied;
+-    inst.paid = inst.paidAmount >= inst.due - 0.01;
+-  }
+-
+-  const newStatus = schedule.every((s) => s.paid) ? "completed" : "active";
+-  const now = Date.now();
+-  const batch = db.batch();
+-  batch.update(loanRef, { schedule, status: newStatus, updatedAt: now });
+-
+-  if (remaining > 0.009) {
+-    const memberRef = db.doc(`chamas/${chamaId}/members/${loan.memberId}`);
+-    const memberSnap = await memberRef.get();
+-    const member = memberSnap.data() || {};
+-    const creditDelta = Math.round(remaining * 100) / 100;
+-    batch.update(memberRef, { creditBalance: (member.creditBalance || 0) + creditDelta, updatedAt: now });
+-  }
+-  await batch.commit();
+-}
+-
+-async function applyMyChamaMgrContribution(
+-  db: admin.firestore.Firestore,
+-  chamaId: string,
+-  potId: string,
+-  memberId: string,
+-  amount: number,
+-  ref: string
+-): Promise<void> {
+-  const potRef = db.doc(`chamas/${chamaId}/mgrPots/${potId}`);
+-  const potSnap = await potRef.get();
+-  if (!potSnap.exists) return;
+-  const pot = potSnap.data()!;
+-  if (pot.status !== "active") return;
+-
+-  const now = Date.now();
+-  const today = new Date().toISOString().slice(0, 10);
+-  const existing = await db
+-    .collection(`chamas/${chamaId}/mgrPots/${potId}/records`)
+-    .where("memberId", "==", memberId)
+-    .where("period", "==", pot.period)
+-    .limit(1)
+-    .get();
+-
+-  if (!existing.empty) {
+-    await existing.docs[0].ref.update({ status: "paid", amount, date: today, method: "paystack", ref, updatedAt: now });
+-  } else {
+-    await db.collection(`chamas/${chamaId}/mgrPots/${potId}/records`).add({
+-      period: pot.period, memberId, status: "paid", amount, date: today, method: "paystack", ref, createdAt: now, updatedAt: now,
+-    });
+-  }
+-}
++// (MyChama payment-application handlers + HostPinnacle SMS moved to
++//  ./mychama/webhook/handlers.ts and ./mychama/sms.ts — see docs/mychama/)
+ 
+-/**
+- * Applies an MCW-/MCA- payment once Paystack confirms it. `reference` is
+- * both the Paystack reference and the mychama1 paymentIntents document ID
+- * — that doubles as the idempotency check: if the intent is already
+- * `success`, this is a replayed webhook event and we do nothing further.
+- */
+-async function handleMyChamaPayment(reference: string, chamaIdHint?: string): Promise<void> {
+-  const db2 = mychamaDb();
+-
+-  // reference format: MCW-{chamaId}-{purposeCode}-{ts}-{rand} — chamaId is
+-  // also usually available in the webhook payload's metadata, used as a
+-  // cross-check / fallback if the reference format ever changes.
+-  const parts = reference.split("-");
+-  const chamaId = chamaIdHint || parts[1];
+-  if (!chamaId) {
+-    console.error("MyChama payment: could not determine chamaId from reference", reference);
+-    return;
+-  }
+-
+-  const intentRef = db2.doc(`chamas/${chamaId}/paymentIntents/${reference}`);
+-  const intentSnap = await intentRef.get();
+-  if (!intentSnap.exists) {
+-    console.error("MyChama payment: no matching paymentIntent for reference", reference);
+-    return;
+-  }
+-  const intent = intentSnap.data()!;
+-  if (intent.status === "success") return; // already applied — replayed webhook event
+-
+-  if (intent.purpose === "contribution" && intent.contributionId) {
+-    await applyMyChamaContributionPayment(db2, chamaId, intent.memberId, intent.contributionId, intent.amount);
+-  } else if (intent.purpose === "loan_repayment" && intent.loanId) {
+-    await applyMyChamaLoanRepayment(db2, chamaId, intent.loanId, intent.amount);
+-  } else if (intent.purpose === "mgr_contribution" && intent.potId) {
+-    await applyMyChamaMgrContribution(db2, chamaId, intent.potId, intent.memberId, intent.amount, reference);
+-  }
+-
+-  const now = Date.now();
+-  await db2.collection(`chamas/${chamaId}/transactions`).add({
+-    type: intent.purpose,
+-    memberId: intent.memberId,
+-    amount: intent.amount,
+-    grossAmount: intent.grossAmount,
+-    paystackFee: intent.paystackFee,
+-    ourFee: intent.ourFee,
+-    method: "paystack",
+-    ref: reference,
+-    date: new Date().toISOString().slice(0, 10),
+-    settled: false,
+-    direction: "in",
+-    channel: intent.channel || "app",
+-    intentId: reference,
+-    createdAt: now,
+-  });
+-
+-  await intentRef.update({ status: "success", updatedAt: now });
+-
+-  // Best-effort confirmation SMS via MyChama's own HostPinnacle sender —
+-  // failure here must never fail the webhook (Paystack will retry the
+-  // whole event if this handler throws, and the payment is already
+-  // applied above).
+-  try {
+-    const memberSnap = await db2.doc(`chamas/${chamaId}/members/${intent.memberId}`).get();
+-    const phone = memberSnap.data()?.phoneNormalized;
+-    if (phone) {
+-      await sendMyChamaSms(phone, `MyChama: payment of KES ${Math.round(intent.amount)} received. Thank you.`);
+-    }
+-  } catch (e) {
+-    console.error("MyChama payment confirmation SMS failed (non-fatal):", e);
+-  }
+-}
+-
+-async function handleMyChamaSmsTopup(reference: string, chamaIdHint?: string): Promise<void> {
+-  const db2 = mychamaDb();
+-  const chamaId = chamaIdHint || reference.split("-")[1];
+-  if (!chamaId) return;
+-
+-  const topupRef = db2.doc(`chamas/${chamaId}/smsTopUps/${reference}`);
+-  const topupSnap = await topupRef.get();
+-  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
+-  const topup = topupSnap.data()!;
+-
+-  const chamaRef = db2.doc(`chamas/${chamaId}`);
+-  const chamaSnap = await chamaRef.get();
+-  const chama = chamaSnap.data() || {};
+-  await chamaRef.update({ smsCredits: (chama.smsCredits || 0) + topup.amountKes, updatedAt: Date.now() });
+-  await topupRef.update({ status: "success", updatedAt: Date.now() });
+-}
+-
+-async function handleMyChamaPlanBilling(reference: string, chamaIdHint?: string, plan?: string): Promise<void> {
+-  const db2 = mychamaDb();
+-  const chamaId = chamaIdHint || reference.split("-")[1];
+-  if (!chamaId || !plan) return;
+-
+-  const billingRef = db2.doc(`chamas/${chamaId}/planBilling/${reference}`);
+-  const billingSnap = await billingRef.get();
+-  if (billingSnap.exists && billingSnap.data()?.status === "success") return;
+-
+-  const now = Date.now();
+-  const expiry = new Date();
+-  expiry.setDate(expiry.getDate() + 30);
+-  await db2.doc(`chamas/${chamaId}`).update({ plan, planExpiry: expiry.toISOString().slice(0, 10), updatedAt: now });
+-  await billingRef.set({ status: "success", plan, updatedAt: now }, { merge: true });
+-}
+-
+-/**
+- * Reports-engine prepaid wallet top-up (MCX-). Unlike smsCredits, this
+- * wallet is CREDIT-denominated, not KES-denominated — mychama1's own
+- * functions/shared/reports_engine.py spends it in credits, so this must
+- * increment `reportCreditsBalance` by `topup.credits`, never by
+- * `topup.amountKes`. See that repo's functions/mychama/reports.py::
+- * purchaseReportCredits, which is what creates this pending doc.
+- */
+-async function handleMyChamaReportCreditTopup(reference: string, chamaIdHint?: string): Promise<void> {
+-  const db2 = mychamaDb();
+-  const chamaId = chamaIdHint || reference.split("-")[1];
+-  if (!chamaId) return;
+-
+-  const topupRef = db2.doc(`chamas/${chamaId}/reportCreditTopUps/${reference}`);
+-  const topupSnap = await topupRef.get();
+-  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
+-  const topup = topupSnap.data()!;
+-
+-  const credits = Number(topup.credits);
+-  if (!Number.isFinite(credits) || credits <= 0) {
+-    console.error(`handleMyChamaReportCreditTopup: invalid credits value "${topup.credits}" for ${reference}`);
+-    return;
+-  }
+-
+-  const chamaRef = db2.doc(`chamas/${chamaId}`);
+-  const chamaSnap = await chamaRef.get();
+-  const chama = chamaSnap.data() || {};
+-  await chamaRef.update({ reportCreditsBalance: (chama.reportCreditsBalance || 0) + credits, updatedAt: Date.now() });
+-  await topupRef.update({ status: "success", updatedAt: Date.now() });
+-}
+-
+-/**
+- * Starter/Basic one-off premium-report purchase (MCR-). Deliberately does
+- * NOT touch any balance on the chama doc — mychama1's own generateReport /
+- * generateStatement callables consume this purchase directly by its
+- * reference once its status flips to "success" (see that repo's
+- * functions/shared/reports_engine.py::consume_alacarte_purchase), so all
+- * this webhook needs to do is flip pending -> success, exactly like plan
+- * billing's status-only branch. The monthly à la carte CAP was already
+- * reserved when the purchase doc was created (mychama1's own
+- * purchasePremiumReportAlaCarte), not here.
+- */
+-async function handleMyChamaReportAlacarte(reference: string, chamaIdHint?: string): Promise<void> {
+-  const db2 = mychamaDb();
+-  const chamaId = chamaIdHint || reference.split("-")[1];
+-  if (!chamaId) return;
+-
+-  const purchaseRef = db2.doc(`chamas/${chamaId}/reportAlacartePurchases/${reference}`);
+-  const purchaseSnap = await purchaseRef.get();
+-  if (!purchaseSnap.exists || purchaseSnap.data()?.status === "success") return;
+-
+-  await purchaseRef.update({ status: "success", updatedAt: Date.now() });
+-}
+-
+-// MyChama's own HostPinnacle credentials — separate from PAY's shared
+-// SMS_CONFIG so MyChama's sender ID/branding never gets mixed with another
+-// product's. Set with:
+-//   firebase functions:secrets:set MYCHAMA_HP_SMS_USERID (and _PASSWORD/_APIKEY/_SENDERID)
+-const MYCHAMA_HP_USERID = defineSecret("MYCHAMA_HP_SMS_USERID");
+-const MYCHAMA_HP_PASSWORD = defineSecret("MYCHAMA_HP_SMS_PASSWORD");
+-const MYCHAMA_HP_APIKEY = defineSecret("MYCHAMA_HP_SMS_APIKEY");
+-const MYCHAMA_HP_SENDERID = defineSecret("MYCHAMA_HP_SMS_SENDERID");
+-
+-async function sendMyChamaSms(phoneE164: string, message: string): Promise<void> {
+-  await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", {
+-    userid: MYCHAMA_HP_USERID.value(),
+-    password: MYCHAMA_HP_PASSWORD.value(),
+-    apikey: MYCHAMA_HP_APIKEY.value(),
+-    senderid: MYCHAMA_HP_SENDERID.value(),
+-    mobile: phoneE164.replace(/^\+/, ""),
+-    msg: message.slice(0, 400),
+-    sendMethod: "quick",
+-    msgType: "text",
+-    output: "json",
+-    duplicatecheck: "true",
+-  });
+-}
+ 
+ 
+ 
+@@ -3563,3 +3243,7 @@ export const expireBusinessTrials = onSchedule({
+ 
+ 
+ 
++
++// ─── MyChama connector / auth wiring (P0) — see docs/mychama/CONNECTOR_CONTRACT.md ───
++export * from "./mychama";
++export * from "./auth";
+diff --git a/functions/src/mychama/config.ts b/functions/src/mychama/config.ts
+new file mode 100644
+index 0000000..61d49fe
+--- /dev/null
++++ b/functions/src/mychama/config.ts
+@@ -0,0 +1,71 @@
++import * as admin from "firebase-admin";
++import * as crypto from "crypto";
++import { defineSecret } from "firebase-functions/params";
++import { MYCHAMA_REGION } from "./contract";
++
++export const REGION = MYCHAMA_REGION;
++
++// ─── Secrets (declare ONCE here; bind per-function via `secrets: [...]`) ───
++/** The NEW Paystack account's secret key. Used ONLY by MyChama code paths. */
++export const MYCHAMA_PAYSTACK_SECRET_KEY = defineSecret("MYCHAMA_PAYSTACK_SECRET_KEY");
++/** HMAC pepper for idKey/phoneKey. MUST be the identical value in mychama1 (Python side). */
++export const MYCHAMA_ID_PEPPER = defineSecret("MYCHAMA_ID_PEPPER");
++// HostPinnacle SMS secrets live in ./sms.ts (MYCHAMA_HP_SECRETS).
++
++// ─── Firestore handles ───
++const MYCHAMA_PROJECT_ID = "mychama1";
++const MYCHAMA_APP_NAME = "mychama";   // same app name index.ts used — one shared instance
++let mychamaDbCached: admin.firestore.Firestore | null = null;
++
++/** mychama1 Firestore via IAM (default service account); no JSON key. Lazy + idempotent. */
++export function mychamaDb(): admin.firestore.Firestore {
++  if (mychamaDbCached) return mychamaDbCached;
++  const existing = admin.apps.find((a) => a && a.name === MYCHAMA_APP_NAME);
++  const mychamaApp = existing || admin.initializeApp(
++    { credential: admin.credential.applicationDefault(), projectId: MYCHAMA_PROJECT_ID },
++    MYCHAMA_APP_NAME
++  );
++  mychamaDbCached = mychamaApp.firestore();
++  mychamaDbCached.settings({ ignoreUndefinedProperties: true });
++  return mychamaDbCached;
++}
++
++/** plot (this project's default) Firestore. */
++export function plotDb(): admin.firestore.Firestore {
++  if (!admin.apps.length) admin.initializeApp();
++  return admin.firestore();
++}
++
++// ─── Identity normalisation (CROSS-REPO CONTRACT — mirror in mychama1) ───
++/** trim, uppercase, drop every non-alphanumeric. "12 345-678" -> "12345678". */
++export function normalizeIdNumber(raw: string): string {
++  return (raw || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
++}
++
++/** Mirrors Chama functions/shared/phone.py::normalize_phone. Returns "" when unusable. */
++export function normalizeKePhone(raw: string): string {
++  const digits = (raw || "").replace(/\D/g, "");
++  if (/^254[17]\d{8}$/.test(digits)) return "+" + digits;
++  if (/^0[17]\d{8}$/.test(digits)) return "+254" + digits.slice(1);
++  if (/^[17]\d{8}$/.test(digits)) return "+254" + digits;
++  return digits ? "+" + digits : "";
++}
++
++function hmacHex(value: string): string {
++  return crypto.createHmac("sha256", MYCHAMA_ID_PEPPER.value()).update(value).digest("hex");
++}
++/** idKey stored on mychama1 member docs as `idKey`. Bind MYCHAMA_ID_PEPPER to any function calling this. */
++export function computeIdKey(rawIdNumber: string): string {
++  const n = normalizeIdNumber(rawIdNumber);
++  return n ? hmacHex("id:" + n) : "";
++}
++/** Phone proof key stored on links (`boundPhoneKey`). Input must be E.164 (normalizeKePhone). */
++export function computePhoneKey(e164: string): string {
++  return e164 ? hmacHex("ph:" + e164) : "";
++}
++/** "+254712345123" -> "07•• ••• 123" */
++export function maskPhone(e164: string): string {
++  const digits = (e164 || "").replace(/\D/g, "");
++  const local = digits.startsWith("254") ? "0" + digits.slice(3) : digits;
++  return local.length >= 6 ? `${local.slice(0, 2)}•• ••• ${local.slice(-3)}` : "•••";
++}
+diff --git a/functions/src/mychama/contract.ts b/functions/src/mychama/contract.ts
+new file mode 100644
+index 0000000..74c076e
+--- /dev/null
++++ b/functions/src/mychama/contract.ts
+@@ -0,0 +1,237 @@
++/**
++ * MyChama <-> PAY connector CONTRACT (v1).
++ *
++ * Pure types + constants + path builders. NO imports, so the byte-identical
++ * copy at  src/mychama/contract.ts  (frontend) compiles unchanged.
++ * `npm run check:mychama-contract` (repo root) fails if the two copies drift.
++ *
++ * FROZEN after P0. Tracks A/B/C must NOT edit this file; request changes via
++ * the integrator (see docs/mychama/CONNECTOR_CONTRACT.md §10).
++ * All money = KES, major units (numbers, 2dp), never strings.
++ */
++
++export const MYCHAMA_CONTRACT_VERSION = 1;
++export const MYCHAMA_REGION = "africa-south1";
++
++export const MYCHAMA_CALLABLES = {
++  sync: "mychamaSync",
++  requestCode: "mychamaLinkRequestCode",
++  verifyCode: "mychamaLinkVerifyCode",
++  payInitiate: "mychamaPayInitiate",
++} as const;
++/** HTTPS webhook (Paystack -> new MyChama account). Not a callable. */
++export const MYCHAMA_WEBHOOK_NAME = "mychamaPaystackCallback";
++
++/** Tunable defaults. Track A/B may READ these; changing them = contract change. */
++export const MYCHAMA_LIMITS = {
++  SYNC_COOLDOWN_SECONDS: 600,          // auto syncs (reload/login) inside this window return stored data
++  SYNC_MANUAL_COOLDOWN_SECONDS: 30,    // manual refresh floor
++  SNAPSHOT_STALE_AFTER_SECONDS: 21600, // 6h without a successful sync => status "stale"
++  SNAPSHOT_MAX_ITEMS_PER_LIST: 50,     // cap per contributions/loans list inside one chama
++  CODE_LENGTH: 6,
++  CODE_TTL_SECONDS: 600,
++  CODE_MAX_ATTEMPTS: 5,
++  CODE_RESEND_COOLDOWN_SECONDS: 60,
++  CODE_MAX_SENDS_PER_PHONE_PER_DAY: 5,
++  CODE_MAX_SENDS_PER_USER_PER_DAY: 10,
++} as const;
++
++// ───────────────────────────── enums ─────────────────────────────
++
++export type PortalRole = "landlord" | "tenant";
++export type ConnectorStatus = "ok" | "stale" | "unavailable" | "never_linked" | "needs_reverify";
++export type SyncReason = "login" | "reload" | "manual";
++export type LinkState = "active" | "needs_reverify" | "revoked";
++export type LinkVerifiedVia = "firebase_phone" | "sms_code";
++export type MyChamaPurpose = "contribution" | "loan_repayment" | "mgr_contribution";
++export type ChamaDataStatus = "ok" | "partial" | "unavailable";
++export type ChamaDataSection = "contributions" | "loans" | "mgr";
++
++export type MyChamaErrorCode =
++  | "unauthenticated"
++  | "not_linked"
++  | "link_needs_reverify"
++  | "throttled"
++  | "chama_unavailable"
++  | "online_collection_disabled"
++  | "invalid_amount"
++  | "invalid_target"
++  | "invalid_phone"
++  | "rate_limited"
++  | "code_invalid"
++  | "code_expired"
++  | "code_attempts_exceeded"
++  | "send_limit_reached"
++  | "upstream_failure"
++  | "not_implemented"
++  | "internal";
++/** Every thrown HttpsError carries details = { code: MyChamaErrorCode }. */
++export interface MyChamaErrorDetails { code: MyChamaErrorCode; retryAfterSeconds?: number }
++
++// ───────────────────────── plot-project paths ─────────────────────────
++// (plot project = this repo's default Firestore). Clients may READ
++// chamaSnapshots/{uid} and chamaLinks/{uid}/links/*; everything is
++// WRITTEN ONLY by Cloud Functions. See docs/mychama/firestore.rules.fragment.
++
++export const MYCHAMA_PATHS = {
++  snapshot: (uid: string) => `chamaSnapshots/${uid}`,
++  links: (uid: string) => `chamaLinks/${uid}/links`,
++  link: (uid: string, linkId: string) => `chamaLinks/${uid}/links/${linkId}`,
++  challenge: (challengeId: string) => `chamaLinkChallenges/${challengeId}`,   // server-only
++  syncState: (uid: string) => `chamaSyncState/${uid}`,                        // server-only
++} as const;
++
++/** linkId = `${chamaId}__${memberId}` */
++export const makeLinkId = (chamaId: string, memberId: string) => `${chamaId}__${memberId}`;
++
++// ───────────────────────────── documents ─────────────────────────────
++
++/** chamaLinks/{uid}/links/{linkId}. Never contains an ID number or a full phone. */
++export interface ChamaLinkDoc {
++  linkId: string;
++  uid: string;
++  chamaId: string;
++  memberId: string;
++  chamaName: string;
++  state: LinkState;
++  verifiedVia: LinkVerifiedVia;
++  /** HMAC key of the phone this link was verified against (see config.phoneKey). If the
++   *  member's phone in mychama1 stops matching, Track A sets state="needs_reverify". */
++  boundPhoneKey: string;
++  boundPhoneMasked: string;            // e.g. "07•• ••• 123"
++  linkedAt: number;                    // epoch ms
++  updatedAt: number;
++}
++
++export interface ContributionItem {
++  contributionId: string;
++  periodKey: string;                   // YYYY-MM
++  dueDate: string | null;              // YYYY-MM-DD
++  amount: number;
++  paid: number;
++  outstanding: number;
++  status: string;
++}
++export interface ContributionsSnap {
++  items: ContributionItem[];           // unpaid/partial only, capped (SNAPSHOT_MAX_ITEMS_PER_LIST)
++  outstanding: number;
++}
++
++export interface LoanItem {
++  loanId: string;
++  principal: number;
++  outstanding: number;
++  status: string;
++  installmentsRemaining: number;
++  nextInstallment: { installmentNo: number; due: number; dueDate: string | null } | null;
++}
++export interface LoansSnap { items: LoanItem[]; outstanding: number }
++
++export interface MgrWin {
++  kind: "won" | "scheduled";
++  potId: string;
++  potName: string;
++  round: number;
++  amount: number | null;               // null when the payout amount can't be known yet
++  expectedDate: string | null;         // YYYY-MM-DD; null when unknown
++  queuePosition: number | null;        // 1-based, scheduled wins only
++}
++export interface MgrPotSnap {
++  potId: string;
++  name: string;
++  amountPerPeriod: number;
++  frequency: string;
++  status: string;
++  period: number;
++  currentPeriodPaid: boolean;
++  dueNow: number;                      // 0 when currentPeriodPaid
++  nextDueDate: string | null;
++  arrearsOpen: number;
++  arrearId: string | null;
++  wins: MgrWin[];
++}
++export interface MgrSnap { pots: MgrPotSnap[]; dueNow: number; arrearsOpen: number }
++
++export interface ChamaTotals {
++  /** unpaid amounts whose dueDate is before today (EAT) — contributions + loan installments + MGR arrears/period due */
++  overdue: number;
++  /** unpaid amounts with dueDate inside the current EAT calendar month and NOT overdue */
++  dueThisMonth: number;
++  /** sum of MGR win amounts with expectedDate in the current EAT month (known amounts only) */
++  expectedInflowThisMonth: number;
++}
++
++export interface ChamaSnapshotChama {
++  chamaId: string;
++  chamaName: string;
++  memberId: string;
++  onlineCollectionEnabled: boolean;    // plan allows it AND settlementSplitCode present
++  dataStatus: ChamaDataStatus;
++  missing: ChamaDataSection[];         // sections that could not be read this sync
++  contributions: ContributionsSnap | null;   // null = unavailable (NOT zero)
++  loans: LoansSnap | null;
++  mgr: MgrSnap | null;
++  totals: ChamaTotals | null;          // null if every section is unavailable
++  asOf: number;                        // epoch ms of the sync that produced this entry
++}
++
++/** A phone registered in mychama1 for the caller's ID that is NOT yet proven. */
++export interface PendingVerification {
++  pendingId: string;                   // opaque; pass to mychamaLinkRequestCode
++  maskedPhone: string;
++  chamaCount: number;
++}
++
++/** chamaSnapshots/{uid} — the ONE doc the UI listens to. */
++export interface ChamaSnapshotDoc {
++  version: typeof MYCHAMA_CONTRACT_VERSION;
++  uid: string;
++  status: ConnectorStatus;
++  lastSyncedAt: number | null;         // last SUCCESSFUL sync
++  lastAttemptAt: number | null;
++  lastError: { code: MyChamaErrorCode; at: number } | null;
++  chamas: ChamaSnapshotChama[];
++  pending: PendingVerification[];
++}
++
++// ───────────────────────────── callables ─────────────────────────────
++
++export interface SyncRequest { reason: SyncReason; force?: boolean }
++export interface SyncResponse {
++  status: ConnectorStatus;
++  throttled: boolean;
++  lastSyncedAt: number | null;
++  nextAllowedAt: number | null;
++}
++
++export interface RequestCodeRequest { pendingId: string }
++export interface RequestCodeResponse {
++  challengeId: string;
++  maskedPhone: string;
++  expiresAt: number;
++  resendAfter: number;
++}
++
++export interface VerifyCodeRequest { challengeId: string; code: string }
++export interface VerifyCodeResponse { linkedChamas: number; remainingAttempts?: number }
++
++export interface PayInitiateRequest {
++  chamaId: string;
++  purpose: MyChamaPurpose;
++  amount: number;                      // NET KES that must reach the chama (fees are grossed up server-side)
++  contributionId?: string;
++  loanId?: string;
++  installmentNo?: number;
++  potId?: string;
++  potPeriod?: number;
++  arrearId?: string;
++  phone?: string;                      // M-Pesa/Airtel number to charge; defaults to the member's phone on file
++  clientRequestId: string;             // idempotency key
++}
++export interface PayInitiateResponse {
++  reference: string;                   // MCA-{chamaId}-{CNT|LNR|MGR}-{epochMs}-{rand6}
++  grossAmount: number;
++  paystackFee: number;
++  ourFee: number;
++  message: string | null;              // Paystack display_text for the STK prompt
++}
+diff --git a/functions/src/mychama/errors.ts b/functions/src/mychama/errors.ts
+new file mode 100644
+index 0000000..55eec7e
+--- /dev/null
++++ b/functions/src/mychama/errors.ts
+@@ -0,0 +1,16 @@
++import { HttpsError, FunctionsErrorCode } from "firebase-functions/v2/https";
++import type { MyChamaErrorCode, MyChamaErrorDetails } from "./contract";
++
++/** All MyChama callables throw through this so clients can switch on details.code. */
++export function myChamaError(
++  code: MyChamaErrorCode,
++  message: string,
++  http: FunctionsErrorCode = "failed-precondition",
++  retryAfterSeconds?: number
++): HttpsError {
++  const details: MyChamaErrorDetails = { code, ...(retryAfterSeconds ? { retryAfterSeconds } : {}) };
++  return new HttpsError(http, message, details);
++}
++
++export const notImplemented = (what: string): HttpsError =>
++  myChamaError("not_implemented", `${what} is not implemented yet.`, "unimplemented");
+diff --git a/functions/src/mychama/index.ts b/functions/src/mychama/index.ts
+new file mode 100644
+index 0000000..1441393
+--- /dev/null
++++ b/functions/src/mychama/index.ts
+@@ -0,0 +1,6 @@
++// MyChama connector entry — re-exports every deployable function. Wired once from
++// ../index.ts (`export * from "./mychama"`). Do NOT export non-function symbols here.
++export * from "./link";
++export * from "./sync";
++export * from "./pay";
++export * from "./webhook";
+diff --git a/functions/src/mychama/link/index.ts b/functions/src/mychama/link/index.ts
+new file mode 100644
+index 0000000..172c633
+--- /dev/null
++++ b/functions/src/mychama/link/index.ts
+@@ -0,0 +1,20 @@
++// TRACK A — owns this directory. Stubs from P0; replace the bodies, keep names + I/O types.
++import { onCall } from "firebase-functions/v2/https";
++import { REGION, MYCHAMA_ID_PEPPER } from "../config";
++import { MYCHAMA_HP_SECRETS } from "../sms";
++import { notImplemented } from "../errors";
++import type { RequestCodeRequest, RequestCodeResponse, VerifyCodeRequest, VerifyCodeResponse } from "../contract";
++
++export const mychamaLinkRequestCode = onCall(
++  { region: REGION, cors: true, maxInstances: 10, secrets: [MYCHAMA_ID_PEPPER, ...MYCHAMA_HP_SECRETS] },
++  async (_req: { data: RequestCodeRequest }): Promise<RequestCodeResponse> => {
++    throw notImplemented("mychamaLinkRequestCode");
++  }
++);
++
++export const mychamaLinkVerifyCode = onCall(
++  { region: REGION, cors: true, maxInstances: 10, secrets: [MYCHAMA_ID_PEPPER] },
++  async (_req: { data: VerifyCodeRequest }): Promise<VerifyCodeResponse> => {
++    throw notImplemented("mychamaLinkVerifyCode");
++  }
++);
+diff --git a/functions/src/mychama/paths.ts b/functions/src/mychama/paths.ts
+new file mode 100644
+index 0000000..11cc283
+--- /dev/null
++++ b/functions/src/mychama/paths.ts
+@@ -0,0 +1,15 @@
++// mychama1 Firestore paths (READ-mostly from PAY). Mirrors Chama repo
++// functions/shared/firestore_paths.py. Do not invent new collections in mychama1.
++export const chama = (c: string) => `chamas/${c}`;
++export const members = (c: string) => `chamas/${c}/members`;
++export const member = (c: string, m: string) => `chamas/${c}/members/${m}`;
++export const contributions = (c: string) => `chamas/${c}/contributions`;
++export const loans = (c: string) => `chamas/${c}/loans`;
++export const mgrPots = (c: string) => `chamas/${c}/mgrPots`;
++export const mgrPot = (c: string, p: string) => `chamas/${c}/mgrPots/${p}`;
++export const mgrRecords = (c: string, p: string) => `chamas/${c}/mgrPots/${p}/records`;
++export const mgrPayouts = (c: string, p: string) => `chamas/${c}/mgrPots/${p}/payouts`;
++export const mgrArrears = (c: string, p: string) => `chamas/${c}/mgrPots/${p}/arrears`;
++export const paymentIntents = (c: string) => `chamas/${c}/paymentIntents`;
++export const paymentIntent = (c: string, ref: string) => `chamas/${c}/paymentIntents/${ref}`;
++export const transactions = (c: string) => `chamas/${c}/transactions`;
+diff --git a/functions/src/mychama/pay/index.ts b/functions/src/mychama/pay/index.ts
+new file mode 100644
+index 0000000..d200dd3
+--- /dev/null
++++ b/functions/src/mychama/pay/index.ts
+@@ -0,0 +1,12 @@
++// TRACK B — owns this directory. Stub from P0; replace the body, keep name + I/O types.
++import { onCall } from "firebase-functions/v2/https";
++import { REGION, MYCHAMA_PAYSTACK_SECRET_KEY } from "../config";
++import { notImplemented } from "../errors";
++import type { PayInitiateRequest, PayInitiateResponse } from "../contract";
++
++export const mychamaPayInitiate = onCall(
++  { region: REGION, cors: true, maxInstances: 10, secrets: [MYCHAMA_PAYSTACK_SECRET_KEY] },
++  async (_req: { data: PayInitiateRequest }): Promise<PayInitiateResponse> => {
++    throw notImplemented("mychamaPayInitiate");
++  }
++);
+diff --git a/functions/src/mychama/sms.ts b/functions/src/mychama/sms.ts
+new file mode 100644
+index 0000000..a9f1424
+--- /dev/null
++++ b/functions/src/mychama/sms.ts
+@@ -0,0 +1,41 @@
++// MyChama's HostPinnacle SMS sender. OWNED BY P0 (shared by Track A's linking
++// codes and Track B's payment-confirmation SMS) — moved verbatim from
++// index.ts; behaviour is unchanged.
++//
++// ANY Cloud Function that calls sendMyChamaSms() MUST list
++// ...MYCHAMA_HP_SECRETS in its `secrets: [...]`, otherwise .value() is empty
++// at runtime and the SMS silently fails (the legacy paystackCallback does not
++// bind them today — see docs/mychama/CONNECTOR_CONTRACT.md §9).
++import { defineSecret } from "firebase-functions/params";
++import axios from "axios";
++
++// MyChama's own HostPinnacle credentials — separate from PAY's shared
++// SMS_CONFIG so MyChama's sender ID/branding never gets mixed with another
++// product's. Set with:
++//   firebase functions:secrets:set MYCHAMA_HP_SMS_USERID (and _PASSWORD/_APIKEY/_SENDERID)
++const MYCHAMA_HP_USERID = defineSecret("MYCHAMA_HP_SMS_USERID");
++const MYCHAMA_HP_PASSWORD = defineSecret("MYCHAMA_HP_SMS_PASSWORD");
++const MYCHAMA_HP_APIKEY = defineSecret("MYCHAMA_HP_SMS_APIKEY");
++const MYCHAMA_HP_SENDERID = defineSecret("MYCHAMA_HP_SMS_SENDERID");
++
++export async function sendMyChamaSms(phoneE164: string, message: string): Promise<void> {
++  await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", {
++    userid: MYCHAMA_HP_USERID.value(),
++    password: MYCHAMA_HP_PASSWORD.value(),
++    apikey: MYCHAMA_HP_APIKEY.value(),
++    senderid: MYCHAMA_HP_SENDERID.value(),
++    mobile: phoneE164.replace(/^\+/, ""),
++    msg: message.slice(0, 400),
++    sendMethod: "quick",
++    msgType: "text",
++    output: "json",
++    duplicatecheck: "true",
++  });
++}
++
++export const MYCHAMA_HP_SECRETS = [
++  MYCHAMA_HP_USERID,
++  MYCHAMA_HP_PASSWORD,
++  MYCHAMA_HP_APIKEY,
++  MYCHAMA_HP_SENDERID,
++];
+diff --git a/functions/src/mychama/sync/index.ts b/functions/src/mychama/sync/index.ts
+new file mode 100644
+index 0000000..deb3d0c
+--- /dev/null
++++ b/functions/src/mychama/sync/index.ts
+@@ -0,0 +1,12 @@
++// TRACK A — owns this directory. Stub from P0; replace the body, keep name + I/O types.
++import { onCall } from "firebase-functions/v2/https";
++import { REGION, MYCHAMA_ID_PEPPER } from "../config";
++import { notImplemented } from "../errors";
++import type { SyncRequest, SyncResponse } from "../contract";
++
++export const mychamaSync = onCall(
++  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 120, secrets: [MYCHAMA_ID_PEPPER] },
++  async (_req: { data: SyncRequest }): Promise<SyncResponse> => {
++    throw notImplemented("mychamaSync");
++  }
++);
+diff --git a/functions/src/mychama/webhook/handlers.ts b/functions/src/mychama/webhook/handlers.ts
+new file mode 100644
+index 0000000..20df821
+--- /dev/null
++++ b/functions/src/mychama/webhook/handlers.ts
+@@ -0,0 +1,294 @@
++// MyChama payment-application handlers (MCW-/MCA-/MCS-/MCP-/MCX-/MCR-).
++// Moved VERBATIM out of index.ts by P0 so the legacy webhook (index.ts) and
++// the new MyChama-only webhook (./index.ts, Track B) share ONE implementation.
++// OWNED BY TRACK B after P0 (hardening allowed; keep exported signatures).
++import * as admin from "firebase-admin";
++import { mychamaDb } from "../config";
++import { sendMyChamaSms } from "../sms";
++
++// ============================================================================
++// MYCHAMA — payment application, SMS top-up, plan billing
++//
++// This is the ONLY place any of these three things happen. mychama1's own
++// Python functions (functions/mychama/{contributions,loans,mgr}.py) and
++// CYBER's WhatsApp bot both only ever CREATE a paymentIntents doc and
++// trigger a Paystack charge — neither one ever marks money as received.
++// The spill-forward math below is a deliberate line-for-line port of
++// functions/shared/money.py's counterparts in the Chama repo; if either
++// side's formula changes, change both in the same commit (see that repo's
++// docs/CONVENTIONS.md).
++// ============================================================================
++
++async function applyMyChamaContributionPayment(
++  db: admin.firestore.Firestore,
++  chamaId: string,
++  memberId: string,
++  startContributionId: string,
++  amount: number
++): Promise<void> {
++  const contribRef = db.collection(`chamas/${chamaId}/contributions`);
++  const snap = await contribRef.where("memberId", "==", memberId).get();
++  const all = snap.docs.sort((a, b) => (a.data().periodKey || "").localeCompare(b.data().periodKey || ""));
++  const startIdx = Math.max(0, all.findIndex((d) => d.id === startContributionId));
++
++  let remaining = amount;
++  let appliedTotal = 0;
++  const batch = db.batch();
++  const now = Date.now();
++
++  for (const doc of all.slice(startIdx)) {
++    if (remaining <= 0.009) break;
++    const data = doc.data();
++    const due = (data.amount || 0) - (data.paidAmount || 0);
++    if (due <= 0.009) continue;
++    const applied = Math.min(due, remaining);
++    const newPaid = (data.paidAmount || 0) + applied;
++    remaining -= applied;
++    appliedTotal += applied;
++    const newStatus = newPaid >= data.amount - 0.01 ? "paid" : "partial";
++    const update: Record<string, unknown> = { paidAmount: newPaid, status: newStatus, updatedAt: now };
++    if (newStatus === "paid" && !data.paidOn) update.paidOn = new Date().toISOString().slice(0, 10);
++    batch.update(doc.ref, update);
++  }
++
++  const memberRef = db.doc(`chamas/${chamaId}/members/${memberId}`);
++  const memberSnap = await memberRef.get();
++  const member = memberSnap.data() || {};
++  const creditDelta = remaining > 0.009 ? Math.round(remaining * 100) / 100 : 0;
++
++  batch.update(memberRef, {
++    creditBalance: (member.creditBalance || 0) + creditDelta,
++    totalContributed: (member.totalContributed || 0) + appliedTotal,
++    updatedAt: now,
++  });
++  await batch.commit();
++}
++
++async function applyMyChamaLoanRepayment(
++  db: admin.firestore.Firestore,
++  chamaId: string,
++  loanId: string,
++  amount: number
++): Promise<void> {
++  const loanRef = db.doc(`chamas/${chamaId}/loans/${loanId}`);
++  const loanSnap = await loanRef.get();
++  if (!loanSnap.exists) return;
++  const loan = loanSnap.data()!;
++  if (!["active", "overdue"].includes(loan.status)) return;
++
++  const schedule = [...loan.schedule];
++  let remaining = amount;
++  for (const inst of schedule) {
++    if (remaining <= 0.009) break;
++    const due = inst.due - (inst.paidAmount || 0);
++    if (due <= 0.009) continue;
++    const applied = Math.min(due, remaining);
++    inst.paidAmount = (inst.paidAmount || 0) + applied;
++    remaining -= applied;
++    inst.paid = inst.paidAmount >= inst.due - 0.01;
++  }
++
++  const newStatus = schedule.every((s) => s.paid) ? "completed" : "active";
++  const now = Date.now();
++  const batch = db.batch();
++  batch.update(loanRef, { schedule, status: newStatus, updatedAt: now });
++
++  if (remaining > 0.009) {
++    const memberRef = db.doc(`chamas/${chamaId}/members/${loan.memberId}`);
++    const memberSnap = await memberRef.get();
++    const member = memberSnap.data() || {};
++    const creditDelta = Math.round(remaining * 100) / 100;
++    batch.update(memberRef, { creditBalance: (member.creditBalance || 0) + creditDelta, updatedAt: now });
++  }
++  await batch.commit();
++}
++
++async function applyMyChamaMgrContribution(
++  db: admin.firestore.Firestore,
++  chamaId: string,
++  potId: string,
++  memberId: string,
++  amount: number,
++  ref: string
++): Promise<void> {
++  const potRef = db.doc(`chamas/${chamaId}/mgrPots/${potId}`);
++  const potSnap = await potRef.get();
++  if (!potSnap.exists) return;
++  const pot = potSnap.data()!;
++  if (pot.status !== "active") return;
++
++  const now = Date.now();
++  const today = new Date().toISOString().slice(0, 10);
++  const existing = await db
++    .collection(`chamas/${chamaId}/mgrPots/${potId}/records`)
++    .where("memberId", "==", memberId)
++    .where("period", "==", pot.period)
++    .limit(1)
++    .get();
++
++  if (!existing.empty) {
++    await existing.docs[0].ref.update({ status: "paid", amount, date: today, method: "paystack", ref, updatedAt: now });
++  } else {
++    await db.collection(`chamas/${chamaId}/mgrPots/${potId}/records`).add({
++      period: pot.period, memberId, status: "paid", amount, date: today, method: "paystack", ref, createdAt: now, updatedAt: now,
++    });
++  }
++}
++
++/**
++ * Applies an MCW-/MCA- payment once Paystack confirms it. `reference` is
++ * both the Paystack reference and the mychama1 paymentIntents document ID
++ * — that doubles as the idempotency check: if the intent is already
++ * `success`, this is a replayed webhook event and we do nothing further.
++ */
++export async function handleMyChamaPayment(reference: string, chamaIdHint?: string): Promise<void> {
++  const db2 = mychamaDb();
++
++  // reference format: MCW-{chamaId}-{purposeCode}-{ts}-{rand} — chamaId is
++  // also usually available in the webhook payload's metadata, used as a
++  // cross-check / fallback if the reference format ever changes.
++  const parts = reference.split("-");
++  const chamaId = chamaIdHint || parts[1];
++  if (!chamaId) {
++    console.error("MyChama payment: could not determine chamaId from reference", reference);
++    return;
++  }
++
++  const intentRef = db2.doc(`chamas/${chamaId}/paymentIntents/${reference}`);
++  const intentSnap = await intentRef.get();
++  if (!intentSnap.exists) {
++    console.error("MyChama payment: no matching paymentIntent for reference", reference);
++    return;
++  }
++  const intent = intentSnap.data()!;
++  if (intent.status === "success") return; // already applied — replayed webhook event
++
++  if (intent.purpose === "contribution" && intent.contributionId) {
++    await applyMyChamaContributionPayment(db2, chamaId, intent.memberId, intent.contributionId, intent.amount);
++  } else if (intent.purpose === "loan_repayment" && intent.loanId) {
++    await applyMyChamaLoanRepayment(db2, chamaId, intent.loanId, intent.amount);
++  } else if (intent.purpose === "mgr_contribution" && intent.potId) {
++    await applyMyChamaMgrContribution(db2, chamaId, intent.potId, intent.memberId, intent.amount, reference);
++  }
++
++  const now = Date.now();
++  await db2.collection(`chamas/${chamaId}/transactions`).add({
++    type: intent.purpose,
++    memberId: intent.memberId,
++    amount: intent.amount,
++    grossAmount: intent.grossAmount,
++    paystackFee: intent.paystackFee,
++    ourFee: intent.ourFee,
++    method: "paystack",
++    ref: reference,
++    date: new Date().toISOString().slice(0, 10),
++    settled: false,
++    direction: "in",
++    channel: intent.channel || "app",
++    intentId: reference,
++    createdAt: now,
++  });
++
++  await intentRef.update({ status: "success", updatedAt: now });
++
++  // Best-effort confirmation SMS via MyChama's own HostPinnacle sender —
++  // failure here must never fail the webhook (Paystack will retry the
++  // whole event if this handler throws, and the payment is already
++  // applied above).
++  try {
++    const memberSnap = await db2.doc(`chamas/${chamaId}/members/${intent.memberId}`).get();
++    const phone = memberSnap.data()?.phoneNormalized;
++    if (phone) {
++      await sendMyChamaSms(phone, `MyChama: payment of KES ${Math.round(intent.amount)} received. Thank you.`);
++    }
++  } catch (e) {
++    console.error("MyChama payment confirmation SMS failed (non-fatal):", e);
++  }
++}
++
++export async function handleMyChamaSmsTopup(reference: string, chamaIdHint?: string): Promise<void> {
++  const db2 = mychamaDb();
++  const chamaId = chamaIdHint || reference.split("-")[1];
++  if (!chamaId) return;
++
++  const topupRef = db2.doc(`chamas/${chamaId}/smsTopUps/${reference}`);
++  const topupSnap = await topupRef.get();
++  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
++  const topup = topupSnap.data()!;
++
++  const chamaRef = db2.doc(`chamas/${chamaId}`);
++  const chamaSnap = await chamaRef.get();
++  const chama = chamaSnap.data() || {};
++  await chamaRef.update({ smsCredits: (chama.smsCredits || 0) + topup.amountKes, updatedAt: Date.now() });
++  await topupRef.update({ status: "success", updatedAt: Date.now() });
++}
++
++export async function handleMyChamaPlanBilling(reference: string, chamaIdHint?: string, plan?: string): Promise<void> {
++  const db2 = mychamaDb();
++  const chamaId = chamaIdHint || reference.split("-")[1];
++  if (!chamaId || !plan) return;
++
++  const billingRef = db2.doc(`chamas/${chamaId}/planBilling/${reference}`);
++  const billingSnap = await billingRef.get();
++  if (billingSnap.exists && billingSnap.data()?.status === "success") return;
++
++  const now = Date.now();
++  const expiry = new Date();
++  expiry.setDate(expiry.getDate() + 30);
++  await db2.doc(`chamas/${chamaId}`).update({ plan, planExpiry: expiry.toISOString().slice(0, 10), updatedAt: now });
++  await billingRef.set({ status: "success", plan, updatedAt: now }, { merge: true });
++}
++
++/**
++ * Reports-engine prepaid wallet top-up (MCX-). Unlike smsCredits, this
++ * wallet is CREDIT-denominated, not KES-denominated — mychama1's own
++ * functions/shared/reports_engine.py spends it in credits, so this must
++ * increment `reportCreditsBalance` by `topup.credits`, never by
++ * `topup.amountKes`. See that repo's functions/mychama/reports.py::
++ * purchaseReportCredits, which is what creates this pending doc.
++ */
++export async function handleMyChamaReportCreditTopup(reference: string, chamaIdHint?: string): Promise<void> {
++  const db2 = mychamaDb();
++  const chamaId = chamaIdHint || reference.split("-")[1];
++  if (!chamaId) return;
++
++  const topupRef = db2.doc(`chamas/${chamaId}/reportCreditTopUps/${reference}`);
++  const topupSnap = await topupRef.get();
++  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
++  const topup = topupSnap.data()!;
++
++  const credits = Number(topup.credits);
++  if (!Number.isFinite(credits) || credits <= 0) {
++    console.error(`handleMyChamaReportCreditTopup: invalid credits value "${topup.credits}" for ${reference}`);
++    return;
++  }
++
++  const chamaRef = db2.doc(`chamas/${chamaId}`);
++  const chamaSnap = await chamaRef.get();
++  const chama = chamaSnap.data() || {};
++  await chamaRef.update({ reportCreditsBalance: (chama.reportCreditsBalance || 0) + credits, updatedAt: Date.now() });
++  await topupRef.update({ status: "success", updatedAt: Date.now() });
++}
++
++/**
++ * Starter/Basic one-off premium-report purchase (MCR-). Deliberately does
++ * NOT touch any balance on the chama doc — mychama1's own generateReport /
++ * generateStatement callables consume this purchase directly by its
++ * reference once its status flips to "success" (see that repo's
++ * functions/shared/reports_engine.py::consume_alacarte_purchase), so all
++ * this webhook needs to do is flip pending -> success, exactly like plan
++ * billing's status-only branch. The monthly à la carte CAP was already
++ * reserved when the purchase doc was created (mychama1's own
++ * purchasePremiumReportAlaCarte), not here.
++ */
++export async function handleMyChamaReportAlacarte(reference: string, chamaIdHint?: string): Promise<void> {
++  const db2 = mychamaDb();
++  const chamaId = chamaIdHint || reference.split("-")[1];
++  if (!chamaId) return;
++
++  const purchaseRef = db2.doc(`chamas/${chamaId}/reportAlacartePurchases/${reference}`);
++  const purchaseSnap = await purchaseRef.get();
++  if (!purchaseSnap.exists || purchaseSnap.data()?.status === "success") return;
++
++  await purchaseRef.update({ status: "success", updatedAt: Date.now() });
++}
+diff --git a/functions/src/mychama/webhook/index.ts b/functions/src/mychama/webhook/index.ts
+new file mode 100644
+index 0000000..c605b49
+--- /dev/null
++++ b/functions/src/mychama/webhook/index.ts
+@@ -0,0 +1,14 @@
++// TRACK B — owns this directory. Stub from P0: the real handler verifies the
++// x-paystack-signature HMAC with MYCHAMA_PAYSTACK_SECRET_KEY and applies MyChama
++// references only via ./handlers (shared with the legacy webhook in index.ts).
++import { onRequest } from "firebase-functions/v2/https";
++import { REGION, MYCHAMA_PAYSTACK_SECRET_KEY } from "../config";
++import { MYCHAMA_HP_SECRETS } from "../sms";
++
++export const mychamaPaystackCallback = onRequest(
++  { region: REGION, cors: false, maxInstances: 10, timeoutSeconds: 60, secrets: [MYCHAMA_PAYSTACK_SECRET_KEY, ...MYCHAMA_HP_SECRETS] },
++  async (_req, res) => {
++    // P0 stub: acknowledge nothing, apply nothing. Track B replaces this.
++    res.status(501).json({ error: "not_implemented" });
++  }
++);
+diff --git a/package.json b/package.json
+index d1f2661..954d55f 100644
+--- a/package.json
++++ b/package.json
+@@ -4,6 +4,7 @@
+   "version": "0.0.0",
+   "type": "module",
+   "scripts": {
++    "check:mychama-contract": "node tools/check-mychama-contract.mjs",
+     "dev": "vite",
+     "build": "tsc -b && vite build",
+     "lint": "eslint .",
+diff --git a/src/mychama/api.ts b/src/mychama/api.ts
+new file mode 100644
+index 0000000..985e434
+--- /dev/null
++++ b/src/mychama/api.ts
+@@ -0,0 +1,32 @@
++// Typed wrappers for the MyChama connector callables. OWNED BY P0 (frozen);
++// Track C consumes these — never call httpsCallable("mychama...") directly.
++import { httpsCallable } from "firebase/functions";
++import { functions } from "../Firebase";
++import {
++  MYCHAMA_CALLABLES,
++  MYCHAMA_PATHS,
++  type MyChamaErrorCode,
++  type SyncRequest, type SyncResponse,
++  type RequestCodeRequest, type RequestCodeResponse,
++  type VerifyCodeRequest, type VerifyCodeResponse,
++  type PayInitiateRequest, type PayInitiateResponse,
++} from "./contract";
++
++const callable = <Req, Res>(name: string) => async (req: Req): Promise<Res> =>
++  (await httpsCallable<Req, Res>(functions, name)(req)).data;
++
++export const mychamaApi = {
++  sync: callable<SyncRequest, SyncResponse>(MYCHAMA_CALLABLES.sync),
++  requestCode: callable<RequestCodeRequest, RequestCodeResponse>(MYCHAMA_CALLABLES.requestCode),
++  verifyCode: callable<VerifyCodeRequest, VerifyCodeResponse>(MYCHAMA_CALLABLES.verifyCode),
++  payInitiate: callable<PayInitiateRequest, PayInitiateResponse>(MYCHAMA_CALLABLES.payInitiate),
++};
++
++/** Firestore doc the UI listens to (read-only for clients). */
++export const mychamaSnapshotPath = (uid: string): string => MYCHAMA_PATHS.snapshot(uid);
++
++/** Extract the contract error code from a callable failure, or null. */
++export function mychamaErrorCode(err: unknown): MyChamaErrorCode | null {
++  const code = (err as { details?: { code?: unknown } } | null)?.details?.code;
++  return typeof code === "string" ? (code as MyChamaErrorCode) : null;
++}
+diff --git a/src/mychama/contract.ts b/src/mychama/contract.ts
+new file mode 100644
+index 0000000..74c076e
+--- /dev/null
++++ b/src/mychama/contract.ts
+@@ -0,0 +1,237 @@
++/**
++ * MyChama <-> PAY connector CONTRACT (v1).
++ *
++ * Pure types + constants + path builders. NO imports, so the byte-identical
++ * copy at  src/mychama/contract.ts  (frontend) compiles unchanged.
++ * `npm run check:mychama-contract` (repo root) fails if the two copies drift.
++ *
++ * FROZEN after P0. Tracks A/B/C must NOT edit this file; request changes via
++ * the integrator (see docs/mychama/CONNECTOR_CONTRACT.md §10).
++ * All money = KES, major units (numbers, 2dp), never strings.
++ */
++
++export const MYCHAMA_CONTRACT_VERSION = 1;
++export const MYCHAMA_REGION = "africa-south1";
++
++export const MYCHAMA_CALLABLES = {
++  sync: "mychamaSync",
++  requestCode: "mychamaLinkRequestCode",
++  verifyCode: "mychamaLinkVerifyCode",
++  payInitiate: "mychamaPayInitiate",
++} as const;
++/** HTTPS webhook (Paystack -> new MyChama account). Not a callable. */
++export const MYCHAMA_WEBHOOK_NAME = "mychamaPaystackCallback";
++
++/** Tunable defaults. Track A/B may READ these; changing them = contract change. */
++export const MYCHAMA_LIMITS = {
++  SYNC_COOLDOWN_SECONDS: 600,          // auto syncs (reload/login) inside this window return stored data
++  SYNC_MANUAL_COOLDOWN_SECONDS: 30,    // manual refresh floor
++  SNAPSHOT_STALE_AFTER_SECONDS: 21600, // 6h without a successful sync => status "stale"
++  SNAPSHOT_MAX_ITEMS_PER_LIST: 50,     // cap per contributions/loans list inside one chama
++  CODE_LENGTH: 6,
++  CODE_TTL_SECONDS: 600,
++  CODE_MAX_ATTEMPTS: 5,
++  CODE_RESEND_COOLDOWN_SECONDS: 60,
++  CODE_MAX_SENDS_PER_PHONE_PER_DAY: 5,
++  CODE_MAX_SENDS_PER_USER_PER_DAY: 10,
++} as const;
++
++// ───────────────────────────── enums ─────────────────────────────
++
++export type PortalRole = "landlord" | "tenant";
++export type ConnectorStatus = "ok" | "stale" | "unavailable" | "never_linked" | "needs_reverify";
++export type SyncReason = "login" | "reload" | "manual";
++export type LinkState = "active" | "needs_reverify" | "revoked";
++export type LinkVerifiedVia = "firebase_phone" | "sms_code";
++export type MyChamaPurpose = "contribution" | "loan_repayment" | "mgr_contribution";
++export type ChamaDataStatus = "ok" | "partial" | "unavailable";
++export type ChamaDataSection = "contributions" | "loans" | "mgr";
++
++export type MyChamaErrorCode =
++  | "unauthenticated"
++  | "not_linked"
++  | "link_needs_reverify"
++  | "throttled"
++  | "chama_unavailable"
++  | "online_collection_disabled"
++  | "invalid_amount"
++  | "invalid_target"
++  | "invalid_phone"
++  | "rate_limited"
++  | "code_invalid"
++  | "code_expired"
++  | "code_attempts_exceeded"
++  | "send_limit_reached"
++  | "upstream_failure"
++  | "not_implemented"
++  | "internal";
++/** Every thrown HttpsError carries details = { code: MyChamaErrorCode }. */
++export interface MyChamaErrorDetails { code: MyChamaErrorCode; retryAfterSeconds?: number }
++
++// ───────────────────────── plot-project paths ─────────────────────────
++// (plot project = this repo's default Firestore). Clients may READ
++// chamaSnapshots/{uid} and chamaLinks/{uid}/links/*; everything is
++// WRITTEN ONLY by Cloud Functions. See docs/mychama/firestore.rules.fragment.
++
++export const MYCHAMA_PATHS = {
++  snapshot: (uid: string) => `chamaSnapshots/${uid}`,
++  links: (uid: string) => `chamaLinks/${uid}/links`,
++  link: (uid: string, linkId: string) => `chamaLinks/${uid}/links/${linkId}`,
++  challenge: (challengeId: string) => `chamaLinkChallenges/${challengeId}`,   // server-only
++  syncState: (uid: string) => `chamaSyncState/${uid}`,                        // server-only
++} as const;
++
++/** linkId = `${chamaId}__${memberId}` */
++export const makeLinkId = (chamaId: string, memberId: string) => `${chamaId}__${memberId}`;
++
++// ───────────────────────────── documents ─────────────────────────────
++
++/** chamaLinks/{uid}/links/{linkId}. Never contains an ID number or a full phone. */
++export interface ChamaLinkDoc {
++  linkId: string;
++  uid: string;
++  chamaId: string;
++  memberId: string;
++  chamaName: string;
++  state: LinkState;
++  verifiedVia: LinkVerifiedVia;
++  /** HMAC key of the phone this link was verified against (see config.phoneKey). If the
++   *  member's phone in mychama1 stops matching, Track A sets state="needs_reverify". */
++  boundPhoneKey: string;
++  boundPhoneMasked: string;            // e.g. "07•• ••• 123"
++  linkedAt: number;                    // epoch ms
++  updatedAt: number;
++}
++
++export interface ContributionItem {
++  contributionId: string;
++  periodKey: string;                   // YYYY-MM
++  dueDate: string | null;              // YYYY-MM-DD
++  amount: number;
++  paid: number;
++  outstanding: number;
++  status: string;
++}
++export interface ContributionsSnap {
++  items: ContributionItem[];           // unpaid/partial only, capped (SNAPSHOT_MAX_ITEMS_PER_LIST)
++  outstanding: number;
++}
++
++export interface LoanItem {
++  loanId: string;
++  principal: number;
++  outstanding: number;
++  status: string;
++  installmentsRemaining: number;
++  nextInstallment: { installmentNo: number; due: number; dueDate: string | null } | null;
++}
++export interface LoansSnap { items: LoanItem[]; outstanding: number }
++
++export interface MgrWin {
++  kind: "won" | "scheduled";
++  potId: string;
++  potName: string;
++  round: number;
++  amount: number | null;               // null when the payout amount can't be known yet
++  expectedDate: string | null;         // YYYY-MM-DD; null when unknown
++  queuePosition: number | null;        // 1-based, scheduled wins only
++}
++export interface MgrPotSnap {
++  potId: string;
++  name: string;
++  amountPerPeriod: number;
++  frequency: string;
++  status: string;
++  period: number;
++  currentPeriodPaid: boolean;
++  dueNow: number;                      // 0 when currentPeriodPaid
++  nextDueDate: string | null;
++  arrearsOpen: number;
++  arrearId: string | null;
++  wins: MgrWin[];
++}
++export interface MgrSnap { pots: MgrPotSnap[]; dueNow: number; arrearsOpen: number }
++
++export interface ChamaTotals {
++  /** unpaid amounts whose dueDate is before today (EAT) — contributions + loan installments + MGR arrears/period due */
++  overdue: number;
++  /** unpaid amounts with dueDate inside the current EAT calendar month and NOT overdue */
++  dueThisMonth: number;
++  /** sum of MGR win amounts with expectedDate in the current EAT month (known amounts only) */
++  expectedInflowThisMonth: number;
++}
++
++export interface ChamaSnapshotChama {
++  chamaId: string;
++  chamaName: string;
++  memberId: string;
++  onlineCollectionEnabled: boolean;    // plan allows it AND settlementSplitCode present
++  dataStatus: ChamaDataStatus;
++  missing: ChamaDataSection[];         // sections that could not be read this sync
++  contributions: ContributionsSnap | null;   // null = unavailable (NOT zero)
++  loans: LoansSnap | null;
++  mgr: MgrSnap | null;
++  totals: ChamaTotals | null;          // null if every section is unavailable
++  asOf: number;                        // epoch ms of the sync that produced this entry
++}
++
++/** A phone registered in mychama1 for the caller's ID that is NOT yet proven. */
++export interface PendingVerification {
++  pendingId: string;                   // opaque; pass to mychamaLinkRequestCode
++  maskedPhone: string;
++  chamaCount: number;
++}
++
++/** chamaSnapshots/{uid} — the ONE doc the UI listens to. */
++export interface ChamaSnapshotDoc {
++  version: typeof MYCHAMA_CONTRACT_VERSION;
++  uid: string;
++  status: ConnectorStatus;
++  lastSyncedAt: number | null;         // last SUCCESSFUL sync
++  lastAttemptAt: number | null;
++  lastError: { code: MyChamaErrorCode; at: number } | null;
++  chamas: ChamaSnapshotChama[];
++  pending: PendingVerification[];
++}
++
++// ───────────────────────────── callables ─────────────────────────────
++
++export interface SyncRequest { reason: SyncReason; force?: boolean }
++export interface SyncResponse {
++  status: ConnectorStatus;
++  throttled: boolean;
++  lastSyncedAt: number | null;
++  nextAllowedAt: number | null;
++}
++
++export interface RequestCodeRequest { pendingId: string }
++export interface RequestCodeResponse {
++  challengeId: string;
++  maskedPhone: string;
++  expiresAt: number;
++  resendAfter: number;
++}
++
++export interface VerifyCodeRequest { challengeId: string; code: string }
++export interface VerifyCodeResponse { linkedChamas: number; remainingAttempts?: number }
++
++export interface PayInitiateRequest {
++  chamaId: string;
++  purpose: MyChamaPurpose;
++  amount: number;                      // NET KES that must reach the chama (fees are grossed up server-side)
++  contributionId?: string;
++  loanId?: string;
++  installmentNo?: number;
++  potId?: string;
++  potPeriod?: number;
++  arrearId?: string;
++  phone?: string;                      // M-Pesa/Airtel number to charge; defaults to the member's phone on file
++  clientRequestId: string;             // idempotency key
++}
++export interface PayInitiateResponse {
++  reference: string;                   // MCA-{chamaId}-{CNT|LNR|MGR}-{epochMs}-{rand6}
++  grossAmount: number;
++  paystackFee: number;
++  ourFee: number;
++  message: string | null;              // Paystack display_text for the STK prompt
++}
+diff --git a/src/mychama/index.ts b/src/mychama/index.ts
+new file mode 100644
+index 0000000..3d2b0ff
+--- /dev/null
++++ b/src/mychama/index.ts
+@@ -0,0 +1,2 @@
++export * from "./contract";
++export * from "./api";
+diff --git a/tools/check-mychama-contract.mjs b/tools/check-mychama-contract.mjs
+new file mode 100644
+index 0000000..666f8b3
+--- /dev/null
++++ b/tools/check-mychama-contract.mjs
+@@ -0,0 +1,10 @@
++// Fails if the frontend copy of the MyChama contract drifted from the backend one.
++import { readFileSync } from "node:fs";
++const a = readFileSync("functions/src/mychama/contract.ts", "utf8");
++const b = readFileSync("src/mychama/contract.ts", "utf8");
++if (a !== b) {
++  console.error("MyChama contract drift: functions/src/mychama/contract.ts !== src/mychama/contract.ts");
++  console.error("Fix: cp functions/src/mychama/contract.ts src/mychama/contract.ts");
++  process.exit(1);
++}
++console.log("MyChama contract: backend and frontend copies are identical.");
