@@ -1,0 +1,12 @@
+// MERGE into the plot project's firestore.rules (that file is NOT in this repo).
+// Clients may only READ their own snapshot/links. Cloud Functions (Admin SDK) write everything.
+match /chamaSnapshots/{uid} {
+  allow read: if request.auth != null && request.auth.uid == uid;
+  allow write: if false;
+}
+match /chamaLinks/{uid}/links/{linkId} {
+  allow read: if request.auth != null && request.auth.uid == uid;
+  allow write: if false;
+}
+match /chamaLinkChallenges/{id} { allow read, write: if false; }
+match /chamaSyncState/{uid}     { allow read, write: if false; }

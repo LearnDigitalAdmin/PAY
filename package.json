@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "check:mychama-contract": "node tools/check-mychama-contract.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
