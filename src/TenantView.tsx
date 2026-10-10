@@ -20,6 +20,9 @@ import {
 } from 'lucide-react';
 import { AuthService, db, TenantService, type Invoice, type Payment } from './Firebase';
 import PaymentModal from './PaymentModal';
+import BrandLogo from './theme/BrandLogo';
+import ChamaSection from './mychama/ChamaSection';
+import { splitInvoiceOutstanding } from './mychama/calc';
 import { doc, getDoc } from 'firebase/firestore';
 
 interface ScreeningMetrics {
@@ -237,6 +240,7 @@ const TenantView: React.FC = () => {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex items-center justify-between">
             <div>
+              <BrandLogo variant="lockup" className="h-8 w-auto mb-2" />
               <h1 className="text-2xl font-bold text-gray-900">Tenant Portal</h1>
               <p className="text-sm text-gray-600 mt-1">Welcome, {tenantData?.fullName}</p>
             </div>
@@ -347,6 +351,13 @@ const TenantView: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {/* MyChama (chama obligations next to rent; rent figures are passed in, never queried) */}
+        <ChamaSection
+          role="tenant"
+          rentDue={splitInvoiceOutstanding(invoices).rentDue}
+          billsDue={splitInvoiceOutstanding(invoices).billsDue}
+        />
 
         {/* Tabs */}
         <div className="bg-white rounded-xl shadow-md overflow-hidden">

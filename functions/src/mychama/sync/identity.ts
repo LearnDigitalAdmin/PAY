@@ -3,19 +3,29 @@
 //
 // Profiles in the plot project today:
 //   tenants  -> tenants/{uid}           { idNumber, phone, ... }   (Firebase phone auth)
-//   landlords-> users/{agentId}         { phone, email, name, ... } (agentId = custom claim set by Track C,
-//                                        falling back to the uid, which equals users/{localId} for accounts
-//                                        made by createUserWithFirebaseAuth)
-// NOTE (reported to the integrator): users/{agentId} has NO idNumber field today. A landlord without one
-// resolves to idNumber "" and stays `never_linked` until Track C / the PMS migration provides it.
+//   landlords-> users/{userId}          where userId IS the landlord's National ID / passport number
+//                                        (PMS convention). `agentId` = custom claim set by Track C, falling
+//                                        back to the uid (users/{localId} for accounts made by
+//                                        createUserWithFirebaseAuth). A stored `idNumber` field, if one ever
+//                                        exists, wins over the doc id.
+// The doc id is only used as an ID number when it LOOKS like one (5-12 alphanumerics): self-signup
+// landlords get a 28-char random Firebase uid, which is not an ID and is skipped. Even if a doc id were
+// forged, linking still needs the phone proof (verified Firebase phone or an SMS code to the phone
+// registered in MyChama), so the ID alone never exposes chama data.
 import type { CallableRequest } from "firebase-functions/v2/https";
-import { normalizeKePhone, plotDb } from "../config";
+import { normalizeIdNumber, normalizeKePhone, plotDb } from "../config";
 import type { PortalRole } from "../contract";
 
 export type AuthInfo = NonNullable<CallableRequest["auth"]>;
 export interface Caller { uid: string; role: PortalRole; idNumber: string; verifiedPhoneE164: string | null }
 
 const KE_MOBILE = /^\+254[17]\d{8}$/;
+
+/** National IDs are 7-8 digits, passports up to ~9 alphanumerics; random Firebase uids are 28 chars. */
+export function looksLikeIdNumber(raw: string): boolean {
+  const n = normalizeIdNumber(raw);
+  return n.length >= 5 && n.length <= 12;
+}
 
 export async function resolveCaller(auth: AuthInfo): Promise<Caller> {
   const uid = auth.uid;
@@ -31,7 +41,9 @@ export async function resolveCaller(auth: AuthInfo): Promise<Caller> {
   if (claimRole !== "tenant") {
     const landlordSnap = await db.doc(`users/${agentId}`).get();
     if (landlordSnap.exists && (claimRole === "landlord" || landlordSnap.data()?.firebaseAuthUid === uid || landlordSnap.id === uid)) {
-      return { uid, role: "landlord", idNumber: String(landlordSnap.data()?.idNumber || ""), verifiedPhoneE164 };
+      const stored = String(landlordSnap.data()?.idNumber || "");
+      const idNumber = stored || (looksLikeIdNumber(landlordSnap.id) ? landlordSnap.id : "");
+      return { uid, role: "landlord", idNumber, verifiedPhoneE164 };
     }
   }
   const tenantSnap = await db.doc(`tenants/${uid}`).get();

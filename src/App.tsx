@@ -1,7 +1,9 @@
 // App.tsx - Main Application Component with Routing
 import React, { useEffect, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { AuthService } from './Firebase';
+import { SessionProvider } from './session/SessionProvider';
+import { useSession } from './session/session';
+import { ChamaConnectorProvider } from './mychama/ChamaConnectorProvider';
 import Auth from './Auth';
 import Signup from './Signup';
 import AgentView from './AgentView';
@@ -11,85 +13,17 @@ import { Loader2 } from 'lucide-react';
 import Welcome from './Welcome';
 import FAQPage from './Faq';
 
-// Protected Route Component
+// Protected Route Component — role comes from the verified session (Firebase Auth + server claims),
+// not from localStorage.
 interface ProtectedRouteProps {
   children: React.ReactNode;
   requiredRole?: 'agent' | 'tenant';
 }
 
 const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requiredRole }) => {
-  const [loading, setLoading] = useState(true);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [userRole, setUserRole] = useState<'agent' | 'tenant' | null>(null);
+  const session = useSession();
 
-  useEffect(() => {
-    // Check both Firebase Auth (for tenants) and localStorage (for agents)
-    const checkAuth = () => {
-      // Check for agent authentication in localStorage
-      const agentUser = localStorage.getItem('agentAuthUser');
-      if (agentUser) {
-        try {
-          const parsed = JSON.parse(agentUser);
-          if (parsed.id && parsed.email) {
-            setIsAuthenticated(true);
-            setUserRole('agent');
-            setLoading(false);
-            return;
-          }
-        } catch (e) {
-          console.error('Error parsing agent user:', e);
-          localStorage.removeItem('agentAuthUser');
-        }
-      }
-
-      // Check Firebase Auth for tenant authentication
-      const unsubscribe = AuthService.onAuthChange((firebaseUser) => {
-        if (firebaseUser) {
-          setIsAuthenticated(true);
-          setUserRole('tenant');
-        } else {
-          setIsAuthenticated(false);
-          setUserRole(null);
-        }
-        setLoading(false);
-      });
-
-      return unsubscribe;
-    };
-
-    const unsubscribe = checkAuth();
-
-    // Also listen for storage changes (in case user logs out in another tab)
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === 'agentAuthUser') {
-        if (!e.newValue) {
-          // Agent logged out
-          setIsAuthenticated(false);
-          setUserRole(null);
-        } else {
-          // Agent logged in
-          try {
-            const parsed = JSON.parse(e.newValue);
-            if (parsed.id && parsed.email) {
-              setIsAuthenticated(true);
-              setUserRole('agent');
-            }
-          } catch (err) {
-            console.error('Error parsing storage change:', err);
-          }
-        }
-      }
-    };
-
-    window.addEventListener('storage', handleStorageChange);
-
-    return () => {
-      if (unsubscribe) unsubscribe();
-      window.removeEventListener('storage', handleStorageChange);
-    };
-  }, []);
-
-  if (loading) {
+  if (session.status === 'loading') {
     return (
       <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-purple-100 flex items-center justify-center">
         <div className="text-center">
@@ -100,15 +34,14 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requiredRole 
     );
   }
 
-  if (!isAuthenticated) {
+  if (session.status === 'signedOut' || !session.role) {
     return <Navigate to="/" replace />;
   }
 
   // If a specific role is required, check it
-  if (requiredRole && userRole !== requiredRole) {
+  if (requiredRole && session.role !== requiredRole) {
     // Redirect to correct dashboard based on actual role
-    const redirectPath = userRole === 'agent' ? '/agent' : '/tenant';
-    return <Navigate to={redirectPath} replace />;
+    return <Navigate to={session.role === 'agent' ? '/agent' : '/tenant'} replace />;
   }
 
   return <>{children}</>;
@@ -132,6 +65,8 @@ const App: React.FC = () => {
   }, []);
 
   return (
+    <SessionProvider>
+    <ChamaConnectorProvider>
     <Router>
       {/* Offline Indicator */}
       {!isOnline && (
@@ -170,6 +105,8 @@ const App: React.FC = () => {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Router>
+    </ChamaConnectorProvider>
+    </SessionProvider>
   );
 };
 

@@ -1,14 +1,16 @@
 // Auth.tsx - Sign In Component with Role-Based Authentication
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { AuthService, db } from './Firebase';
+import { AuthService } from './Firebase';
+import { useSession, setPortalPreference } from './session/session';
+import BrandLogo from './theme/BrandLogo';
 import { Loader2, Phone, Hash, ArrowLeft, Mail, Lock } from 'lucide-react';
-import { collection, getDocs, query, where } from 'firebase/firestore';
 // import { argon2Verify } from 'hash-wasm';
 
 const Auth: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
+  const { refresh } = useSession();
 
 
 //   const verifyHashedPass = async (password: string, hash: string): Promise<boolean> => {
@@ -41,6 +43,10 @@ const Auth: React.FC = () => {
   const [confirmationResult, setConfirmationResult] = useState<any>(null);
   const [phoneStep, setPhoneStep] = useState<'phone' | 'code'>('phone');
 
+  // Agents (landlords) can sign in with email/password OR a phone code
+  const [agentMethod, setAgentMethod] = useState<'email' | 'phone'>('email');
+  const usesPhone = userType === 'tenant' || (userType === 'agent' && agentMethod === 'phone');
+
   // Email/Password Authentication State (for Agents)
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -51,14 +57,14 @@ const Auth: React.FC = () => {
 
   useEffect(() => {
     // Initialize reCAPTCHA only for tenant (phone) authentication
-    if (userType === 'tenant') {
+    if (usesPhone) {
       try {
         AuthService.initRecaptcha('recaptcha-container');
       } catch (error) {
         console.error('Failed to initialize reCAPTCHA:', error);
       }
     }
-  }, [userType]);
+  }, [userType, usesPhone]);
 
   const formatPhoneNumber = (input: string): string => {
     // Remove all non-digit characters
@@ -74,6 +80,18 @@ const Auth: React.FC = () => {
     }
     
     return `+${digits}`;
+  };
+
+  // Landlord sign-in is complete once Firebase Auth succeeded AND the server confirms (and claims) a
+  // landlord account for this identity — the session layer asks the server, not localStorage.
+  const finishAgentLogin = async () => {
+    setPortalPreference('agent');
+    const result = await refresh();
+    if (result.role !== 'agent') {
+      await AuthService.signOut();
+      throw new Error(result.message || 'No landlord account is linked to this sign-in. Please contact your administrator.');
+    }
+    navigate('/agent');
   };
 
   // TENANT AUTHENTICATION - Phone Number
@@ -117,8 +135,14 @@ const Auth: React.FC = () => {
       }
 
       await AuthService.verifyCode(confirmationResult, verificationCode);
-      
+
+      if (userType === 'agent') {
+        await finishAgentLogin();
+        return;
+      }
+
       // Navigate to tenant dashboard
+      setPortalPreference('tenant');
       const from = location.state?.from || '/tenant';
       navigate(from);
       
@@ -146,45 +170,7 @@ const Auth: React.FC = () => {
       }
 
       await AuthService.signInWithEmailPassword(email, password);
-
-      const usersRef = collection(db, 'users');
-      const q = query(usersRef, where('email', '==', email.trim()));
-      const snapshot = await getDocs(q);
-
-      if (snapshot.empty) {
-        throw new Error('No account found with this email. Please contact your administrator.');
-      }
-
-      const userDoc = snapshot.docs[0];
-      const userData = userDoc.data();
-
-      // Verify hashed password
-      // const passwordMatch = await verifyHashedPass(password, userData.passwordHash);
-
-      // if (!passwordMatch) {
-      //   throw new Error('Incorrect password. Please try again.');
-      // }
-
-      // Optional: Check access level / role
-      if (userData.type !== 'paid') {
-        throw new Error('Access restricted to agent accounts.');
-      }
-
-      // Save session
-      const agentUser = {
-        id: userDoc.id,
-        email: userData.email,
-        name: userData.name || '',
-        type: userData.type,
-        tier: userData.tier || '',
-      };
-
-      localStorage.setItem('agentAuthUser', JSON.stringify(agentUser));
-
-      
-      
-      // Navigate to agent dashboard
-      navigate('/agent');
+      await finishAgentLogin();
       
     } catch (err: any) {
       console.error('Error signing in:', err);
@@ -192,7 +178,7 @@ const Auth: React.FC = () => {
       // Provide user-friendly error messages
       let errorMessage = 'Failed to sign in. Please check your credentials.';
       
-      if (err.code === 'auth/user-not-found') {
+      if (err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential') {
         errorMessage = 'No account found with this email. Please contact your administrator.';
       } else if (err.code === 'auth/wrong-password') {
         errorMessage = 'Incorrect password. Please try again.';
@@ -275,7 +261,7 @@ const Auth: React.FC = () => {
 // };
 
   const handleBack = () => {
-    if (userType === 'tenant' && phoneStep === 'code') {
+    if (usesPhone && phoneStep === 'code') {
       setPhoneStep('phone');
       setVerificationCode('');
       setError('');
@@ -303,11 +289,12 @@ const Auth: React.FC = () => {
               Back
             </button>
             
+            <BrandLogo variant="lockup" className="h-9 w-auto mb-4" />
             <h1 className="text-3xl font-bold text-gray-900 mb-2">
               Sign In as {userType === 'agent' ? 'Agent/Landlord' : 'Tenant'}
             </h1>
             <p className="text-gray-600">
-              {userType === 'agent' 
+              {userType === 'agent' && agentMethod === 'email'
                 ? 'Enter your email and password to access your dashboard'
                 : phoneStep === 'phone' 
                   ? 'Enter your phone number to receive a verification code' 
@@ -322,8 +309,23 @@ const Auth: React.FC = () => {
             </div>
           )}
 
+          {userType === 'agent' && phoneStep === 'phone' && (
+            <div className="mb-6 grid grid-cols-2 gap-2 rounded-lg bg-gray-100 p-1">
+              {(['email', 'phone'] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => { setAgentMethod(m); setError(''); }}
+                  className={`rounded-md py-2 text-sm font-semibold transition-colors ${agentMethod === m ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-600 hover:text-gray-900'}`}
+                >
+                  {m === 'email' ? 'Email & password' : 'Phone code'}
+                </button>
+              ))}
+            </div>
+          )}
+
           {/* AGENT LOGIN - Email/Password */}
-          {userType === 'agent' && (
+          {userType === 'agent' && agentMethod === 'email' && (
             <form onSubmit={handleEmailPasswordLogin} className="space-y-6">
               <div>
                 <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-2">
@@ -392,7 +394,7 @@ const Auth: React.FC = () => {
           )}
 
           {/* TENANT LOGIN - Phone Authentication */}
-          {userType === 'tenant' && (
+          {usesPhone && (
             <>
               {/* Phone Step */}
               {phoneStep === 'phone' && (
@@ -510,7 +512,7 @@ const Auth: React.FC = () => {
 
         {/* Footer */}
         <div className="mt-8 text-center text-sm text-gray-600">
-          <p>© 2024 Plot Yangu Payments. All rights reserved.</p>
+          <p>© 2026 Samuhia Payments. All rights reserved.</p>
           <div className="mt-2 space-x-4">
             <button
               onClick={() => navigate('/contact')}

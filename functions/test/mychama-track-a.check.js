@@ -286,6 +286,19 @@ function makeDb() {
     assert.strictEqual(l2.role, "landlord");
     const none = await ID.resolveCaller(tok({ uid: "ghost" }));
     assert.strictEqual(none.idNumber, "");
+    // PMS convention: landlord userId IS the ID number (no idNumber field needed)
+    put(plot, "users/23456789", { firebaseAuthUid: "23456789", phone: "+254700000002" });
+    const pms = await ID.resolveCaller(tok({ uid: "23456789" }));
+    assert.deepStrictEqual([pms.role, pms.idNumber], ["landlord", "23456789"]);
+    const viaClaim = await ID.resolveCaller(tok({ uid: "fb-uid-xyz", token: { role: "landlord", agentId: "23456789" } }));
+    assert.strictEqual(viaClaim.idNumber, "23456789");
+    // self-signup landlord: random 28-char uid is NOT an ID number
+    const rnd = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9v";
+    put(plot, "users/" + rnd, { firebaseAuthUid: rnd });
+    assert.strictEqual((await ID.resolveCaller(tok({ uid: rnd }))).idNumber, "");
+    // a stored idNumber field wins over the doc id
+    put(plot, "users/34567890", { firebaseAuthUid: "34567890", idNumber: "A1234567" });
+    assert.strictEqual((await ID.resolveCaller(tok({ uid: "34567890" }))).idNumber, "A1234567");
   });
 
   console.log(process.exitCode ? "\nFAILED" : `\nAll ${passed} checks passed`);

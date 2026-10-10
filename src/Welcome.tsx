@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Building2, User, CheckCircle, Phone, Mail } from 'lucide-react';
+import BrandLogo from './theme/BrandLogo';
 
 const Welcome: React.FC = () => {
   const navigate = useNavigate();
@@ -21,11 +22,11 @@ const Welcome: React.FC = () => {
           {/* Header Section */}
           <div className="bg-gradient-to-r from-blue-600 to-indigo-600 px-8 py-12 text-center">
             <div className="mb-6">
-              <div className="w-20 h-20 bg-white rounded-full flex items-center justify-center mx-auto mb-4">
-                <Building2 className="w-10 h-10 text-blue-600" />
+              <div className="mx-auto mb-4 w-20">
+                <BrandLogo variant="icon" className="w-20 h-20 rounded-2xl shadow-lg" />
               </div>
               <h1 className="text-4xl font-bold text-white mb-2">
-                Welcome to Plot Yangu
+                Welcome to Samuhia Payments
               </h1>
               <p className="text-xl text-blue-100">
                 Payments Portal
@@ -162,7 +163,7 @@ const Welcome: React.FC = () => {
 
         {/* Footer */}
         <div className="mt-8 text-center text-sm text-gray-600">
-          <p>© 2024 Plot Yangu Payments. All rights reserved.</p>
+          <p>© 2026 Samuhia Payments. All rights reserved.</p>
           <div className="mt-3 space-x-4">
             <button
               onClick={() => navigate('/contact')}

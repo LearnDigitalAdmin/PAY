@@ -27,7 +27,7 @@ const faqs = [
   {
     question: 'Do landlords or agents need a Paystack account?',
     answer:
-      'No, they don\'t. Plot Yangu Payments lets you automatically set up account by providing MPESA, Airtel Money, or Bank Details in the account settings, and payments are sent directly to their preferred bank or M-Pesa number.',
+      'No, they don\'t. Samuhia Payments lets you automatically set up account by providing MPESA, Airtel Money, or Bank Details in the account settings, and payments are sent directly to their preferred bank or M-Pesa number.',
   },
   {
     question: 'Can tenants pay using M-Pesa or Airtel Money?',
@@ -37,7 +37,7 @@ const faqs = [
   {
     question: 'What if my internet is slow?',
     answer:
-      'No worries — Plot Yangu Payments is built as a Progressive Web App (PWA), meaning it runs smoothly even on slow networks and can be installed directly on your Android phone or PC.',
+      'No worries — Samuhia Payments is built as a Progressive Web App (PWA), meaning it runs smoothly even on slow networks and can be installed directly on your Android phone or PC.',
   },
   {
     question: 'Is my data safe?',

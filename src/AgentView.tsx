@@ -25,6 +25,8 @@ import {
 } from 'lucide-react';
 import { AgentService, type Invoice, type Payment, type AgentAccount, AuthService } from './Firebase';
 import PaymentModal from './PaymentModal';
+import BrandLogo from './theme/BrandLogo';
+import ChamaSection from './mychama/ChamaSection';
 
 type PaymentMode = 'mobile_money' | 'bank' | 'paybill' | 'till';
 
@@ -384,6 +386,13 @@ const AgentView: React.FC = () => {
     );
   }
 
+  // Rent figures handed to the MyChama section (it never queries rental data itself).
+  const rentPayments = payments.map((p) => ({
+    amount: p.amount,
+    status: p.status,
+    date: (p.completedAt ?? p.initiatedAt)?.toDate ? (p.completedAt ?? p.initiatedAt).toDate() as Date : null,
+  }));
+
   const totalRevenue = payments
     .filter(p => p.status === 'success')
     .reduce((sum, p) => sum + p.amount, 0);
@@ -461,6 +470,7 @@ const AgentView: React.FC = () => {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex items-center justify-between">
             <div>
+              <BrandLogo variant="lockup" className="h-8 w-auto mb-2" />
               <h1 className="text-xl sm:text-2xl font-bold text-gray-900">Agent Dashboard</h1>
               <p className="text-sm text-gray-600 mt-1">Welcome, {agentData?.name}</p>
               {agentData?.tier && (
@@ -962,6 +972,8 @@ const AgentView: React.FC = () => {
             <p className="text-xs text-gray-500 mt-2">All time invoices</p>
           </div>
         </div>
+
+        <ChamaSection role="landlord" rentPayments={rentPayments} />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6 mb-6 sm:mb-8">
           <div className="bg-white rounded-xl shadow-lg p-4 sm:p-6">

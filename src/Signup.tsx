@@ -1,4 +1,5 @@
 // Signup.tsx - Tenant Signup Component
+import BrandLogo from './theme/BrandLogo';
 import React, { useState, useEffect } from 'react';
 import { Phone, Mail, User, CreditCard, Lock, AlertCircle, Loader2, CheckCircle } from 'lucide-react';
 import { AuthService, TenantService } from './Firebase';
@@ -94,6 +95,7 @@ const Signup: React.FC = () => {
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
         <div className="text-center mb-8">
+          <BrandLogo variant="lockup" className="h-10 w-auto mx-auto mb-4" />
           <h1 className="text-3xl font-bold text-gray-900 mb-2">Create Tenant Account</h1>
           <p className="text-gray-600">Sign up to manage your rent payments</p>
         </div>

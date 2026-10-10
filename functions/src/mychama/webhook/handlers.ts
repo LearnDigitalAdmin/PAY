@@ -42,6 +42,27 @@ import { sendMyChamaSms } from "../sms";
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+/**
+ * TRACK B — permanent-mismatch guard shared by every handler. Returns a reason string when the
+ * Paystack payload must NOT be applied against the stored doc, else null.
+ *   - currency (when supplied) must be KES
+ *   - paidKobo (when supplied) must equal the stored KES amount * 100
+ * A mismatch is PERMANENT (a retry can't fix it): callers write `applyNote`/`applyBlockedAt` on the doc,
+ * log, apply nothing and let the webhook answer 200. Transient errors are NOT handled here — they throw,
+ * the webhook answers 500 and Paystack retries.
+ */
+function paymentMismatch(expectedKes: unknown, paidKobo?: number, currency?: string): string | null {
+  if (typeof currency === "string" && currency.toUpperCase() !== "KES") {
+    return `Paystack currency ${currency} is not KES — nothing applied`;
+  }
+  if (typeof paidKobo === "number") {
+    const expected = Math.round(Number(expectedKes) * 100);
+    if (!Number.isFinite(expected) || expected <= 0) return "stored amount is invalid — nothing applied";
+    if (paidKobo !== expected) return `amount mismatch (expected ${expected}, paid ${paidKobo} minor units) — nothing applied`;
+  }
+  return null;
+}
+
 type MyChamaTx = admin.firestore.Transaction;
 type MyChamaDb = admin.firestore.Firestore;
 
@@ -282,11 +303,16 @@ async function applyMgrInTx(
  * `paidKobo` is the amount Paystack reports (event.data.amount). When given,
  * it must equal the intent's grossAmount — a mismatch means a tampered or
  * stale reference and nothing is applied.
+ * `currency` (Track B) is Paystack's event.data.currency; when given it must be "KES".
+ * A mismatch is permanent: nothing is applied, the intent gets an `applyNote` +
+ * `applyBlockedAt`, a whatsappAuditLog row is written, and the function RETURNS (the webhook
+ * answers 200 — a retry cannot fix it). Thrown errors are transient (webhook 500 => retry).
  */
 export async function handleMyChamaPayment(
   reference: string,
   chamaIdHint?: string,
-  paidKobo?: number
+  paidKobo?: number,
+  currency?: string
 ): Promise<void> {
   const db2 = mychamaDb();
 
@@ -306,8 +332,17 @@ export async function handleMyChamaPayment(
     const intent = intentSnap.data()!;
     if (intent.status === "success") return { kind: "already" as const };
 
-    if (typeof paidKobo === "number" && paidKobo !== Math.round((intent.grossAmount || 0) * 100)) {
-      return { kind: "mismatch" as const, expected: Math.round((intent.grossAmount || 0) * 100), got: paidKobo };
+    const blocked = paymentMismatch(intent.grossAmount, paidKobo, currency);
+    if (blocked) {
+      const now0 = Date.now();
+      tx.update(intentRef, { applyNote: blocked, applyBlockedAt: now0, updatedAt: now0 });
+      return {
+        kind: "mismatch" as const,
+        reason: blocked,
+        expected: Math.round((intent.grossAmount || 0) * 100),
+        got: paidKobo,
+        currency,
+      };
     }
 
     const now = Date.now();
@@ -363,7 +398,7 @@ export async function handleMyChamaPayment(
         outcome: "denied",
         chamaId,
         reference,
-        detail: { expectedKobo: outcome.expected, paidKobo: outcome.got },
+        detail: { reason: outcome.reason, expectedKobo: outcome.expected, paidKobo: outcome.got, currency: outcome.currency },
         createdAt: Date.now(),
       });
     } catch (e) {
@@ -386,37 +421,102 @@ export async function handleMyChamaPayment(
   }
 }
 
-export async function handleMyChamaSmsTopup(reference: string, chamaIdHint?: string): Promise<void> {
+/** Stages an "apply blocked" note on a non-payment doc (call INSIDE a transaction, before returning). */
+function blockApply(tx: MyChamaTx, ref: admin.firestore.DocumentReference, note: string): void {
+  const now = Date.now();
+  tx.update(ref, { applyNote: note, applyBlockedAt: now, updatedAt: now });
+}
+
+/**
+ * SMS credit top-up (MCS-). Track B: runs in ONE transaction (the old read-then-update could double-credit
+ * if two deliveries raced), uses the same crediting rule as before (+amountKes), and checks Paystack's
+ * amount/currency against the stored `amountKes`.
+ */
+export async function handleMyChamaSmsTopup(
+  reference: string,
+  chamaIdHint?: string,
+  paidKobo?: number,
+  currency?: string
+): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
   if (!chamaId) return;
 
   const topupRef = db2.doc(`chamas/${chamaId}/smsTopUps/${reference}`);
-  const topupSnap = await topupRef.get();
-  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
-  const topup = topupSnap.data()!;
-
   const chamaRef = db2.doc(`chamas/${chamaId}`);
-  const chamaSnap = await chamaRef.get();
-  const chama = chamaSnap.data() || {};
-  await chamaRef.update({ smsCredits: (chama.smsCredits || 0) + topup.amountKes, updatedAt: Date.now() });
-  await topupRef.update({ status: "success", updatedAt: Date.now() });
+
+  const out = await db2.runTransaction(async (tx) => {
+    const topupSnap = await tx.get(topupRef);
+    if (!topupSnap.exists) return "missing" as const;
+    const topup = topupSnap.data()!;
+    if (topup.status === "success") return "already" as const;
+    const blocked = paymentMismatch(topup.amountKes, paidKobo, currency);
+    if (blocked) {
+      blockApply(tx, topupRef, blocked);
+      return blocked;
+    }
+    const chama = (await tx.get(chamaRef)).data() || {};
+    const now = Date.now();
+    tx.update(chamaRef, { smsCredits: (chama.smsCredits || 0) + topup.amountKes, updatedAt: now });
+    tx.update(topupRef, { status: "success", updatedAt: now });
+    return "applied" as const;
+  });
+  logOutcome("MyChama SMS top-up", reference, out);
 }
 
-export async function handleMyChamaPlanBilling(reference: string, chamaIdHint?: string, plan?: string): Promise<void> {
+/**
+ * Plan billing (MCP-). Track B: transactional; the stored doc is REQUIRED (a reference with no billing doc
+ * applies nothing); the plan is `plan` (metadata.plan) falling back to the doc's `toPlan` — Chama's billing.py
+ * sends `toPlan`, never `plan`, so the old `if (!plan) return` meant paid upgrades were silently dropped; a
+ * metadata plan that disagrees with the doc blocks the apply; the amount/currency are checked against `amountKes`.
+ */
+const PAID_PLANS = ["starter", "basic", "growth", "max"];
+export async function handleMyChamaPlanBilling(
+  reference: string,
+  chamaIdHint?: string,
+  plan?: string,
+  paidKobo?: number,
+  currency?: string
+): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
-  if (!chamaId || !plan) return;
+  if (!chamaId) return;
 
   const billingRef = db2.doc(`chamas/${chamaId}/planBilling/${reference}`);
-  const billingSnap = await billingRef.get();
-  if (billingSnap.exists && billingSnap.data()?.status === "success") return;
+  const chamaRef = db2.doc(`chamas/${chamaId}`);
 
-  const now = Date.now();
-  const expiry = new Date();
-  expiry.setDate(expiry.getDate() + 30);
-  await db2.doc(`chamas/${chamaId}`).update({ plan, planExpiry: expiry.toISOString().slice(0, 10), updatedAt: now });
-  await billingRef.set({ status: "success", plan, updatedAt: now }, { merge: true });
+  const out = await db2.runTransaction(async (tx) => {
+    const billingSnap = await tx.get(billingRef);
+    if (!billingSnap.exists) return "missing" as const;
+    const billing = billingSnap.data()!;
+    if (billing.status === "success") return "already" as const;
+
+    const docPlan: string | undefined = typeof billing.toPlan === "string" ? billing.toPlan : undefined;
+    if (plan && docPlan && plan !== docPlan) {
+      const note = `plan in the charge metadata (${plan}) does not match the billing doc (${docPlan}) — nothing applied`;
+      blockApply(tx, billingRef, note);
+      return note;
+    }
+    const finalPlan = docPlan || plan;
+    if (!finalPlan || !PAID_PLANS.includes(finalPlan)) {
+      const note = "billing doc has no valid target plan — nothing applied";
+      blockApply(tx, billingRef, note);
+      return note;
+    }
+    const blocked = paymentMismatch(billing.amountKes, paidKobo, currency);
+    if (blocked) {
+      blockApply(tx, billingRef, blocked);
+      return blocked;
+    }
+
+    const now = Date.now();
+    const expiry = new Date();
+    expiry.setDate(expiry.getDate() + 30);
+    tx.update(chamaRef, { plan: finalPlan, planExpiry: expiry.toISOString().slice(0, 10), updatedAt: now });
+    tx.set(billingRef, { status: "success", plan: finalPlan, updatedAt: now }, { merge: true });
+    return "applied" as const;
+  });
+  logOutcome("MyChama plan billing", reference, out);
 }
 
 /**
@@ -426,28 +526,46 @@ export async function handleMyChamaPlanBilling(reference: string, chamaIdHint?: 
  * increment `reportCreditsBalance` by `topup.credits`, never by
  * `topup.amountKes`. See that repo's functions/mychama/reports.py::
  * purchaseReportCredits, which is what creates this pending doc.
+ * Track B: transactional + amount/currency check against `amountKes`.
  */
-export async function handleMyChamaReportCreditTopup(reference: string, chamaIdHint?: string): Promise<void> {
+export async function handleMyChamaReportCreditTopup(
+  reference: string,
+  chamaIdHint?: string,
+  paidKobo?: number,
+  currency?: string
+): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
   if (!chamaId) return;
 
   const topupRef = db2.doc(`chamas/${chamaId}/reportCreditTopUps/${reference}`);
-  const topupSnap = await topupRef.get();
-  if (!topupSnap.exists || topupSnap.data()?.status === "success") return;
-  const topup = topupSnap.data()!;
-
-  const credits = Number(topup.credits);
-  if (!Number.isFinite(credits) || credits <= 0) {
-    console.error(`handleMyChamaReportCreditTopup: invalid credits value "${topup.credits}" for ${reference}`);
-    return;
-  }
-
   const chamaRef = db2.doc(`chamas/${chamaId}`);
-  const chamaSnap = await chamaRef.get();
-  const chama = chamaSnap.data() || {};
-  await chamaRef.update({ reportCreditsBalance: (chama.reportCreditsBalance || 0) + credits, updatedAt: Date.now() });
-  await topupRef.update({ status: "success", updatedAt: Date.now() });
+
+  const out = await db2.runTransaction(async (tx) => {
+    const topupSnap = await tx.get(topupRef);
+    if (!topupSnap.exists) return "missing" as const;
+    const topup = topupSnap.data()!;
+    if (topup.status === "success") return "already" as const;
+
+    const credits = Number(topup.credits);
+    if (!Number.isFinite(credits) || credits <= 0) {
+      const note = `invalid credits value "${topup.credits}" — nothing applied`;
+      blockApply(tx, topupRef, note);
+      return note;
+    }
+    const blocked = paymentMismatch(topup.amountKes, paidKobo, currency);
+    if (blocked) {
+      blockApply(tx, topupRef, blocked);
+      return blocked;
+    }
+
+    const chama = (await tx.get(chamaRef)).data() || {};
+    const now = Date.now();
+    tx.update(chamaRef, { reportCreditsBalance: (chama.reportCreditsBalance || 0) + credits, updatedAt: now });
+    tx.update(topupRef, { status: "success", updatedAt: now });
+    return "applied" as const;
+  });
+  logOutcome("MyChama report-credit top-up", reference, out);
 }
 
 /**
@@ -460,15 +578,38 @@ export async function handleMyChamaReportCreditTopup(reference: string, chamaIdH
  * billing's status-only branch. The monthly à la carte CAP was already
  * reserved when the purchase doc was created (mychama1's own
  * purchasePremiumReportAlaCarte), not here.
+ * Track B: transactional + amount/currency check against `amountKes`.
  */
-export async function handleMyChamaReportAlacarte(reference: string, chamaIdHint?: string): Promise<void> {
+export async function handleMyChamaReportAlacarte(
+  reference: string,
+  chamaIdHint?: string,
+  paidKobo?: number,
+  currency?: string
+): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
   if (!chamaId) return;
 
   const purchaseRef = db2.doc(`chamas/${chamaId}/reportAlacartePurchases/${reference}`);
-  const purchaseSnap = await purchaseRef.get();
-  if (!purchaseSnap.exists || purchaseSnap.data()?.status === "success") return;
 
-  await purchaseRef.update({ status: "success", updatedAt: Date.now() });
+  const out = await db2.runTransaction(async (tx) => {
+    const snap = await tx.get(purchaseRef);
+    if (!snap.exists) return "missing" as const;
+    const purchase = snap.data()!;
+    if (purchase.status === "success") return "already" as const;
+    const blocked = paymentMismatch(purchase.amountKes, paidKobo, currency);
+    if (blocked) {
+      blockApply(tx, purchaseRef, blocked);
+      return blocked;
+    }
+    tx.update(purchaseRef, { status: "success", updatedAt: Date.now() });
+    return "applied" as const;
+  });
+  logOutcome("MyChama report à-la-carte", reference, out);
+}
+
+/** "missing" / a block reason are logged (no phones, no secrets); "applied"/"already" are quiet. */
+function logOutcome(what: string, reference: string, out: string): void {
+  if (out === "missing") console.error(`${what}: no matching document for reference`, reference);
+  else if (out !== "applied" && out !== "already") console.error(`${what}: NOT applied — ${out}`, reference);
 }

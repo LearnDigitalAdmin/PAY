@@ -1,0 +1,1312 @@
+diff --git a/docs/mychama/track-A-notes.md b/docs/mychama/track-A-notes.md
+new file mode 100644
+index 0000000..50221e9
+--- /dev/null
++++ b/docs/mychama/track-A-notes.md
+@@ -0,0 +1,54 @@
++# Track A — data plane: notes for the integrator
++
++Patches: `track-A-pay-data-plane.patch` (PAY, base `9af8741`) and `track-A-chama-idkey.patch` (Chama, base `1c83e40`).
++PAY files touched: `functions/src/mychama/link/**`, `functions/src/mychama/sync/**`, this note, and `functions/test/mychama-track-a.check.js`. Nothing else (no `index.ts`, no contract, no frontend).
++
++## What was built
++| Piece | Where | Notes |
++|---|---|---|
++| `mychamaSync` | `sync/index.ts`, `sync/service.ts` | Lease + cooldown gate in a transaction on `chamaSyncState/{uid}`; first `login` with no snapshot is forced; `manual`/`force` use the 30 s floor, auto uses 600 s; throttled calls return stored status and never touch mychama1. |
++| Caller identity | `sync/identity.ts` | Reads only the caller's profile doc: tenants `tenants/{uid}`; landlords `users/{agentId}` (`agentId` = claim, else uid). Verified phone = Firebase `phone_number` token only. |
++| Link engine | `link/actions.ts` (pure), `link/match.ts`, `link/engine.ts` | idKey lookup (collection group on `members.idKey`), silent link on verified-phone match, `pending[]` per MyChama phone, `needs_reverify` when a member's phone stops matching, `revoked` when the member disappears, ambiguous IDs (2 members, one ID, one chama) never link. Only `status:"active"` members link. |
++| SMS code | `link/challenge.ts`, `link/index.ts` | Tap-to-send. One live challenge per (user, pending group); code stored as HMAC only; 6 digits, 10 min TTL, 5 attempts, 60 s resend cooldown, 5 sends/phone/day, 10/user/day (counters in `chamaLinkChallenges/lim_*`, server-only). Per-phone grants. `mychamaLinkVerifyCode` also runs a cooldown-bypassing sync so the snapshot is fresh when it returns. |
++| Calculations | `sync/compute.ts` (pure) | Contributions, loans, MGR (due now, arrears, won + scheduled wins), totals — KES `round2`, EAT dates. |
++| Chama `idKey` | Chama patch | Trigger `on_member_id_key`, `tools/backfill_id_key.py`, collection-group index, `MYCHAMA_ID_PEPPER` secret, docs, tests. The `idNumber` index exemption is untouched. |
++
++## Behaviours worth knowing
++* **Never 0 for unknown.** A section that can't be read is `null` + listed in `missing[]`; the chama gets `dataStatus: partial|unavailable`. If every linked chama is unreadable, or the link query itself fails, the sync fails as a whole: the last good `chamas[]/pending[]` are **kept**, status becomes `stale` (or `unavailable` if there never was one), `lastError` is set.
++* **Staleness over time is a client decision.** The server only writes `stale` on failure. A snapshot that is simply old still says `ok` — Track C should compute `now - lastSyncedAt > SNAPSHOT_STALE_AFTER_SECONDS` (contract constant) and show "as of …".
++* **MGR dates.** mychama1 stores no period/round dates (periods are closed manually), so scheduled wins have `expectedDate: null` and `expectedInflowThisMonth` is only non-zero if a future version supplies dates. Scheduled amount = pool / `recipientsPerRound` (mirrors `mgr_engine.py`); a "short round" (queue smaller than recipients) gives `amount: null`. `won` wins come from `payouts` of the pot's current cycle. "Due now" for MGR is counted in `dueThisMonth`; open arrears in `overdue`.
++* **Contributions without `dueDate`** fall back to `periodKey` (before this month ⇒ overdue, this month ⇒ due this month).
++* **Link doc contents:** never the ID number or a full phone — only `boundPhoneKey` (HMAC) and a masked phone.
++* **Rate limits by phone** return `send_limit_reached` (same code as the per-user cap) so the response doesn't reveal that a phone is being hammered.
++
++## Contract change request (non-blocking)
++`verifyCode` reports wrong codes as an error, but `MyChamaErrorDetails` has no field for the attempts left, so the error `details` carries an **extra key** `remainingAttempts: number` next to `code` (only for `code_invalid`). Track C can read it via `(err as any).details.remainingAttempts` today. Proposed P0.1: add `remainingAttempts?: number` to `MyChamaErrorDetails` (and update the frontend copy). `VerifyCodeResponse.remainingAttempts` is never set by Track A (success has nothing remaining to report).
++
++## Findings the integrator must act on
++1. **Landlords have no ID number in PAY.** `users/{id}` (created by `createUserWithFirebaseAuth`) stores name, phone, email, passwordHash, tier, cyberId… but no `idNumber` (only `tenants/{uid}` does). Until a landlord's `users/{id}.idNumber` exists, they resolve to "no ID" and stay `never_linked`. Decide the source (collect it at landlord sign-in in Track C, or copy it from the PMS record via `cyberId`) — Track A reads the field name `idNumber`.
++2. **Landlord Firebase Auth users already exist** for accounts made by `createUserWithFirebaseAuth` (uid = `localId`/doc id, with email/phone/password) — the custom `localStorage` login just doesn't use them. Track C's migration may be simpler than its prompt assumes; Track A's resolver already accepts "uid == users doc id".
++3. **Ordering:** deploy the Chama patch first (trigger + index), run the backfill, wait for the `idKey` index to finish building, **then** deploy PAY — otherwise the collection-group query fails (the sync then reports `unavailable`/`stale`, it does not crash).
++
++## Deploy checklist (Track A only)
++1. `firebase functions:secrets:set MYCHAMA_ID_PEPPER` in **both** projects with the **same** value (use a long random string).
++2. Chama: `firebase deploy --only functions:on_member_id_key,firestore:indexes` (or your usual deploy); then `MYCHAMA_ID_PEPPER=… python tools/backfill_id_key.py` (dry run) and `--apply`.
++3. Merge `docs/mychama/firestore.rules.fragment` into the plot rules.
++4. PAY: deploy `mychamaSync`, `mychamaLinkRequestCode`, `mychamaLinkVerifyCode` (the pepper and `MYCHAMA_HP_SMS_*` secrets must exist in the PAY project).
++5. The PAY default service account needs read access to mychama1 Firestore (already granted for the payment handlers).
++
++## Tests run
++* `python functions/tests/test_id_key.py` (Chama): 7 vectors + pepper sensitivity — pass.
++* `cd functions && npm run build && node test/mychama-track-a.check.js` (PAY): **19 checks pass** — pure compute and link-action logic, plus an end-to-end run against an in-memory fake Firestore (first-login silent link, ambiguous/removed members excluded, cooldown throttling, SMS code request/resend/wrong-code/lockout/single-use, per-phone grant, post-link refresh, mychama1 outage keeps last good data, partial sections, phone change ⇒ needs_reverify, no-ID caller, identity resolution).
++* **Cross-language idKey vectors** — Node `computeIdKey` and Python `compute_id_key` agree on all of these (pepper `test-pepper-123`):
++
++| input | normalised | idKey (hex) |
++|---|---|---|
++| `12345678` | `12345678` | `5f2b4873088e9d4ee7cb39de1b6f4723ba83bed014d882f445fc4b1e4a487d92` |
++| `12 345-678` | `12345678` | `5f2b4873088e9d4ee7cb39de1b6f4723ba83bed014d882f445fc4b1e4a487d92` |
++| `a1234567` | `A1234567` | `cc0d2069f3bb9ab2a64e6766739737d4c8cb6352e158ee4eebbc14cf8a342fdc` |
++| ` 0012.3456 ` | `00123456` | `d3286373afc9a2dde04e1ed56437c3088b820d5d2d2bab9c48459139b5a8b896` |
++| `K-1234 567` | `K1234567` | `8a11729bb5c2011f3ac0d43820ee9fc3995e567c5d8614ca7c154910af94ae21` |
++| `` / `!!!` | `` | `` (empty) |
++
++## Not verified here
++No Firebase emulator or live project was available in this environment, so nothing ran against real Firestore/Functions/SMS. Real-Firestore behaviours to watch on first deploy: the `idKey` collection-group index build time, transaction contention on `chamaSyncState` (not expected), and HostPinnacle delivery of the code SMS.
+diff --git a/functions/src/mychama/link/actions.ts b/functions/src/mychama/link/actions.ts
+new file mode 100644
+index 0000000..bb1fb15
+--- /dev/null
++++ b/functions/src/mychama/link/actions.ts
+@@ -0,0 +1,64 @@
++// PURE linking decisions (no Firebase imports): given the member records that carry the caller's idKey,
++// the caller's existing links, and what phone proof exists right now, decide what to do.
++// Rules (contract §5): silent link only on a verified-phone match; other phones go to `pending` (SMS
++// code); per-phone grants; a link is bound to the phone it was proven on and drops to needs_reverify
++// when the member's phone stops matching; vanished members are revoked.
++import { makeLinkId, type LinkState, type LinkVerifiedVia } from "../contract";
++
++export interface Candidate { chamaId: string; memberId: string; phoneKey: string; phoneE164: string }
++export interface ExistingLink { linkId: string; state: LinkState; boundPhoneKey: string; verifiedVia: LinkVerifiedVia }
++
++export interface LinkInputs {
++  candidates: Candidate[];
++  existing: ExistingLink[];
++  /** HMAC key of the caller's Firebase-verified phone (null if none, e.g. email/password landlords). */
++  verifiedPhoneKey: string | null;
++  /** Phone keys just proven by an SMS code in THIS request (verifyCode only). */
++  provenSmsPhoneKeys: string[];
++}
++export interface PendingGroup { phoneKey: string; phoneE164: string; candidates: Candidate[] }
++export interface LinkActions {
++  activate: Array<{ candidate: Candidate; via: LinkVerifiedVia; linkId: string }>;
++  keep: string[];
++  reverify: string[];
++  revoke: string[];
++  pending: PendingGroup[];
++}
++
++export function computeLinkActions(input: LinkInputs): LinkActions {
++  const existingById = new Map(input.existing.map((l) => [l.linkId, l]));
++  const out: LinkActions = { activate: [], keep: [], reverify: [], revoke: [], pending: [] };
++  const pendingByPhone = new Map<string, PendingGroup>();
++  const seen = new Set<string>();
++
++  const addPending = (c: Candidate) => {
++    const g = pendingByPhone.get(c.phoneKey) || { phoneKey: c.phoneKey, phoneE164: c.phoneE164, candidates: [] };
++    g.candidates.push(c);
++    pendingByPhone.set(c.phoneKey, g);
++  };
++
++  for (const c of input.candidates) {
++    const linkId = makeLinkId(c.chamaId, c.memberId);
++    seen.add(linkId);
++    const ex = existingById.get(linkId);
++    const proof: LinkVerifiedVia | null =
++      input.verifiedPhoneKey && input.verifiedPhoneKey === c.phoneKey ? "firebase_phone"
++      : input.provenSmsPhoneKeys.includes(c.phoneKey) ? "sms_code" : null;
++
++    if (ex && (ex.state === "active" || ex.state === "needs_reverify") && ex.boundPhoneKey === c.phoneKey) {
++      // Still the phone it was proven on (or the member's phone went back to it).
++      if (ex.state === "active") out.keep.push(linkId);
++      else out.activate.push({ candidate: c, via: ex.verifiedVia, linkId });
++      continue;
++    }
++    if (proof) { out.activate.push({ candidate: c, via: proof, linkId }); continue; }
++    if (ex && ex.state === "active") out.reverify.push(linkId);   // member's phone changed, no proof yet
++    addPending(c);
++  }
++
++  for (const ex of input.existing) {
++    if (!seen.has(ex.linkId) && ex.state !== "revoked") out.revoke.push(ex.linkId);
++  }
++  out.pending = [...pendingByPhone.values()];
++  return out;
++}
+diff --git a/functions/src/mychama/link/challenge.ts b/functions/src/mychama/link/challenge.ts
+new file mode 100644
+index 0000000..547465d
+--- /dev/null
++++ b/functions/src/mychama/link/challenge.ts
+@@ -0,0 +1,91 @@
++// SMS-code challenge for proving a MyChama-registered phone. Tap-to-send (never automatic), one live
++// challenge per (user, pending group), codes stored only as HMACs, attempt/send limits, no phone or ID
++// ever returned in full. Collections are server-only (see docs/mychama/firestore.rules.fragment).
++import { HttpsError } from "firebase-functions/v2/https";
++import { MYCHAMA_LIMITS, MYCHAMA_PATHS, type RequestCodeResponse } from "../contract";
++import { plotDb } from "../config";
++import { myChamaError } from "../errors";
++import { sendMyChamaSms } from "../sms";
++import { eatDateIso } from "../sync/dates";
++import type { Caller } from "../sync/identity";
++import { counterId, challengeIdFor, hashCode, randomCode, safeEqualHex } from "./crypto";
++import { planLinkPass, pendingViews } from "./engine";
++
++const L = MYCHAMA_LIMITS;
++
++export async function requestCode(caller: Caller, pendingId: string): Promise<RequestCodeResponse> {
++  if (!pendingId) throw myChamaError("invalid_target", "Unknown verification request.", "invalid-argument");
++
++  const plan = await planLinkPass(caller);
++  const view = pendingViews(caller.uid, plan.actions).find((p) => p.pendingId === pendingId);
++  if (!view) throw myChamaError("invalid_target", "Unknown verification request.", "invalid-argument");
++
++  const db = plotDb();
++  const now = Date.now();
++  const day = eatDateIso(now).replace(/-/g, "");
++  const challengeId = challengeIdFor(caller.uid, pendingId);
++  const chRef = db.doc(MYCHAMA_PATHS.challenge(challengeId));
++  const userCtr = db.doc(MYCHAMA_PATHS.challenge(`lim_u_${counterId("u", caller.uid)}_${day}`));
++  const phoneCtr = db.doc(MYCHAMA_PATHS.challenge(`lim_p_${counterId("p", view.phoneKey)}_${day}`));
++
++  const code = randomCode(L.CODE_LENGTH);
++  const expiresAt = now + L.CODE_TTL_SECONDS * 1000;
++
++  await db.runTransaction(async (tx) => {
++    const [ch, uc, pc] = await Promise.all([tx.get(chRef), tx.get(userCtr), tx.get(phoneCtr)]);
++    const last = ch.exists ? Number(ch.data()?.lastSentAt || 0) : 0;
++    if (last && now - last < L.CODE_RESEND_COOLDOWN_SECONDS * 1000) {
++      throw myChamaError("rate_limited", "Please wait before requesting another code.", "resource-exhausted", Math.ceil((L.CODE_RESEND_COOLDOWN_SECONDS * 1000 - (now - last)) / 1000));
++    }
++    if (Number(uc.data()?.count || 0) >= L.CODE_MAX_SENDS_PER_USER_PER_DAY || Number(pc.data()?.count || 0) >= L.CODE_MAX_SENDS_PER_PHONE_PER_DAY) {
++      throw myChamaError("send_limit_reached", "Too many codes requested today. Try again tomorrow.", "resource-exhausted");
++    }
++    tx.set(userCtr, { count: Number(uc.data()?.count || 0) + 1, day, updatedAt: now });
++    tx.set(phoneCtr, { count: Number(pc.data()?.count || 0) + 1, day, updatedAt: now });
++    tx.set(chRef, {
++      uid: caller.uid, phoneKey: view.phoneKey, codeHash: hashCode(challengeId, code),
++      expiresAt, attempts: 0, lastSentAt: now, createdAt: ch.exists ? Number(ch.data()?.createdAt || now) : now,
++    });
++  });
++
++  try {
++    await sendMyChamaSms(view.phoneE164, `Samuhia Payments: your MyChama linking code is ${code}. Valid for ${Math.round(L.CODE_TTL_SECONDS / 60)} minutes. Never share it.`);
++  } catch (e) {
++    console.error("mychama link: SMS send failed:", (e as Error)?.message || e);   // never log the code or phone
++    await chRef.delete().catch(() => undefined);
++    throw myChamaError("upstream_failure", "We could not send the code. Please try again shortly.", "unavailable");
++  }
++  return { challengeId, maskedPhone: view.maskedPhone, expiresAt, resendAfter: now + L.CODE_RESEND_COOLDOWN_SECONDS * 1000 };
++}
++
++/** Validates the code; on success consumes the challenge and returns the proven phone key. */
++export async function verifyCode(uid: string, challengeId: string, rawCode: string): Promise<string> {
++  const db = plotDb();
++  const now = Date.now();
++  const code = (rawCode || "").replace(/\s+/g, "");
++  const chRef = db.doc(MYCHAMA_PATHS.challenge(challengeId));
++
++  const result = await db.runTransaction(async (tx) => {
++    const snap = await tx.get(chRef);
++    const d = snap.data();
++    if (!snap.exists || !d || d.uid !== uid) return { kind: "invalid" as const };
++    if (Number(d.expiresAt || 0) < now) { tx.delete(chRef); return { kind: "expired" as const }; }
++    const attempts = Number(d.attempts || 0);
++    if (attempts >= L.CODE_MAX_ATTEMPTS) return { kind: "locked" as const };
++
++    const ok = /^\d+$/.test(code) && code.length === L.CODE_LENGTH && safeEqualHex(hashCode(challengeId, code), String(d.codeHash || ""));
++    if (ok) { tx.delete(chRef); return { kind: "ok" as const, phoneKey: String(d.phoneKey) }; }
++    tx.update(chRef, { attempts: attempts + 1 });
++    return { kind: "wrong" as const, remaining: Math.max(0, L.CODE_MAX_ATTEMPTS - attempts - 1) };
++  });
++
++  switch (result.kind) {
++    case "ok": return result.phoneKey;
++    case "expired": throw myChamaError("code_expired", "That code has expired. Request a new one.", "deadline-exceeded");
++    case "locked": throw myChamaError("code_attempts_exceeded", "Too many wrong attempts. Request a new code.", "resource-exhausted");
++    case "wrong":
++      // remainingAttempts rides in details next to `code` (extra key; see track-A-notes.md).
++      throw new HttpsError("failed-precondition", "That code is not correct.", { code: "code_invalid", remainingAttempts: result.remaining });
++    default: throw myChamaError("code_invalid", "That code is not correct.", "failed-precondition");
++  }
++}
+diff --git a/functions/src/mychama/link/crypto.ts b/functions/src/mychama/link/crypto.ts
+new file mode 100644
+index 0000000..a6d010c
+--- /dev/null
++++ b/functions/src/mychama/link/crypto.ts
+@@ -0,0 +1,30 @@
++// Small crypto helpers for the linking flow. All keyed with MYCHAMA_ID_PEPPER (bind that secret on any
++// function using these). Nothing here logs codes, keys, phones or ID numbers.
++import * as crypto from "crypto";
++import { MYCHAMA_ID_PEPPER } from "../config";
++
++export function hmacHex(label: string, value: string): string {
++  return crypto.createHmac("sha256", MYCHAMA_ID_PEPPER.value()).update(`${label}:${value}`).digest("hex");
++}
++
++/** Opaque id for "this user + this phone group". Stable, so requestCode can recompute it statelessly. */
++export const pendingIdFor = (uid: string, phoneKey: string): string => hmacHex("pd", `${uid}:${phoneKey}`).slice(0, 24);
++
++/** One live challenge per (user, pending group). */
++export const challengeIdFor = (uid: string, pendingId: string): string => hmacHex("ch", `${uid}:${pendingId}`).slice(0, 32);
++
++export const hashCode = (challengeId: string, code: string): string => hmacHex("cd", `${challengeId}:${code}`);
++
++/** Opaque short id used in counter doc names (keeps raw uids/phone keys out of doc ids). */
++export const counterId = (kind: "u" | "p", value: string): string => hmacHex(`lim${kind}`, value).slice(0, 24);
++
++export function randomCode(length: number): string {
++  const max = 10 ** length;
++  return String(crypto.randomInt(0, max)).padStart(length, "0");
++}
++
++export function safeEqualHex(a: string, b: string): boolean {
++  const ab = Buffer.from(a, "hex");
++  const bb = Buffer.from(b, "hex");
++  return ab.length === bb.length && ab.length > 0 && crypto.timingSafeEqual(ab, bb);
++}
+diff --git a/functions/src/mychama/link/engine.ts b/functions/src/mychama/link/engine.ts
+new file mode 100644
+index 0000000..e77fcf6
+--- /dev/null
++++ b/functions/src/mychama/link/engine.ts
+@@ -0,0 +1,116 @@
++// Linking engine: plan (read-only) and apply (writes under chamaLinks/{uid}/links in the plot DB only).
++import { MYCHAMA_PATHS, type ChamaLinkDoc, type LinkState } from "../contract";
++import { computeIdKey, computePhoneKey, maskPhone, mychamaDb, plotDb } from "../config";
++import * as P from "../paths";
++import type { Caller } from "../sync/identity";
++import { computeLinkActions, type ExistingLink, type LinkActions } from "./actions";
++import { findCandidates } from "./match";
++import { pendingIdFor } from "./crypto";
++
++export interface PendingView { pendingId: string; phoneKey: string; phoneE164: string; maskedPhone: string; chamaCount: number }
++
++export interface LinkPlan {
++  actions: LinkActions;
++  existing: ChamaLinkDoc[];
++  ambiguousChamaIds: string[];
++  noId: boolean;
++}
++
++/** Read-only: what would the link pass do right now? */
++export async function planLinkPass(caller: Caller, provenSmsPhoneKeys: string[] = []): Promise<LinkPlan> {
++  const existing = await readLinks(caller.uid);
++  const idKey = computeIdKey(caller.idNumber);
++  if (!idKey) {
++    // No usable ID: nothing to match. Existing links are left exactly as they are.
++    return { actions: { activate: [], keep: existing.filter((l) => l.state === "active").map((l) => l.linkId), reverify: [], revoke: [], pending: [] }, existing, ambiguousChamaIds: [], noId: true };
++  }
++  const { candidates, ambiguousChamaIds } = await findCandidates(idKey);
++  const verifiedPhoneKey = caller.verifiedPhoneE164 ? computePhoneKey(caller.verifiedPhoneE164) : null;
++  const ex: ExistingLink[] = existing.map((l) => ({ linkId: l.linkId, state: l.state, boundPhoneKey: l.boundPhoneKey, verifiedVia: l.verifiedVia }));
++  const actions = computeLinkActions({ candidates, existing: ex, verifiedPhoneKey, provenSmsPhoneKeys });
++  return { actions, existing, ambiguousChamaIds, noId: false };
++}
++
++export interface LinkPassResult {
++  active: ChamaLinkDoc[];
++  needsReverify: ChamaLinkDoc[];
++  pending: PendingView[];
++  activatedForPhoneKeys: Record<string, number>;
++  ambiguousCount: number;
++  noId: boolean;
++}
++
++/** Plan, then persist the decisions. Never writes to mychama1. */
++export async function runLinkPass(caller: Caller, provenSmsPhoneKeys: string[] = []): Promise<LinkPassResult> {
++  const plan = await planLinkPass(caller, provenSmsPhoneKeys);
++  const { actions } = plan;
++  const db = plotDb();
++  const now = Date.now();
++  const byId = new Map(plan.existing.map((l) => [l.linkId, l]));
++  const batch = db.batch();
++  const activatedForPhoneKeys: Record<string, number> = {};
++
++  if (actions.activate.length > 0) {
++    const names = await chamaNames(actions.activate.map((a) => a.candidate.chamaId));
++    for (const a of actions.activate) {
++      const prev = byId.get(a.linkId);
++      const doc: ChamaLinkDoc = {
++        linkId: a.linkId, uid: caller.uid, chamaId: a.candidate.chamaId, memberId: a.candidate.memberId,
++        chamaName: names.get(a.candidate.chamaId) || prev?.chamaName || "",
++        state: "active", verifiedVia: a.via, boundPhoneKey: a.candidate.phoneKey,
++        boundPhoneMasked: maskPhone(a.candidate.phoneE164),
++        linkedAt: prev && prev.state !== "revoked" ? prev.linkedAt : now, updatedAt: now,
++      };
++      batch.set(db.doc(MYCHAMA_PATHS.link(caller.uid, a.linkId)), doc);
++      byId.set(a.linkId, doc);
++      activatedForPhoneKeys[a.candidate.phoneKey] = (activatedForPhoneKeys[a.candidate.phoneKey] || 0) + 1;
++    }
++  }
++  const setState = (ids: string[], state: LinkState) => {
++    for (const id of ids) {
++      const prev = byId.get(id);
++      if (!prev || prev.state === state) continue;
++      batch.update(db.doc(MYCHAMA_PATHS.link(caller.uid, id)), { state, updatedAt: now });
++      byId.set(id, { ...prev, state, updatedAt: now });
++    }
++  };
++  setState(actions.reverify, "needs_reverify");
++  setState(actions.revoke, "revoked");
++  if (actions.activate.length || actions.reverify.length || actions.revoke.length) await batch.commit();
++
++  const all = [...byId.values()];
++  return {
++    active: all.filter((l) => l.state === "active"),
++    needsReverify: all.filter((l) => l.state === "needs_reverify"),
++    pending: pendingViews(caller.uid, actions),
++    activatedForPhoneKeys,
++    ambiguousCount: plan.ambiguousChamaIds.length,
++    noId: plan.noId,
++  };
++}
++
++export function pendingViews(uid: string, actions: LinkActions): PendingView[] {
++  return actions.pending.map((g) => ({
++    pendingId: pendingIdFor(uid, g.phoneKey), phoneKey: g.phoneKey, phoneE164: g.phoneE164,
++    maskedPhone: maskPhone(g.phoneE164), chamaCount: g.candidates.length,
++  }));
++}
++
++async function readLinks(uid: string): Promise<ChamaLinkDoc[]> {
++  const snap = await plotDb().collection(MYCHAMA_PATHS.links(uid)).get();
++  return snap.docs.map((d) => d.data() as ChamaLinkDoc);
++}
++
++async function chamaNames(chamaIds: string[]): Promise<Map<string, string>> {
++  const out = new Map<string, string>();
++  const unique = [...new Set(chamaIds)];
++  if (unique.length === 0) return out;
++  try {
++    const db = mychamaDb();
++    const snaps = await db.getAll(...unique.map((id) => db.doc(P.chama(id))));
++    for (const s of snaps) if (s.exists) out.set(s.id, String(s.data()?.name || ""));
++  } catch (e) {
++    console.error("mychama link: chama name lookup failed:", (e as Error)?.message || e);   // cosmetic only
++  }
++  return out;
++}
+diff --git a/functions/src/mychama/link/index.ts b/functions/src/mychama/link/index.ts
+index 172c633..93b8438 100644
+--- a/functions/src/mychama/link/index.ts
++++ b/functions/src/mychama/link/index.ts
+@@ -1,20 +1,36 @@
+-// TRACK A — owns this directory. Stubs from P0; replace the bodies, keep names + I/O types.
+-import { onCall } from "firebase-functions/v2/https";
++// TRACK A — linking callables (SMS-code flow). Silent linking happens inside mychamaSync.
++import { onCall, type CallableRequest } from "firebase-functions/v2/https";
+ import { REGION, MYCHAMA_ID_PEPPER } from "../config";
+ import { MYCHAMA_HP_SECRETS } from "../sms";
+-import { notImplemented } from "../errors";
++import { myChamaError } from "../errors";
+ import type { RequestCodeRequest, RequestCodeResponse, VerifyCodeRequest, VerifyCodeResponse } from "../contract";
++import { resolveCaller } from "../sync/identity";
++import { requestCode, verifyCode } from "./challenge";
++import { runLinkPass } from "./engine";
++import { runSyncFor } from "../sync/service";
+ 
+ export const mychamaLinkRequestCode = onCall(
+   { region: REGION, cors: true, maxInstances: 10, secrets: [MYCHAMA_ID_PEPPER, ...MYCHAMA_HP_SECRETS] },
+-  async (_req: { data: RequestCodeRequest }): Promise<RequestCodeResponse> => {
+-    throw notImplemented("mychamaLinkRequestCode");
++  async (req: CallableRequest<RequestCodeRequest>): Promise<RequestCodeResponse> => {
++    if (!req.auth) throw myChamaError("unauthenticated", "Sign in required.", "unauthenticated");
++    const caller = await resolveCaller(req.auth);
++    return requestCode(caller, String(req.data?.pendingId || ""));
+   }
+ );
+ 
+ export const mychamaLinkVerifyCode = onCall(
+-  { region: REGION, cors: true, maxInstances: 10, secrets: [MYCHAMA_ID_PEPPER] },
+-  async (_req: { data: VerifyCodeRequest }): Promise<VerifyCodeResponse> => {
+-    throw notImplemented("mychamaLinkVerifyCode");
++  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 120, secrets: [MYCHAMA_ID_PEPPER] },
++  async (req: CallableRequest<VerifyCodeRequest>): Promise<VerifyCodeResponse> => {
++    if (!req.auth) throw myChamaError("unauthenticated", "Sign in required.", "unauthenticated");
++    const caller = await resolveCaller(req.auth);
++    const phoneKey = await verifyCode(caller.uid, String(req.data?.challengeId || ""), String(req.data?.code || ""));
++
++    // Per-phone grant: only the chamas registered on the proven phone are linked.
++    const pass = await runLinkPass(caller, [phoneKey]);
++    const linkedChamas = pass.activatedForPhoneKeys[phoneKey] || 0;
++
++    // Refresh the snapshot right away so the UI shows the new chamas (bypasses the cooldown; never fails the verify).
++    try { await runSyncFor(caller, "manual", { bypassCooldown: true }); } catch (e) { console.error("mychama verify: post-link sync failed:", (e as Error)?.message || e); }
++    return { linkedChamas };
+   }
+ );
+diff --git a/functions/src/mychama/link/match.ts b/functions/src/mychama/link/match.ts
+new file mode 100644
+index 0000000..a8318d0
+--- /dev/null
++++ b/functions/src/mychama/link/match.ts
+@@ -0,0 +1,33 @@
++// Finds the mychama1 member records that carry a given idKey (collection-group query on the indexed
++// `members.idKey` field — see the Chama track-A patch). READ-ONLY.
++import { mychamaDb, computePhoneKey, normalizeKePhone } from "../config";
++import type { Candidate } from "./actions";
++
++const KE_MOBILE = /^\+254[17]\d{8}$/;
++
++export interface MatchResult { candidates: Candidate[]; ambiguousChamaIds: string[] }
++
++export async function findCandidates(idKey: string): Promise<MatchResult> {
++  const snap = await mychamaDb().collectionGroup("members").where("idKey", "==", idKey).limit(200).get();
++
++  const perChama = new Map<string, Candidate[]>();
++  const ambiguous = new Set<string>();
++  for (const d of snap.docs) {
++    const data = d.data();
++    if (data.status !== "active") continue;                     // inactive/suspended/removed never link
++    const chamaId = d.ref.parent.parent?.id;
++    if (!chamaId) continue;
++    const e164 = normalizeKePhone(String(data.phoneNormalized || data.phone || ""));
++    if (!KE_MOBILE.test(e164)) continue;                         // no usable phone => cannot be proven, ever
++    const list = perChama.get(chamaId) || [];
++    list.push({ chamaId, memberId: d.id, phoneKey: computePhoneKey(e164), phoneE164: e164 });
++    perChama.set(chamaId, list);
++  }
++
++  const candidates: Candidate[] = [];
++  for (const [chamaId, list] of perChama) {
++    if (list.length > 1) ambiguous.add(chamaId);                 // two members, one ID, same chama: never link
++    else candidates.push(list[0]);
++  }
++  return { candidates, ambiguousChamaIds: [...ambiguous] };
++}
+diff --git a/functions/src/mychama/sync/compute.ts b/functions/src/mychama/sync/compute.ts
+new file mode 100644
+index 0000000..ef9173a
+--- /dev/null
++++ b/functions/src/mychama/sync/compute.ts
+@@ -0,0 +1,199 @@
++// Pure chama-side calculations for the snapshot. NO Firebase imports: every function takes plain
++// objects, so it is unit-testable (see functions/test/mychama-track-a.check.js).
++//
++// Money: KES, round2. Dates: "YYYY-MM-DD" in Africa/Nairobi. A section that cannot be built is
++// returned as null by the caller — these functions never turn "unknown" into 0.
++import {
++  MYCHAMA_LIMITS,
++  type ChamaTotals,
++  type ContributionItem, type ContributionsSnap,
++  type LoanItem, type LoansSnap,
++  type MgrPotSnap, type MgrSnap, type MgrWin,
++} from "../contract";
++import { round2, toIsoDate } from "./dates";
++
++const EPS = 0.009;
++
++/** Where "now" is, for overdue / this-month decisions. */
++export interface TimeCtx { today: string; month: string }   // "YYYY-MM-DD", "YYYY-MM"
++
++
++// ─────────────────────────── contributions ───────────────────────────
++export interface RawContribution {
++  id: string; periodKey?: string; dueDate?: unknown; amount?: number; paidAmount?: number; status?: string;
++}
++
++export function buildContributions(raw: RawContribution[], t: TimeCtx): { snap: ContributionsSnap; overdue: number; dueThisMonth: number } {
++  const items: ContributionItem[] = [];
++  let overdue = 0;
++  let dueThisMonth = 0;
++  let outstandingAll = 0;
++
++  const sorted = [...raw].sort((a, b) => (a.periodKey || "").localeCompare(b.periodKey || ""));
++  for (const c of sorted) {
++    const amount = round2(c.amount || 0);
++    const paid = round2(c.paidAmount || 0);
++    const outstanding = round2(amount - paid);
++    if (outstanding <= EPS || c.status === "paid") continue;
++
++    const periodKey = c.periodKey || "";
++    const dueDate = toIsoDate(c.dueDate);
++    const isOverdue = c.status === "overdue" || (dueDate ? dueDate < t.today : periodKey !== "" && periodKey < t.month);
++    const inMonth = dueDate ? dueDate.slice(0, 7) === t.month : periodKey === t.month;
++
++    outstandingAll += outstanding;
++    if (isOverdue) overdue += outstanding;
++    else if (inMonth) dueThisMonth += outstanding;
++
++    items.push({ contributionId: c.id, periodKey, dueDate, amount, paid, outstanding, status: c.status || "pending" });
++  }
++  return {
++    snap: { items: items.slice(0, MYCHAMA_LIMITS.SNAPSHOT_MAX_ITEMS_PER_LIST), outstanding: round2(outstandingAll) },
++    overdue: round2(overdue),
++    dueThisMonth: round2(dueThisMonth),
++  };
++}
++
++// ─────────────────────────────── loans ───────────────────────────────
++export interface RawInstallment { n: number; due?: number; paid?: boolean; paidAmount?: number; dueDate?: unknown }
++export interface RawLoan { id: string; status?: string; principal?: number; schedule?: RawInstallment[] }
++
++export function buildLoans(raw: RawLoan[], t: TimeCtx): { snap: LoansSnap; overdue: number; dueThisMonth: number } {
++  const items: LoanItem[] = [];
++  let overdue = 0;
++  let dueThisMonth = 0;
++  let outstandingAll = 0;
++
++  for (const loan of raw) {
++    if (loan.status !== "active" && loan.status !== "overdue") continue;
++    const schedule = [...(loan.schedule || [])].sort((a, b) => a.n - b.n);
++    let outstanding = 0;
++    let remaining = 0;
++    let next: LoanItem["nextInstallment"] = null;
++
++    for (const inst of schedule) {
++      const left = round2((inst.due || 0) - (inst.paidAmount || 0));
++      if (inst.paid || left <= EPS) continue;
++      const dueDate = toIsoDate(inst.dueDate);
++      outstanding += left;
++      remaining += 1;
++      if (!next) next = { installmentNo: inst.n, due: left, dueDate };
++
++      const isOverdue = dueDate ? dueDate < t.today : loan.status === "overdue";
++      if (isOverdue) overdue += left;
++      else if (dueDate && dueDate.slice(0, 7) === t.month) dueThisMonth += left;
++    }
++    if (remaining === 0) continue;
++    outstandingAll += outstanding;
++    items.push({
++      loanId: loan.id, principal: round2(loan.principal || 0), outstanding: round2(outstanding),
++      status: loan.status || "active", installmentsRemaining: remaining, nextInstallment: next,
++    });
++  }
++  return {
++    snap: { items: items.slice(0, MYCHAMA_LIMITS.SNAPSHOT_MAX_ITEMS_PER_LIST), outstanding: round2(outstandingAll) },
++    overdue: round2(overdue),
++    dueThisMonth: round2(dueThisMonth),
++  };
++}
++
++// ──────────────────────────────── MGR ────────────────────────────────
++export interface RawPot {
++  id: string; name?: string; amount?: number; frequency?: string; status?: string; period?: number;
++  periodsPerRound?: number; recipientsPerRound?: number; memberIds?: string[]; queue?: string[];
++  drawDone?: boolean; cycleNumber?: number;
++}
++export interface RawMgrRecord { period?: number; memberId?: string; status?: string; amount?: number }
++export interface RawMgrPayout { memberId?: string; round?: number; cycleNumber?: number; amount?: number; date?: unknown }
++export interface RawMgrArrear { id: string; memberId?: string; amount?: number; status?: string }
++export interface PotBundle { pot: RawPot; records: RawMgrRecord[]; payouts: RawMgrPayout[]; arrears: RawMgrArrear[] }
++
++/**
++ * Mirrors Chama functions/shared/mgr_engine.py: pool = amount x members x periodsPerRound, equal split
++ * across recipientsPerRound; a "short round" (0 < queue < recipientsPerRound) is NOT an equal split, so
++ * its amount is unknown (null). Future payout DATES are not stored anywhere in mychama1 (periods are
++ * closed manually), so scheduled wins carry expectedDate = null — never an invented date.
++ */
++export function buildMgr(bundles: PotBundle[], memberId: string): { snap: MgrSnap; overdue: number; dueThisMonth: number } {
++  const pots: MgrPotSnap[] = [];
++  let overdue = 0;
++  let dueThisMonth = 0;
++  let dueNowAll = 0;
++  let arrearsAll = 0;
++
++  for (const { pot, records, payouts, arrears } of bundles) {
++    if (pot.status !== "active" || !(pot.memberIds || []).includes(memberId)) continue;
++    const amount = round2(pot.amount || 0);
++    const period = pot.period || 0;
++
++    const rec = records.find((r) => r.period === period && r.memberId === memberId);
++    const currentPeriodPaid = rec?.status === "paid";
++    const dueNow = currentPeriodPaid ? 0 : round2(Math.max(0, amount - (rec?.status === "partial" ? rec.amount || 0 : 0)));
++
++    const openArrears = arrears.filter((a) => a.memberId === memberId && a.status === "open");
++    const arrearsOpen = round2(openArrears.reduce((s, a) => s + (a.amount || 0), 0));
++
++    const cycle = pot.cycleNumber || 1;
++    const cyclePayouts = payouts.filter((p) => (p.cycleNumber || 1) === cycle);
++    const wins: MgrWin[] = cyclePayouts
++      .filter((p) => p.memberId === memberId)
++      .map((p) => ({
++        kind: "won" as const, potId: pot.id, potName: pot.name || "", round: p.round || 0,
++        amount: typeof p.amount === "number" ? round2(p.amount) : null,
++        expectedDate: toIsoDate(p.date), queuePosition: null,
++      }));
++
++    const queue = pot.queue || [];
++    const recipients = pot.recipientsPerRound || 0;
++    const idx = queue.indexOf(memberId);
++    if (pot.drawDone && idx >= 0 && recipients > 0) {
++      const shortRound = queue.length > 0 && queue.length < recipients;
++      const pool = amount * (pot.memberIds || []).length * (pot.periodsPerRound || 1);
++      const roundsDone = Math.floor(cyclePayouts.length / recipients);
++      wins.push({
++        kind: "scheduled", potId: pot.id, potName: pot.name || "",
++        round: roundsDone + 1 + Math.floor(idx / recipients),
++        amount: shortRound ? null : round2(pool / recipients),
++        expectedDate: null, queuePosition: idx + 1,
++      });
++    }
++
++    dueNowAll += dueNow;
++    arrearsAll += arrearsOpen;
++    // Period boundaries are not date-stamped, so "due now" is treated as due this month; arrears are overdue.
++    dueThisMonth += dueNow;
++    overdue += arrearsOpen;
++
++    pots.push({
++      potId: pot.id, name: pot.name || "", amountPerPeriod: amount, frequency: pot.frequency || "",
++      status: pot.status || "active", period, currentPeriodPaid, dueNow, nextDueDate: null,
++      arrearsOpen, arrearId: openArrears[0]?.id ?? null, wins,
++    });
++  }
++  return {
++    snap: { pots, dueNow: round2(dueNowAll), arrearsOpen: round2(arrearsAll) },
++    overdue: round2(overdue),
++    dueThisMonth: round2(dueThisMonth),
++  };
++}
++
++// ─────────────────────────────── totals ───────────────────────────────
++export function combineTotals(
++  parts: Array<{ overdue: number; dueThisMonth: number } | null>,
++  mgr: MgrSnap | null,
++  t: TimeCtx
++): ChamaTotals | null {
++  const present = parts.filter((p): p is { overdue: number; dueThisMonth: number } => p !== null);
++  if (present.length === 0) return null;
++  let expected = 0;
++  for (const pot of mgr?.pots ?? []) {
++    for (const w of pot.wins) {
++      if (w.kind === "scheduled" && w.amount !== null && w.expectedDate && w.expectedDate.slice(0, 7) === t.month) expected += w.amount;
++    }
++  }
++  return {
++    overdue: round2(present.reduce((s, p) => s + p.overdue, 0)),
++    dueThisMonth: round2(present.reduce((s, p) => s + p.dueThisMonth, 0)),
++    expectedInflowThisMonth: round2(expected),
++  };
++}
+diff --git a/functions/src/mychama/sync/dates.ts b/functions/src/mychama/sync/dates.ts
+new file mode 100644
+index 0000000..d53e154
+--- /dev/null
++++ b/functions/src/mychama/sync/dates.ts
+@@ -0,0 +1,30 @@
++// Pure date/number helpers for the sync module (Africa/Nairobi = UTC+3, no DST).
++const EAT_OFFSET_MS = 3 * 60 * 60 * 1000;
++
++export const round2 = (n: number): number => Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
++
++/** epoch ms -> "YYYY-MM-DD" in EAT. */
++export function eatDateIso(ms: number): string {
++  return new Date(ms + EAT_OFFSET_MS).toISOString().slice(0, 10);
++}
++/** epoch ms -> "YYYY-MM" in EAT. */
++export function eatMonthKey(ms: number): string {
++  return eatDateIso(ms).slice(0, 7);
++}
++
++/**
++ * Best-effort normalisation of the date shapes found in mychama1 documents
++ * ("YYYY-MM-DD", ISO datetimes, epoch ms, Firestore Timestamps) to "YYYY-MM-DD".
++ * Returns null when it can't be read — never guesses.
++ */
++export function toIsoDate(v: unknown): string | null {
++  if (v === null || v === undefined || v === "") return null;
++  if (typeof v === "string") {
++    const m = /^(\d{4}-\d{2}-\d{2})/.exec(v.trim());
++    return m ? m[1] : null;
++  }
++  if (typeof v === "number" && Number.isFinite(v) && v > 0) return eatDateIso(v);
++  const ts = v as { toMillis?: () => number } | null;
++  if (ts && typeof ts.toMillis === "function") return eatDateIso(ts.toMillis());
++  return null;
++}
+diff --git a/functions/src/mychama/sync/identity.ts b/functions/src/mychama/sync/identity.ts
+new file mode 100644
+index 0000000..598c9be
+--- /dev/null
++++ b/functions/src/mychama/sync/identity.ts
+@@ -0,0 +1,42 @@
++// Resolves "who is calling" to {uid, role, idNumber, verifiedPhone}. Reads ONLY the caller's own profile
++// document (ID number + role) — never rent, payment, booking or invoice collections.
++//
++// Profiles in the plot project today:
++//   tenants  -> tenants/{uid}           { idNumber, phone, ... }   (Firebase phone auth)
++//   landlords-> users/{agentId}         { phone, email, name, ... } (agentId = custom claim set by Track C,
++//                                        falling back to the uid, which equals users/{localId} for accounts
++//                                        made by createUserWithFirebaseAuth)
++// NOTE (reported to the integrator): users/{agentId} has NO idNumber field today. A landlord without one
++// resolves to idNumber "" and stays `never_linked` until Track C / the PMS migration provides it.
++import type { CallableRequest } from "firebase-functions/v2/https";
++import { normalizeKePhone, plotDb } from "../config";
++import type { PortalRole } from "../contract";
++
++export type AuthInfo = NonNullable<CallableRequest["auth"]>;
++export interface Caller { uid: string; role: PortalRole; idNumber: string; verifiedPhoneE164: string | null }
++
++const KE_MOBILE = /^\+254[17]\d{8}$/;
++
++export async function resolveCaller(auth: AuthInfo): Promise<Caller> {
++  const uid = auth.uid;
++  const token = auth.token as { phone_number?: unknown; role?: unknown; agentId?: unknown };
++
++  const phone = typeof token.phone_number === "string" ? normalizeKePhone(token.phone_number) : "";
++  const verifiedPhoneE164 = KE_MOBILE.test(phone) ? phone : null;
++
++  const db = plotDb();
++  const claimRole = token.role === "landlord" || token.role === "tenant" ? token.role : null;
++  const agentId = typeof token.agentId === "string" && token.agentId ? token.agentId : uid;
++
++  if (claimRole !== "tenant") {
++    const landlordSnap = await db.doc(`users/${agentId}`).get();
++    if (landlordSnap.exists && (claimRole === "landlord" || landlordSnap.data()?.firebaseAuthUid === uid || landlordSnap.id === uid)) {
++      return { uid, role: "landlord", idNumber: String(landlordSnap.data()?.idNumber || ""), verifiedPhoneE164 };
++    }
++  }
++  const tenantSnap = await db.doc(`tenants/${uid}`).get();
++  if (tenantSnap.exists) {
++    return { uid, role: "tenant", idNumber: String(tenantSnap.data()?.idNumber || ""), verifiedPhoneE164 };
++  }
++  return { uid, role: claimRole ?? "tenant", idNumber: "", verifiedPhoneE164 };
++}
+diff --git a/functions/src/mychama/sync/index.ts b/functions/src/mychama/sync/index.ts
+index deb3d0c..d68b3c2 100644
+--- a/functions/src/mychama/sync/index.ts
++++ b/functions/src/mychama/sync/index.ts
+@@ -1,12 +1,20 @@
+-// TRACK A — owns this directory. Stub from P0; replace the body, keep name + I/O types.
+-import { onCall } from "firebase-functions/v2/https";
++// TRACK A — mychamaSync callable (see service.ts for the orchestration).
++import { onCall, type CallableRequest } from "firebase-functions/v2/https";
+ import { REGION, MYCHAMA_ID_PEPPER } from "../config";
+-import { notImplemented } from "../errors";
+-import type { SyncRequest, SyncResponse } from "../contract";
++import { myChamaError } from "../errors";
++import type { SyncReason, SyncRequest, SyncResponse } from "../contract";
++import { resolveCaller } from "./identity";
++import { runSyncFor } from "./service";
++
++const REASONS: SyncReason[] = ["login", "reload", "manual"];
+ 
+ export const mychamaSync = onCall(
+   { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 120, secrets: [MYCHAMA_ID_PEPPER] },
+-  async (_req: { data: SyncRequest }): Promise<SyncResponse> => {
+-    throw notImplemented("mychamaSync");
++  async (req: CallableRequest<SyncRequest>): Promise<SyncResponse> => {
++    if (!req.auth) throw myChamaError("unauthenticated", "Sign in required.", "unauthenticated");
++    const reason = req.data?.reason;
++    if (!reason || !REASONS.includes(reason)) throw myChamaError("invalid_target", "reason must be login, reload or manual.", "invalid-argument");
++    const caller = await resolveCaller(req.auth);
++    return runSyncFor(caller, reason, { force: req.data?.force === true });
+   }
+ );
+diff --git a/functions/src/mychama/sync/read.ts b/functions/src/mychama/sync/read.ts
+new file mode 100644
+index 0000000..85d13c2
+--- /dev/null
++++ b/functions/src/mychama/sync/read.ts
+@@ -0,0 +1,77 @@
++// READ-ONLY access to mychama1 for one (chama, member). Per-section try/catch: a failing section comes
++// back as null (never 0) and is named in `failed`. Nothing here ever writes to mychama1.
++import type * as admin from "firebase-admin";
++import { mychamaDb } from "../config";
++import * as P from "../paths";
++import type { ChamaDataSection } from "../contract";
++import type { PotBundle, RawContribution, RawLoan, RawMgrArrear, RawMgrPayout, RawMgrRecord, RawPot } from "./compute";
++
++type Doc = admin.firestore.DocumentData;
++
++export interface ChamaMemberRead {
++  chama: { name: string; plan: string; status: string; settlementSplitCode: string };
++  member: { status: string; role: string; phoneNormalized: string };
++  contributions: RawContribution[] | null;
++  loans: RawLoan[] | null;
++  pots: PotBundle[] | null;
++  failed: ChamaDataSection[];
++}
++
++/** Throws if the chama or member document itself cannot be read (that is a whole-chama failure). */
++export async function readChamaForMember(chamaId: string, memberId: string): Promise<ChamaMemberRead> {
++  const db = mychamaDb();
++  const [chamaSnap, memberSnap] = await Promise.all([db.doc(P.chama(chamaId)).get(), db.doc(P.member(chamaId, memberId)).get()]);
++  if (!chamaSnap.exists || !memberSnap.exists) throw new Error("chama or member document missing");
++  const c: Doc = chamaSnap.data() || {};
++  const m: Doc = memberSnap.data() || {};
++
++  const failed: ChamaDataSection[] = [];
++
++  const contributions = await section("contributions", failed, async () => {
++    const snap = await db.collection(P.contributions(chamaId)).where("memberId", "==", memberId).get();
++    return snap.docs.map((d) => ({ id: d.id, ...(d.data() as Doc) }) as RawContribution);
++  });
++
++  const loans = await section("loans", failed, async () => {
++    const snap = await db.collection(P.loans(chamaId)).where("memberId", "==", memberId).get();
++    return snap.docs.map((d) => ({ id: d.id, ...(d.data() as Doc) }) as RawLoan);
++  });
++
++  const pots = await section("mgr", failed, async () => {
++    // array-contains alone needs no composite index; status is filtered in code.
++    const potSnap = await db.collection(P.mgrPots(chamaId)).where("memberIds", "array-contains", memberId).get();
++    const bundles: PotBundle[] = [];
++    for (const pd of potSnap.docs) {
++      const pot = { id: pd.id, ...(pd.data() as Doc) } as RawPot;
++      if (pot.status !== "active") continue;
++      const [recs, pays, arrs] = await Promise.all([
++        db.collection(P.mgrRecords(chamaId, pd.id)).where("memberId", "==", memberId).get(),
++        db.collection(P.mgrPayouts(chamaId, pd.id)).where("memberId", "==", memberId).get(),
++        db.collection(P.mgrArrears(chamaId, pd.id)).where("memberId", "==", memberId).get(),
++      ]);
++      bundles.push({
++        pot,
++        records: recs.docs.map((d) => d.data() as RawMgrRecord),
++        payouts: pays.docs.map((d) => d.data() as RawMgrPayout),
++        arrears: arrs.docs.map((d) => ({ id: d.id, ...(d.data() as Doc) }) as RawMgrArrear),
++      });
++    }
++    return bundles;
++  });
++
++  return {
++    chama: { name: String(c.name || ""), plan: String(c.plan || "free"), status: String(c.status || "active"), settlementSplitCode: String(c.settlementSplitCode || "") },
++    member: { status: String(m.status || ""), role: String(m.role || "member"), phoneNormalized: String(m.phoneNormalized || "") },
++    contributions, loans, pots, failed,
++  };
++}
++
++async function section<T>(name: ChamaDataSection, failed: ChamaDataSection[], fn: () => Promise<T>): Promise<T | null> {
++  try {
++    return await fn();
++  } catch (e) {
++    failed.push(name);
++    console.error(`mychama sync: section ${name} failed:`, (e as Error)?.message || e);
++    return null;
++  }
++}
+diff --git a/functions/src/mychama/sync/service.ts b/functions/src/mychama/sync/service.ts
+new file mode 100644
+index 0000000..0b127a8
+--- /dev/null
++++ b/functions/src/mychama/sync/service.ts
+@@ -0,0 +1,132 @@
++// Sync orchestration: lease/cooldown gate -> link pass -> per-chama reads -> snapshot write.
++// Reads mychama1, writes ONLY plot docs (chamaSnapshots/{uid}, chamaSyncState/{uid}, chamaLinks/*).
++import {
++  MYCHAMA_LIMITS, MYCHAMA_PATHS,
++  type ChamaSnapshotChama, type ChamaSnapshotDoc, type ConnectorStatus, type MyChamaErrorCode,
++  type ChamaLinkDoc, type SyncReason, type SyncResponse,
++} from "../contract";
++import { plotDb } from "../config";
++import { myChamaError } from "../errors";
++import { runLinkPass } from "../link/engine";
++import { buildContributions, buildLoans, buildMgr, combineTotals } from "./compute";
++import { eatDateIso, eatMonthKey } from "./dates";
++import type { Caller } from "./identity";
++import { readChamaForMember } from "./read";
++
++const L = MYCHAMA_LIMITS;
++const LEASE_MS = 90_000;
++
++export interface SyncOptions { force?: boolean; bypassCooldown?: boolean }
++
++export async function runSyncFor(caller: Caller, reason: SyncReason, opts: SyncOptions = {}): Promise<SyncResponse> {
++  const uid = caller.uid;
++  const now = Date.now();
++  const gate = await acquire(uid, reason, opts, now);
++
++  if (!gate.go) {
++    const snap = await readSnapshot(uid);
++    return { status: snap?.status ?? "never_linked", throttled: true, lastSyncedAt: snap?.lastSyncedAt ?? null, nextAllowedAt: gate.nextAllowedAt };
++  }
++
++  try {
++    try {
++      const snapshot = await buildSnapshot(caller, now);
++      await plotDb().doc(MYCHAMA_PATHS.snapshot(uid)).set(snapshot);
++      await plotDb().doc(MYCHAMA_PATHS.syncState(uid)).set({ lastSyncedAt: now }, { merge: true });
++      return { status: snapshot.status, throttled: false, lastSyncedAt: now, nextAllowedAt: now + L.SYNC_COOLDOWN_SECONDS * 1000 };
++    } catch (e) {
++      // Failed sync: NEVER wipe the last good data — only status / error / attempt time change.
++      console.error("mychama sync failed:", (e as Error)?.message || e);
++      const prev = await readSnapshot(uid).catch(() => null);
++      const code: MyChamaErrorCode = "upstream_failure";
++      const failure: ChamaSnapshotDoc = {
++        version: 1, uid,
++        status: prev?.lastSyncedAt ? "stale" : "unavailable",
++        lastSyncedAt: prev?.lastSyncedAt ?? null, lastAttemptAt: now, lastError: { code, at: now },
++        chamas: prev?.chamas ?? [], pending: prev?.pending ?? [],
++      };
++      try {
++        await plotDb().doc(MYCHAMA_PATHS.snapshot(uid)).set(failure);
++      } catch {
++        throw myChamaError("internal", "Could not record sync state.", "internal");
++      }
++      return { status: failure.status, throttled: false, lastSyncedAt: failure.lastSyncedAt, nextAllowedAt: now + L.SYNC_MANUAL_COOLDOWN_SECONDS * 1000 };
++    }
++  } finally {
++    await plotDb().doc(MYCHAMA_PATHS.syncState(uid)).set({ leaseUntil: 0 }, { merge: true }).catch(() => undefined);
++  }
++}
++
++// ─────────────────────────────── gate ───────────────────────────────
++async function acquire(uid: string, reason: SyncReason, opts: SyncOptions, now: number): Promise<{ go: boolean; nextAllowedAt: number | null }> {
++  const db = plotDb();
++  const stateRef = db.doc(MYCHAMA_PATHS.syncState(uid));
++  const snapRef = db.doc(MYCHAMA_PATHS.snapshot(uid));
++
++  return db.runTransaction(async (tx) => {
++    const [st, sn] = await Promise.all([tx.get(stateRef), tx.get(snapRef)]);
++    const s = st.data() || {};
++    const leaseUntil = Number(s.leaseUntil || 0);
++    if (leaseUntil > now) return { go: false, nextAllowedAt: leaseUntil };          // another sync is running
++
++    const first = !sn.exists;
++    const forced = opts.bypassCooldown === true || (reason === "login" && first);
++    const cooldownSec = reason === "manual" || opts.force ? L.SYNC_MANUAL_COOLDOWN_SECONDS : L.SYNC_COOLDOWN_SECONDS;
++    const last = Number(s.lastAttemptAt || 0);
++    if (!forced && now - last < cooldownSec * 1000) return { go: false, nextAllowedAt: last + cooldownSec * 1000 };
++
++    tx.set(stateRef, { lastAttemptAt: now, leaseUntil: now + LEASE_MS }, { merge: true });
++    return { go: true, nextAllowedAt: null };
++  });
++}
++
++async function readSnapshot(uid: string): Promise<ChamaSnapshotDoc | null> {
++  const s = await plotDb().doc(MYCHAMA_PATHS.snapshot(uid)).get();
++  return s.exists ? (s.data() as ChamaSnapshotDoc) : null;
++}
++
++// ───────────────────────────── snapshot ─────────────────────────────
++async function buildSnapshot(caller: Caller, now: number): Promise<ChamaSnapshotDoc> {
++  const pass = await runLinkPass(caller);            // may throw (mychama1 unreachable / index missing) => whole-sync failure
++  const t = { today: eatDateIso(now), month: eatMonthKey(now) };
++
++  const results = await Promise.all(pass.active.map((l) => buildChama(l, t, now)));
++  if (results.length > 0 && results.every((r) => r.failed)) throw new Error("every linked chama was unreadable");
++
++  const chamas = results.map((r) => r.chama).sort((a, b) => a.chamaName.localeCompare(b.chamaName));
++  const status: ConnectorStatus = pass.active.length > 0 ? "ok" : pass.needsReverify.length > 0 ? "needs_reverify" : "never_linked";
++  return {
++    version: 1, uid: caller.uid, status, lastSyncedAt: now, lastAttemptAt: now, lastError: null, chamas,
++    pending: pass.pending.map((p) => ({ pendingId: p.pendingId, maskedPhone: p.maskedPhone, chamaCount: p.chamaCount })),
++  };
++}
++
++async function buildChama(link: ChamaLinkDoc, t: { today: string; month: string }, now: number): Promise<{ chama: ChamaSnapshotChama; failed: boolean }> {
++  try {
++    const r = await readChamaForMember(link.chamaId, link.memberId);
++    const c = r.contributions ? buildContributions(r.contributions, t) : null;
++    const l = r.loans ? buildLoans(r.loans, t) : null;
++    const m = r.pots ? buildMgr(r.pots, link.memberId) : null;
++    const dataStatus = r.failed.length === 0 ? "ok" : r.failed.length >= 3 ? "unavailable" : "partial";
++    return {
++      failed: dataStatus === "unavailable",
++      chama: {
++        chamaId: link.chamaId, chamaName: r.chama.name || link.chamaName, memberId: link.memberId,
++        onlineCollectionEnabled: r.chama.plan !== "free" && r.chama.status === "active" && r.chama.settlementSplitCode !== "",
++        dataStatus, missing: r.failed,
++        contributions: c?.snap ?? null, loans: l?.snap ?? null, mgr: m?.snap ?? null,
++        totals: combineTotals([c, l, m], m?.snap ?? null, t), asOf: now,
++      },
++    };
++  } catch (e) {
++    console.error(`mychama sync: chama ${link.chamaId} unreadable:`, (e as Error)?.message || e);
++    return {
++      failed: true,
++      chama: {
++        chamaId: link.chamaId, chamaName: link.chamaName, memberId: link.memberId, onlineCollectionEnabled: false,
++        dataStatus: "unavailable", missing: ["contributions", "loans", "mgr"],
++        contributions: null, loans: null, mgr: null, totals: null, asOf: now,
++      },
++    };
++  }
++}
+diff --git a/functions/test/mychama-track-a.check.js b/functions/test/mychama-track-a.check.js
+new file mode 100644
+index 0000000..b6bf92b
+--- /dev/null
++++ b/functions/test/mychama-track-a.check.js
+@@ -0,0 +1,292 @@
++/* Track A checks — pure logic + an end-to-end flow against an in-memory fake Firestore.
++ * Run:  cd functions && npm run build && node test/mychama-track-a.check.js   (exit 1 on failure) */
++process.env.MYCHAMA_ID_PEPPER = "test-pepper-123";
++const assert = require("assert");
++const path = require("path");
++const lib = (p) => require(path.join(__dirname, "..", "lib", "mychama", p));
++
++let passed = 0;
++const ok = (name, fn) => Promise.resolve().then(fn).then(() => { passed++; console.log("  ✓", name); }, (e) => { console.error("  ✗", name, "\n", e); process.exitCode = 1; });
++
++// ───────────── fake Firestore ─────────────
++function makeDb() {
++  const store = new Map();
++  const segs = (p) => p.split("/");
++  const colRef = (p) => ({
++    path: p, id: segs(p).pop(),
++    get parent() { const s = segs(p); return s.length > 1 ? docRef(s.slice(0, -1).join("/")) : null; },
++    where: (f, op, v) => query(() => [...store.keys()].filter((k) => { const s = segs(k); return s.length === segs(p).length + 1 && k.startsWith(p + "/"); }), [[f, op, v]]),
++    get: () => query(() => [...store.keys()].filter((k) => segs(k).length === segs(p).length + 1 && k.startsWith(p + "/")), []).get(),
++  });
++  const snap = (k) => ({ id: segs(k).pop(), exists: store.has(k), data: () => (store.has(k) ? JSON.parse(JSON.stringify(store.get(k))) : undefined), ref: docRef(k) });
++  const docRef = (p) => ({
++    path: p, id: segs(p).pop(),
++    get parent() { return colRef(segs(p).slice(0, -1).join("/")); },
++    get: async () => snap(p),
++    set: async (d, o) => { store.set(p, o && o.merge ? { ...(store.get(p) || {}), ...d } : { ...d }); },
++    update: async (d) => { if (!store.has(p)) throw new Error("NOT_FOUND " + p); store.set(p, { ...store.get(p), ...d }); },
++    delete: async () => { store.delete(p); },
++  });
++  const matches = (data, [f, op, v]) => (op === "==" ? data[f] === v : op === "array-contains" ? Array.isArray(data[f]) && data[f].includes(v) : false);
++  function query(keysFn, wheres, lim) {
++    const q = {
++      where: (f, op, v) => query(keysFn, [...wheres, [f, op, v]], lim),
++      limit: (n) => query(keysFn, wheres, n),
++      get: async () => {
++        let ks = keysFn().filter((k) => wheres.every((w) => matches(store.get(k), w)));
++        if (lim) ks = ks.slice(0, lim);
++        return { docs: ks.map(snap), empty: ks.length === 0, size: ks.length };
++      },
++    };
++    return q;
++  }
++  const db = {
++    store, doc: docRef, collection: colRef,
++    collectionGroup: (name) => query(() => [...store.keys()].filter((k) => { const s = segs(k); return s.length % 2 === 0 && s[s.length - 2] === name; }), []),
++    getAll: async (...refs) => refs.map((r) => snap(r.path)),
++    batch: () => { const ops = []; return { set: (r, d) => ops.push(() => r.set(d)), update: (r, d) => ops.push(() => r.update(d)), commit: async () => { for (const o of ops) await o(); } }; },
++    runTransaction: async (fn) => fn({
++      get: async (r) => r.get(), set: (r, d, o) => { r.set(d, o); }, update: (r, d) => { r.update(d); }, delete: (r) => { r.delete(); },
++    }),
++  };
++  return db;
++}
++
++(async () => {
++  console.log("pure: compute");
++  const C = lib("sync/compute");
++  const t = { today: "2026-10-09", month: "2026-10" };
++
++  await ok("contributions: overdue vs this-month, paid skipped, cap & outstanding", () => {
++    const r = C.buildContributions([
++      { id: "a", periodKey: "2026-08", dueDate: "2026-08-05", amount: 1000, paidAmount: 0, status: "overdue" },
++      { id: "b", periodKey: "2026-09", dueDate: "2026-09-05", amount: 1000, paidAmount: 400, status: "partial" },
++      { id: "c", periodKey: "2026-10", dueDate: "2026-10-20", amount: 1000, paidAmount: 0, status: "pending" },
++      { id: "d", periodKey: "2026-07", dueDate: "2026-07-05", amount: 1000, paidAmount: 1000, status: "paid" },
++    ], t);
++    assert.strictEqual(r.snap.items.length, 3);
++    assert.strictEqual(r.overdue, 1600);          // 1000 (Aug) + 600 (Sep partial)
++    assert.strictEqual(r.dueThisMonth, 1000);
++    assert.strictEqual(r.snap.outstanding, 2600);
++    assert.deepStrictEqual(r.snap.items.map((i) => i.contributionId), ["a", "b", "c"]);
++  });
++
++  await ok("loans: outstanding, next instalment, overdue/this-month split; completed ignored", () => {
++    const r = C.buildLoans([
++      { id: "L1", status: "active", principal: 5000, schedule: [
++        { n: 1, due: 1000, paid: true, paidAmount: 1000, dueDate: "2026-08-10" },
++        { n: 2, due: 1000, paid: false, paidAmount: 250, dueDate: "2026-09-10" },
++        { n: 3, due: 1000, paid: false, paidAmount: 0, dueDate: "2026-10-10" },
++        { n: 4, due: 1000, paid: false, paidAmount: 0, dueDate: "2026-11-10" } ] },
++      { id: "L2", status: "completed", principal: 1000, schedule: [] },
++    ], t);
++    assert.strictEqual(r.snap.items.length, 1);
++    assert.strictEqual(r.snap.items[0].outstanding, 2750);
++    assert.strictEqual(r.snap.items[0].installmentsRemaining, 3);
++    assert.deepStrictEqual(r.snap.items[0].nextInstallment, { installmentNo: 2, due: 750, dueDate: "2026-09-10" });
++    assert.strictEqual(r.overdue, 750);
++    assert.strictEqual(r.dueThisMonth, 1000);
++  });
++
++  await ok("mgr: due now, partial, arrears, won + scheduled (equal split) and short round => null amount", () => {
++    const pot = { id: "P1", name: "Pot", amount: 500, frequency: "weekly", status: "active", period: 3, periodsPerRound: 1, recipientsPerRound: 2, memberIds: ["m1", "m2", "m3", "m4"], queue: ["m3", "m1", "m4"], drawDone: true, cycleNumber: 1 };
++    const b = { pot, records: [{ period: 3, memberId: "m1", status: "partial", amount: 200 }], payouts: [{ memberId: "m1", round: 1, amount: 1000, date: "2026-09-20" }, { memberId: "m2", round: 1, amount: 1000, date: "2026-09-20" }], arrears: [{ id: "A1", memberId: "m1", amount: 300, status: "open" }, { id: "A2", memberId: "m1", amount: 99, status: "settled" }] };
++    const r = C.buildMgr([b], "m1");
++    const p = r.snap.pots[0];
++    assert.strictEqual(p.dueNow, 300); assert.strictEqual(p.currentPeriodPaid, false);
++    assert.strictEqual(p.arrearsOpen, 300); assert.strictEqual(p.arrearId, "A1");
++    const won = p.wins.find((w) => w.kind === "won"), sch = p.wins.find((w) => w.kind === "scheduled");
++    assert.strictEqual(won.amount, 1000); assert.strictEqual(won.expectedDate, "2026-09-20");
++    assert.strictEqual(sch.queuePosition, 2); assert.strictEqual(sch.amount, 1000);   // 500*4*1 / 2
++    assert.strictEqual(sch.round, 2 + 0);                                              // 2 payouts / 2 per round => round 2, idx 1 => same round
++    assert.strictEqual(sch.expectedDate, null);
++    assert.strictEqual(r.overdue, 300); assert.strictEqual(r.dueThisMonth, 300);
++    const short = C.buildMgr([{ ...b, pot: { ...pot, queue: ["m1"] } }], "m1").snap.pots[0].wins.find((w) => w.kind === "scheduled");
++    assert.strictEqual(short.amount, null);
++    const notIn = C.buildMgr([b], "zzz"); assert.strictEqual(notIn.snap.pots.length, 0);
++  });
++
++  await ok("totals: null only when every section is unavailable", () => {
++    assert.strictEqual(C.combineTotals([null, null, null], null, t), null);
++    assert.deepStrictEqual(C.combineTotals([{ overdue: 5, dueThisMonth: 7 }, null, null], null, t), { overdue: 5, dueThisMonth: 7, expectedInflowThisMonth: 0 });
++  });
++
++  console.log("pure: link actions");
++  const A = lib("link/actions");
++  const cand = (chamaId, memberId, phoneKey) => ({ chamaId, memberId, phoneKey, phoneE164: "+2547" + phoneKey });
++  await ok("silent link only on verified-phone match; others pending grouped by phone", () => {
++    const r = A.computeLinkActions({ candidates: [cand("c1", "m1", "A"), cand("c2", "m2", "B"), cand("c3", "m3", "B")], existing: [], verifiedPhoneKey: "A", provenSmsPhoneKeys: [] });
++    assert.deepStrictEqual(r.activate.map((a) => [a.linkId, a.via]), [["c1__m1", "firebase_phone"]]);
++    assert.strictEqual(r.pending.length, 1); assert.strictEqual(r.pending[0].candidates.length, 2);
++  });
++  await ok("per-phone grant: an SMS-proven phone links only chamas on that phone", () => {
++    const r = A.computeLinkActions({ candidates: [cand("c2", "m2", "B"), cand("c4", "m4", "C")], existing: [], verifiedPhoneKey: null, provenSmsPhoneKeys: ["B"] });
++    assert.deepStrictEqual(r.activate.map((a) => a.linkId), ["c2__m2"]);
++    assert.deepStrictEqual(r.pending.map((p) => p.phoneKey), ["C"]);
++  });
++  await ok("phone change => needs_reverify + pending; member gone => revoked; phone back => restored", () => {
++    const ex = [{ linkId: "c1__m1", state: "active", boundPhoneKey: "A", verifiedVia: "sms_code" }, { linkId: "c9__m9", state: "active", boundPhoneKey: "Z", verifiedVia: "sms_code" }];
++    const r = A.computeLinkActions({ candidates: [cand("c1", "m1", "A2")], existing: ex, verifiedPhoneKey: null, provenSmsPhoneKeys: [] });
++    assert.deepStrictEqual(r.reverify, ["c1__m1"]); assert.deepStrictEqual(r.revoke, ["c9__m9"]); assert.strictEqual(r.pending.length, 1);
++    const back = A.computeLinkActions({ candidates: [cand("c1", "m1", "A")], existing: [{ linkId: "c1__m1", state: "needs_reverify", boundPhoneKey: "A", verifiedVia: "sms_code" }], verifiedPhoneKey: null, provenSmsPhoneKeys: [] });
++    assert.deepStrictEqual(back.activate.map((a) => [a.linkId, a.via]), [["c1__m1", "sms_code"]]);
++  });
++
++  // ───────────── end-to-end with fakes ─────────────
++  console.log("end-to-end (fake Firestore)");
++  const cfg = lib("config");
++  const smsMod = lib("sms");
++  const plot = makeDb(), mc = makeDb();
++  cfg.plotDb = () => plot; cfg.mychamaDb = () => mc;
++  const sent = [];
++  smsMod.sendMyChamaSms = async (phone, msg) => { sent.push({ phone, msg }); };
++
++  const idKey = cfg.computeIdKey("12345678");
++  const member = (name, phone, extra = {}) => ({ name, phoneNormalized: phone, status: "active", role: "member", idKey, ...extra });
++  const put = (db, p, d) => db.store.set(p, d);
++  put(plot, "tenants/u1", { idNumber: "12 345-678", phone: "0712345678" });
++  // chama c1: phone matches the verified Firebase phone
++  put(mc, "chamas/c1", { name: "Alpha", plan: "growth", status: "active", settlementSplitCode: "SPL_1" });
++  put(mc, "chamas/c1/members/m1", member("T", "+254712345678"));
++  put(mc, "chamas/c1/contributions/k1", { memberId: "m1", periodKey: "2026-10", dueDate: "2026-10-25", amount: 1000, paidAmount: 0, status: "pending" });
++  put(mc, "chamas/c1/loans/l1", { memberId: "m1", status: "active", principal: 3000, schedule: [{ n: 1, due: 1100, paid: false, paidAmount: 0, dueDate: "2026-10-15" }] });
++  put(mc, "chamas/c1/mgrPots/p1", { name: "Pot", amount: 500, frequency: "weekly", status: "active", period: 1, periodsPerRound: 1, recipientsPerRound: 1, memberIds: ["m1"], queue: ["m1"], drawDone: true, cycleNumber: 1 });
++  // chama c2: same person, DIFFERENT registered phone
++  put(mc, "chamas/c2", { name: "Beta", plan: "starter", status: "active", settlementSplitCode: "" });
++  put(mc, "chamas/c2/members/m2", member("T", "+254722000111"));
++  // chama c3: two members share the ID => ambiguous, never links
++  put(mc, "chamas/c3", { name: "Gamma", plan: "basic", status: "active", settlementSplitCode: "SPL_3" });
++  put(mc, "chamas/c3/members/m3a", member("X", "+254733000111")); put(mc, "chamas/c3/members/m3b", member("Y", "+254733000222"));
++  // removed member in c4 never links
++  put(mc, "chamas/c4", { name: "Delta", plan: "basic", status: "active" });
++  put(mc, "chamas/c4/members/m4", member("T", "+254712345678", { status: "removed" }));
++
++  const caller = { uid: "u1", role: "tenant", idNumber: "12 345-678", verifiedPhoneE164: "+254712345678" };
++  const S = lib("sync/service");
++  const ID = lib("sync/identity");
++  const Ch = lib("link/challenge");
++  const Eng = lib("link/engine");
++  let pendingId, challengeId, code;
++
++  await ok("first login: forced sync silently links c1 only; c2 pending; c3/c4 excluded", async () => {
++    const r = await S.runSyncFor(caller, "login");
++    assert.strictEqual(r.throttled, false); assert.strictEqual(r.status, "ok");
++    const snap = plot.store.get("chamaSnapshots/u1");
++    assert.deepStrictEqual(snap.chamas.map((c) => c.chamaId), ["c1"]);
++    const c1 = snap.chamas[0];
++    assert.strictEqual(c1.dataStatus, "ok"); assert.strictEqual(c1.onlineCollectionEnabled, true);
++    assert.strictEqual(c1.contributions.outstanding, 1000); assert.strictEqual(c1.loans.outstanding, 1100);
++    assert.strictEqual(c1.mgr.pots[0].dueNow, 500);
++    assert.strictEqual(snap.pending.length, 1); assert.strictEqual(snap.pending[0].chamaCount, 1);
++    assert.ok(/^07•• ••• 111$/.test(snap.pending[0].maskedPhone), snap.pending[0].maskedPhone);
++    assert.ok(!JSON.stringify(snap).includes("12345678") && !JSON.stringify(snap).includes("+2547"), "no ID or full phone in snapshot");
++    assert.strictEqual(plot.store.get("chamaLinks/u1/links/c1__m1").verifiedVia, "firebase_phone");
++    pendingId = snap.pending[0].pendingId;
++  });
++
++  await ok("reload inside the cooldown is throttled and does not touch mychama1", async () => {
++    const before = JSON.stringify(plot.store.get("chamaSnapshots/u1"));
++    const r = await S.runSyncFor(caller, "reload");
++    assert.strictEqual(r.throttled, true); assert.ok(r.nextAllowedAt > Date.now());
++    assert.strictEqual(JSON.stringify(plot.store.get("chamaSnapshots/u1")), before);
++  });
++
++  await ok("request code: SMS goes to the MyChama-registered phone; resend cooldown enforced", async () => {
++    const r = await Ch.requestCode(caller, pendingId);
++    assert.strictEqual(sent.length, 1); assert.strictEqual(sent[0].phone, "+254722000111");
++    code = /(\d{6})/.exec(sent[0].msg)[1];
++    challengeId = r.challengeId;
++    const stored = JSON.stringify([...plot.store.entries()].filter(([k]) => k.startsWith("chamaLinkChallenges/")));
++    assert.ok(!stored.includes(code), "plain code must never be stored");
++    await assert.rejects(() => Ch.requestCode(caller, pendingId), (e) => e.details && e.details.code === "rate_limited");
++    await assert.rejects(() => Ch.requestCode(caller, "bogus"), (e) => e.details && e.details.code === "invalid_target");
++  });
++
++  await ok("wrong code decrements attempts; another user's challenge is rejected", async () => {
++    await assert.rejects(() => Ch.verifyCode("u1", challengeId, code === "000000" ? "111111" : "000000"), (e) => e.details.code === "code_invalid" && e.details.remainingAttempts === 4);
++    await assert.rejects(() => Ch.verifyCode("someone-else", challengeId, code), (e) => e.details.code === "code_invalid");
++  });
++
++  await ok("attempt lockout after CODE_MAX_ATTEMPTS", async () => {
++    const wrong = code === "000000" ? "111111" : "000000";
++    for (let i = 0; i < 4; i++) await assert.rejects(() => Ch.verifyCode("u1", challengeId, wrong));
++    await assert.rejects(() => Ch.verifyCode("u1", challengeId, code), (e) => e.details.code === "code_attempts_exceeded");
++    // fresh challenge for the rest of the flow (reset the resend cooldown the way real time would)
++    const ch = plot.store.get("chamaLinkChallenges/" + challengeId); ch.lastSentAt -= 120000; plot.store.set("chamaLinkChallenges/" + challengeId, ch);
++    const r = await Ch.requestCode(caller, pendingId);
++    challengeId = r.challengeId; code = /(\d{6})/.exec(sent[sent.length - 1].msg)[1];
++  });
++
++  await ok("correct code links ONLY the chamas on that phone and consumes the challenge", async () => {
++    const phoneKey = await Ch.verifyCode("u1", challengeId, code);
++    assert.ok(!plot.store.has("chamaLinkChallenges/" + challengeId));
++    const pass = await Eng.runLinkPass(caller, [phoneKey]);
++    assert.strictEqual(pass.activatedForPhoneKeys[phoneKey], 1);
++    assert.strictEqual(plot.store.get("chamaLinks/u1/links/c2__m2").verifiedVia, "sms_code");
++    assert.ok(!plot.store.has("chamaLinks/u1/links/c3__m3a"));
++    await assert.rejects(() => Ch.verifyCode("u1", challengeId, code), (e) => e.details.code === "code_invalid");   // single use
++  });
++
++  await ok("post-link sync (bypass) shows both chamas, nothing pending", async () => {
++    const r = await S.runSyncFor(caller, "manual", { bypassCooldown: true });
++    assert.strictEqual(r.status, "ok");
++    const snap = plot.store.get("chamaSnapshots/u1");
++    assert.deepStrictEqual(snap.chamas.map((c) => c.chamaId), ["c1", "c2"]);
++    assert.strictEqual(snap.chamas[1].onlineCollectionEnabled, false);   // no split code
++    assert.strictEqual(snap.pending.length, 0);
++  });
++
++  await ok("mychama1 down: last good data is kept, status becomes stale, lastError set", async () => {
++    const good = JSON.parse(JSON.stringify(plot.store.get("chamaSnapshots/u1")));
++    cfg.mychamaDb = () => { throw new Error("mychama1 unavailable"); };
++    const r = await S.runSyncFor(caller, "manual", { bypassCooldown: true });
++    assert.strictEqual(r.status, "stale");
++    const snap = plot.store.get("chamaSnapshots/u1");
++    assert.deepStrictEqual(snap.chamas, good.chamas);
++    assert.strictEqual(snap.lastSyncedAt, good.lastSyncedAt); assert.strictEqual(snap.lastError.code, "upstream_failure");
++    assert.ok(plot.store.get("chamaSyncState/u1").leaseUntil === 0, "lease released");
++    cfg.mychamaDb = () => mc;
++  });
++
++  await ok("one section failing yields partial data with null (not 0) and missing[]", async () => {
++    const realCol = mc.collection;
++    mc.collection = (p) => (p.endsWith("/loans") ? { where: () => ({ get: async () => { throw new Error("boom"); } }) } : realCol(p));
++    await S.runSyncFor(caller, "manual", { bypassCooldown: true });
++    mc.collection = realCol;
++    const c1 = plot.store.get("chamaSnapshots/u1").chamas.find((c) => c.chamaId === "c1");
++    assert.strictEqual(c1.dataStatus, "partial"); assert.deepStrictEqual(c1.missing, ["loans"]); assert.strictEqual(c1.loans, null);
++    assert.ok(c1.contributions && c1.mgr);
++  });
++
++  await ok("member phone changes in MyChama => link needs_reverify, chama data hidden, shows pending", async () => {
++    put(mc, "chamas/c2/members/m2", member("T", "+254799888777"));
++    const r = await S.runSyncFor(caller, "manual", { bypassCooldown: true });
++    const snap = plot.store.get("chamaSnapshots/u1");
++    assert.strictEqual(plot.store.get("chamaLinks/u1/links/c2__m2").state, "needs_reverify");
++    assert.deepStrictEqual(snap.chamas.map((c) => c.chamaId), ["c1"]);
++    assert.strictEqual(snap.pending.length, 1); assert.strictEqual(r.status, "ok");
++  });
++
++  await ok("caller without an ID number: never_linked, no matching attempted", async () => {
++    const r = await S.runSyncFor({ uid: "u2", role: "landlord", idNumber: "", verifiedPhoneE164: null }, "login");
++    assert.strictEqual(r.status, "never_linked");
++    const snap = plot.store.get("chamaSnapshots/u2");
++    assert.deepStrictEqual([snap.chamas, snap.pending], [[], []]);
++  });
++
++  await ok("identity: tenant doc, landlord users doc (claim + uid fallback), unknown user", async () => {
++    put(plot, "users/L1", { firebaseAuthUid: "L1", phone: "+254700000001", idNumber: "99887766" });
++    put(plot, "tenants/T9", { idNumber: "55443322" });
++    const tok = (o) => ({ uid: o.uid, token: o.token || {} });
++    const t9 = await ID.resolveCaller(tok({ uid: "T9", token: { phone_number: "+254711111111" } }));
++    assert.deepStrictEqual([t9.role, t9.idNumber, t9.verifiedPhoneE164], ["tenant", "55443322", "+254711111111"]);
++    const l1 = await ID.resolveCaller(tok({ uid: "L1" }));
++    assert.deepStrictEqual([l1.role, l1.idNumber, l1.verifiedPhoneE164], ["landlord", "99887766", null]);
++    const l2 = await ID.resolveCaller(tok({ uid: "newuid", token: { role: "landlord", agentId: "L1" } }));
++    assert.strictEqual(l2.role, "landlord");
++    const none = await ID.resolveCaller(tok({ uid: "ghost" }));
++    assert.strictEqual(none.idNumber, "");
++  });
++
++  console.log(process.exitCode ? "\nFAILED" : `\nAll ${passed} checks passed`);
++})();

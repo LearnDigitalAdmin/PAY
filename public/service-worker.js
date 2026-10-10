@@ -1,7 +1,7 @@
 // service-worker.js - PWA Service Worker
 
-const CACHE_NAME = 'cogvana-payments-v1';
-const RUNTIME_CACHE = 'cogvana-runtime-v1';
+const CACHE_NAME = 'samuhia-payments-v1';
+const RUNTIME_CACHE = 'samuhia-runtime-v1';
 
 // Assets to cache on install
 const PRECACHE_ASSETS = [

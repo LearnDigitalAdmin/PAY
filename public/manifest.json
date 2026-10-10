@@ -1,11 +1,11 @@
 {
-  "name": "Cogvana Payments",
-  "short_name": "Payments",
-  "description": "Cogvana Property Management Payment Portal - Secure rent collection and payment processing",
+  "name": "Samuhia Payments",
+  "short_name": "Samuhia Pay",
+  "description": "Samuhia Payments — secure rent, bills and MyChama payments",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#4f46e5",
+  "background_color": "#FBF9F4",
+  "theme_color": "#96600F",
   "orientation": "portrait",
   "scope": "/",
   "icons": [

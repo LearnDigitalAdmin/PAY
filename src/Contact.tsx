@@ -122,7 +122,7 @@ const Contact: React.FC = () => {
             <div className="mt-8 pt-8 border-t border-gray-200">
               <h2 className="text-lg font-bold text-gray-900 mb-4">About Our Payment Service</h2>
               <p className="text-gray-700 leading-relaxed mb-4">
-                Cogvana Payments is integrated with your Property Management System to provide seamless rent collection and payment processing. We support M-PESA and Airtel Money for convenient mobile money transactions.
+                Samuhia Payments is integrated with your Property Management System to provide seamless rent collection and payment processing. We support M-PESA and Airtel Money for convenient mobile money transactions.
               </p>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
                 <div className="text-center p-4 bg-indigo-50 rounded-lg">
@@ -143,7 +143,7 @@ const Contact: React.FC = () => {
         </div>
 
         <div className="mt-8 text-center text-sm text-gray-600">
-          <p>© 2024 Cogvana. All rights reserved.</p>
+          <p>© 2026 Samuhia Payments. All rights reserved.</p>
           <div className="mt-2 space-x-4">
             <a href="#" className="hover:text-indigo-600 transition-colors">Privacy Policy</a>
             <span>•</span>
