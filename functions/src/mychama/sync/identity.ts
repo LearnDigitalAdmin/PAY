@@ -29,9 +29,11 @@ export function looksLikeIdNumber(raw: string): boolean {
 
 export async function resolveCaller(auth: AuthInfo): Promise<Caller> {
   const uid = auth.uid;
-  const token = auth.token as { phone_number?: unknown; role?: unknown; agentId?: unknown };
+  const token = auth.token as { phone_number?: unknown; otp_phone?: unknown; role?: unknown; agentId?: unknown };
 
-  const phone = typeof token.phone_number === "string" ? normalizeKePhone(token.phone_number) : "";
+  // Verified phone: legacy Firebase phone auth (`phone_number`) or the HostPinnacle OTP proof (`otp_phone`).
+  const rawPhone = typeof token.otp_phone === "string" ? token.otp_phone : token.phone_number;
+  const phone = typeof rawPhone === "string" ? normalizeKePhone(rawPhone) : "";
   const verifiedPhoneE164 = KE_MOBILE.test(phone) ? phone : null;
 
   const db = plotDb();

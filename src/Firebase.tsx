@@ -2,8 +2,7 @@
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
-  RecaptchaVerifier, 
-  signInWithPhoneNumber,
+  signInWithCustomToken,
   signOut,
   onAuthStateChanged,
   type User as FirebaseUser,
@@ -126,33 +125,28 @@ export interface Payment {
 }
 
 // Auth Service
+// Phone sign-in is OTP-over-SMS sent by OUR HostPinnacle account (Cloud Functions sendLoginOtp / verifyLoginOtp),
+// then signInWithCustomToken. No Google phone auth, no reCAPTCHA. The object returned by sendVerificationCode()
+// keeps the old ConfirmationResult shape (`confirm(code)`) so callers did not have to change.
 export class AuthService {
-  private static recaptchaVerifier: RecaptchaVerifier | null = null;
+  /** Kept for compatibility with existing callers; OTP login needs no reCAPTCHA. */
+  static initRecaptcha(_containerId: string): void {}
 
-  static initRecaptcha(containerId: string): void {
-    if (!this.recaptchaVerifier) {
-      this.recaptchaVerifier = new RecaptchaVerifier(auth, containerId, {
-        size: 'invisible',
-        callback: () => {
-          console.log('reCAPTCHA verified');
-        }
-      });
-    }
-  }
-
-  static async sendVerificationCode(phoneNumber: string): Promise<any> {
+  static async sendVerificationCode(phoneNumber: string): Promise<{ confirm: (code: string) => Promise<{ user: FirebaseUser }> }> {
+    const phone = phoneNumber.startsWith('+') ? phoneNumber : `+${phoneNumber}`;
     try {
-      if (!this.recaptchaVerifier) {
-        throw new Error('reCAPTCHA not initialized');
-      }
-
-      const formattedPhone = phoneNumber.startsWith('+') ? phoneNumber : `+${phoneNumber}`;
-      const confirmationResult = await signInWithPhoneNumber(auth, formattedPhone, this.recaptchaVerifier);
-      return confirmationResult;
+      await httpsCallable(functions, 'sendLoginOtp')({ phone });
     } catch (error: any) {
       console.error('Error sending verification code:', error);
-      throw new Error(error.message || 'Failed to send verification code');
+      throw new Error(error?.message || 'Failed to send verification code');
     }
+    return {
+      confirm: async (code: string) => {
+        const res: any = await httpsCallable(functions, 'verifyLoginOtp')({ phone, code });
+        const cred = await signInWithCustomToken(auth, res.data.token);
+        return { user: cred.user };
+      }
+    };
   }
 
   static async verifyCode(confirmationResult: any, code: string): Promise<FirebaseUser> {
@@ -161,7 +155,8 @@ export class AuthService {
       return result.user;
     } catch (error: any) {
       console.error('Error verifying code:', error);
-      throw new Error('Invalid verification code');
+      // Surface the server's reason (wrong code / expired / too many attempts) instead of a blanket message.
+      throw new Error(error?.message && error.code !== 'internal' ? error.message : 'Invalid verification code');
     }
   }
 

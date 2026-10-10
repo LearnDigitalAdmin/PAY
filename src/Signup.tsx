@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { Phone, Mail, User, CreditCard, Lock, AlertCircle, Loader2, CheckCircle } from 'lucide-react';
 import { AuthService, TenantService } from './Firebase';
 import { useNavigate } from 'react-router-dom';
+import { setPortalPreference } from './session/session';
 
 const Signup: React.FC = () => {
   const [step, setStep] = useState<'info' | 'phone' | 'code'>('info');
@@ -17,7 +18,7 @@ const Signup: React.FC = () => {
   const [code, setCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [, setConfirmationResult] = useState<any>(null);
+  const [confirmationResult, setConfirmationResult] = useState<any>(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -73,8 +74,10 @@ const Signup: React.FC = () => {
     setLoading(true);
 
     try {
-      //const user = await AuthService.verifyCode(confirmationResult, code);
-      
+      // Prove the phone first (signs the person in); createTenant() needs the signed-in user.
+      if (!confirmationResult) throw new Error('Please request a verification code first');
+      await AuthService.verifyCode(confirmationResult, code);
+
       // Create tenant account
       await TenantService.createTenant({
         phone: formatPhoneNumber(formData.phone),
@@ -83,6 +86,7 @@ const Signup: React.FC = () => {
         idNumber: formData.idNumber
       });
 
+      setPortalPreference('tenant');
       navigate('/tenant');
     } catch (err: any) {
       setError(err.message || 'Failed to create account. Please try again.');

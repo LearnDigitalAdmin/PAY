@@ -9,6 +9,8 @@ import { onCall, HttpsError } from "firebase-functions/v2/https";
 import * as admin from "firebase-admin";
 import { REGION, normalizeKePhone, plotDb } from "../mychama/config";
 
+export * from "./otp";
+
 export interface SyncClaimsResponse { agentId: string; claimsChanged: boolean }
 
 const KE_MOBILE = /^\+254[17]\d{8}$/;
@@ -18,7 +20,7 @@ export const agentSyncClaims = onCall(
   async (req): Promise<SyncClaimsResponse> => {
     if (!req.auth) throw new HttpsError("unauthenticated", "Sign in required.");
     const uid = req.auth.uid;
-    const token = req.auth.token as { phone_number?: unknown };
+    const token = req.auth.token as { phone_number?: unknown; otp_phone?: unknown };
     const db = plotDb();
 
     // 1) uid IS the userId (accounts made by createUserWithFirebaseAuth use localId = userId = Firebase uid)
@@ -33,8 +35,11 @@ export const agentSyncClaims = onCall(
     }
 
     // 3) signed in with a verified phone that equals exactly one landlord's registered phone
-    if (!agentDoc && typeof token.phone_number === "string") {
-      const phone = normalizeKePhone(token.phone_number);
+    // (verified phone = legacy Firebase phone auth `phone_number`, or `otp_phone` stamped by verifyLoginOtp)
+    const verifiedPhone = typeof token.otp_phone === "string" ? token.otp_phone
+      : typeof token.phone_number === "string" ? token.phone_number : "";
+    if (!agentDoc && verifiedPhone) {
+      const phone = normalizeKePhone(verifiedPhone);
       if (KE_MOBILE.test(phone)) {
         const byPhone = await db.collection("users").where("phone", "==", phone).limit(2).get();
         if (byPhone.size > 1) throw new HttpsError("failed-precondition", "More than one account uses this phone number. Please contact support.");

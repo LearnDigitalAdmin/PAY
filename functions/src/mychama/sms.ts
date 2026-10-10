@@ -33,6 +33,38 @@ export async function sendMyChamaSms(phoneE164: string, message: string): Promis
   });
 }
 
+/**
+ * Same HostPinnacle account/secrets, but REPORTS failure (returns false) instead of silently succeeding.
+ * Used for login OTPs, where an SMS that never left must not look "sent". Bind ...MYCHAMA_HP_SECRETS.
+ */
+export async function sendHpSmsChecked(phoneE164: string, message: string): Promise<boolean> {
+  try {
+    const params = new URLSearchParams({
+      userid: MYCHAMA_HP_USERID.value(),
+      password: MYCHAMA_HP_PASSWORD.value(),
+      senderid: MYCHAMA_HP_SENDERID.value(),
+      sendMethod: "quick",
+      mobile: phoneE164.replace(/^\+/, ""),
+      msg: message.slice(0, 400),
+      msgType: "text",
+      duplicatecheck: "false",
+      output: "json",
+    });
+    const res = await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", params.toString(), {
+      headers: { apikey: MYCHAMA_HP_APIKEY.value(), "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 10_000,
+    });
+    const d = res.data;
+    const isError = d?.status === "error" || d?.ErrorCode !== undefined ||
+      (typeof d?.status === "string" && d.status.toLowerCase().includes("fail"));
+    if (isError) console.error("HostPinnacle rejected the send:", JSON.stringify(d));
+    return !isError;
+  } catch (e) {
+    console.error("HostPinnacle request failed:", (e as Error).message);
+    return false;
+  }
+}
+
 export const MYCHAMA_HP_SECRETS = [
   MYCHAMA_HP_USERID,
   MYCHAMA_HP_PASSWORD,

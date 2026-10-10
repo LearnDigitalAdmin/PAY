@@ -1,0 +1,37 @@
+--- a/src/Auth.tsx	2026-10-10 14:14:24.284395526 +0300
++++ b/src/Auth.tsx	2026-10-10 14:14:24.288536676 +0300
+@@ -141,14 +141,19 @@
+         return;
+       }
+ 
+-      // Navigate to tenant dashboard
++      // Resolve the session BEFORE navigating (same as the landlord flow), so /tenant never renders
++      // while the session still says "signedOut".
+       setPortalPreference('tenant');
++      const result = await refresh();
++      if (result.role !== 'tenant') {
++        throw new Error(result.message || 'We could not load your tenant profile. Please try again.');
++      }
+       const from = location.state?.from || '/tenant';
+       navigate(from);
+-      
++
+     } catch (err: any) {
+       console.error('Error verifying code:', err);
+-      setError('Invalid verification code. Please try again.');
++      setError(err?.message && err.message !== 'Invalid verification code' ? err.message : 'Invalid verification code. Please try again.');
+     } finally {
+       setLoading(false);
+     }
+--- a/src/session/SessionProvider.tsx	2026-10-10 14:14:24.286485380 +0300
++++ b/src/session/SessionProvider.tsx	2026-10-10 14:14:24.292486264 +0300
+@@ -17,6 +17,9 @@
+       setState({ status: 'signedOut', user: null, role: null, agentProfile: null, freshSignIn: false });
+       return { role: null, agentProfile: null };
+     }
++    // Fresh sign-in (or a different user): hold the session in 'loading' until the role is resolved, so
++    // ProtectedRoute shows the spinner instead of seeing 'signedOut' and bouncing the person to "/".
++    setState((s) => (s.status === 'signedIn' && s.user?.uid === user.uid ? s : { ...s, status: 'loading', user }));
+     let result: ResolveResult;
+     try {
+       result = await resolveRole(user);

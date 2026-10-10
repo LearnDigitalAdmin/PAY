@@ -141,14 +141,19 @@ const Auth: React.FC = () => {
         return;
       }
 
-      // Navigate to tenant dashboard
+      // Resolve the session BEFORE navigating (same as the landlord flow), so /tenant never renders
+      // while the session still says "signedOut".
       setPortalPreference('tenant');
+      const result = await refresh();
+      if (result.role !== 'tenant') {
+        throw new Error(result.message || 'We could not load your tenant profile. Please try again.');
+      }
       const from = location.state?.from || '/tenant';
       navigate(from);
-      
+
     } catch (err: any) {
       console.error('Error verifying code:', err);
-      setError('Invalid verification code. Please try again.');
+      setError(err?.message && err.message !== 'Invalid verification code' ? err.message : 'Invalid verification code. Please try again.');
     } finally {
       setLoading(false);
     }

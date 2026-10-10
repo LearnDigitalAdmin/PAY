@@ -17,6 +17,9 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
       setState({ status: 'signedOut', user: null, role: null, agentProfile: null, freshSignIn: false });
       return { role: null, agentProfile: null };
     }
+    // Fresh sign-in (or a different user): hold the session in 'loading' until the role is resolved, so
+    // ProtectedRoute shows the spinner instead of seeing 'signedOut' and bouncing the person to "/".
+    setState((s) => (s.status === 'signedIn' && s.user?.uid === user.uid ? s : { ...s, status: 'loading', user }));
     let result: ResolveResult;
     try {
       result = await resolveRole(user);

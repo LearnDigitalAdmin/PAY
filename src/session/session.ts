@@ -93,7 +93,8 @@ export async function resolveRole(user: User): Promise<ResolveResult> {
     if (r?.message) message = r.message;
   }
   // A brand-new tenant (phone verified, profile not created yet) continues to the signup flow.
-  if (user.phoneNumber && pref !== 'agent') return { role: 'tenant', agentProfile: null };
+  const phoneVerified = !!user.phoneNumber || typeof claims.otp_phone === 'string';
+  if (phoneVerified && pref !== 'agent') return { role: 'tenant', agentProfile: null };
   return { role: null, agentProfile: null, message };
 }
 
