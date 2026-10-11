@@ -6,7 +6,7 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { REGION, MYCHAMA_PAYSTACK_SECRET_KEY } from "../config";
 import { MYCHAMA_HP_SECRETS } from "../sms";
-import { dispatchChargeFailed, dispatchChargeSuccess, type PaystackChargeData } from "./dispatch";
+import { dispatchChargeFailed, dispatchChargeSuccess, dispatchRefundProcessed, type PaystackChargeData } from "./dispatch";
 import { verifyPaystackSignature } from "./util";
 
 export { reconcileMyChamaIntentsV2 } from "./reconcile";
@@ -54,6 +54,8 @@ export const mychamaPaystackCallback = onRequest(
         }
       } else if (event.event === "charge.failed") {
         await dispatchChargeFailed(data);
+      } else if (event.event === "refund.processed") {
+        await dispatchRefundProcessed(data);
       }
       // every other event type: acknowledged, nothing to do
       res.status(200).json({ received: true });

@@ -8,6 +8,7 @@ import {
   handleMyChamaReportCreditTopup, handleMyChamaSmsTopup,
 } from "./handlers";
 import { isSafeChamaId, parseMyChamaReference } from "./util";
+import { recordRefundEvent } from "../../desk/hooks";
 
 export interface PaystackChargeData {
   reference?: unknown;
@@ -16,6 +17,9 @@ export interface PaystackChargeData {
   status?: unknown;
   gateway_response?: unknown;
   metadata?: unknown;
+  /** Paystack's real fee for the charge, in minor units — the desk events record it (never an estimate). */
+  fees?: unknown;
+  paid_at?: unknown;
 }
 
 export type DispatchOutcome = "handled" | "ignored_non_mychama" | "ignored_invalid";
@@ -50,24 +54,25 @@ export async function dispatchChargeSuccess(data: PaystackChargeData): Promise<D
   }
   const paid = data.amount;
   const cur = data.currency;
+  const facts = { amountKobo: data.amount, feesKobo: data.fees, paidAt: data.paid_at };
 
   switch (parsed.kind) {
     case "payment":
       await handleMyChamaPayment(reference, chamaId, paid, cur);
       break;
     case "sms_topup":
-      await handleMyChamaSmsTopup(reference, chamaId, paid, cur);
+      await handleMyChamaSmsTopup(reference, chamaId, paid, cur, facts);
       break;
     case "plan_billing": {
       const plan = typeof meta.plan === "string" ? meta.plan : typeof meta.toPlan === "string" ? meta.toPlan : undefined;
-      await handleMyChamaPlanBilling(reference, chamaId, plan, paid, cur);
+      await handleMyChamaPlanBilling(reference, chamaId, plan, paid, cur, facts);
       break;
     }
     case "report_credit_topup":
-      await handleMyChamaReportCreditTopup(reference, chamaId, paid, cur);
+      await handleMyChamaReportCreditTopup(reference, chamaId, paid, cur, facts);
       break;
     case "report_alacarte":
-      await handleMyChamaReportAlacarte(reference, chamaId, paid, cur);
+      await handleMyChamaReportAlacarte(reference, chamaId, paid, cur, facts);
       break;
   }
   return "handled";
@@ -98,5 +103,14 @@ export async function dispatchChargeFailed(data: PaystackChargeData): Promise<Di
     if (!snap.exists || snap.data()?.status !== "pending") return;
     tx.update(ref, { status: "failed", ...(message ? { paystackMessage: message } : {}), updatedAt: Date.now() });
   });
+  return "handled";
+}
+
+/**
+ * refund.processed: writes a desk `refund` event when a desk_events document exists for the refunded transaction
+ * (any product's — desk events live in this project's database); otherwise ignored. Throws only on a transient error.
+ */
+export async function dispatchRefundProcessed(data: unknown): Promise<"handled"> {
+  await recordRefundEvent(data);
   return "handled";
 }

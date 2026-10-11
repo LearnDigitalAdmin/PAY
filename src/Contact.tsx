@@ -10,8 +10,8 @@ const Contact: React.FC = () => {
     {
       icon: Mail,
       title: 'General Inquiries',
-      value: 'info@cogvana.co.ke',
-      href: 'mailto:info@cogvana.co.ke',
+      value: 'info@samuhia.co.ke',
+      href: 'mailto:info@samuhia.co.ke',
       color: 'text-blue-600',
       bgColor: 'bg-blue-50',
       description: 'For general questions and support'
@@ -19,8 +19,8 @@ const Contact: React.FC = () => {
     {
       icon: Mail,
       title: 'Sales & Business',
-      value: 'sales@cogvana.co.ke',
-      href: 'mailto:sales@cogvana.co.ke',
+      value: 'sales@samuhia.co.ke',
+      href: 'mailto:sales@samuhia.co.ke',
       color: 'text-green-600',
       bgColor: 'bg-green-50',
       description: 'For business inquiries and partnerships'

@@ -143,7 +143,7 @@ export default function FAQPage() {
                 Contact Us
               </button>
               <a
-                href="https://cogvana.co.ke/"
+                href="https://samuhia.co.ke/"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center justify-center bg-gray-100 text-gray-700 font-semibold px-6 py-3 rounded-lg hover:bg-gray-200 transition duration-300"

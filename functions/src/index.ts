@@ -4,7 +4,6 @@
 
 import { onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
 import { onRequest } from "firebase-functions/v2/https";
-import { defineSecret } from "firebase-functions/params";
 import * as admin from "firebase-admin";
 import axios from "axios";
 import * as crypto from "crypto";
@@ -38,6 +37,12 @@ function myregisterDb(): admin.firestore.Firestore {
   return myregisterDbCached;
 }
 
+import { PAYSTACK_SECRET_KEY, PAYSTACK_API_BASE } from "./desk/paystack";
+import { getDeskConfig } from "./desk/config";
+import { rentRateForTier } from "./desk/rent";
+import { initiateRentCharge } from "./desk/rentCharge";
+import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
+import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
 import { mychamaDb } from "./mychama/config";
 import { MYCHAMA_HP_SECRETS } from "./mychama/sms";
 import {
@@ -54,16 +59,7 @@ export * from "./auth";
 
 
 // ============= CONFIGURATION =============
-const PAYSTACK_SECRET_KEY = defineSecret('PAYSTACK_SECRET_KEY');
-const PAYSTACK_API_BASE = "https://api.paystack.co";
-
-// Tier commission rates
-const TIER_RATES = {
-  ENTERPRISE: 1.0,
-  PRO: 1.9,
-  BUSINESS: 1.5,
-  SOLO: 2.4,
-} as const;
+// PAYSTACK_SECRET_KEY / PAYSTACK_API_BASE are declared once in ./desk/paystack (shared with the desk module).
 
 
 //declare const project2App: admin.app.App;
@@ -99,6 +95,9 @@ const PMS_TIER_SMS_RATE: Record<string, number> = {
   pro:        0.50,
   enterprise: 0.45,
 };
+
+/** Free SMS tokens granted to a self sign-up. They are a gift, not a purchase: they never earn commission. */
+const PMS_SIGNUP_FREE_TOKENS = 50;
 
 const PMS_DEFAULT_SMS_RATE = 0.75; // free / low / starter / anything unrecognized
  
@@ -170,8 +169,21 @@ export const chargeSmsTopUp = onCall({
     const amountInCents = Math.round(amountKes * 100);
     const reference = `SMS_${userId}_${Date.now()}`;
 
+    // ── Desk commission (Plot Yangu landlords). It must never block the purchase: planDeskSmsCharge degrades to
+    //    "no desk split" (with an audit row) on any failure. MyRegister: see the notes — school ownership cannot be
+    //    verified from the data PAY can read, so Register top-ups carry no desk part.
+    let deskSplitCode: string | undefined;
+    let deskCommission: Record<string, unknown> | undefined;
+    if (targetApp === 'pms') {
+      const landlordCode = (await db.collection("users").doc(userId).get()).data()?.landlordCode;
+      if (typeof landlordCode === "string" && landlordCode) {
+        const plan = await planDeskSmsCharge({ entityKey: `pms:${landlordCode}`, reference, grossMinor: amountInCents, credits: Math.round(Number(tokens)) });
+        if (plan.applied) { deskSplitCode = plan.splitCode; deskCommission = { ...plan.commission }; }
+      }
+    }
+
     const chargePayload = {
-      email: `${userId}@cogvana.co.ke`,
+      email: `${userId}@samuhia.co.ke`,
       amount: amountInCents,
       currency: "KES",
       mobile_money: {
@@ -179,6 +191,7 @@ export const chargeSmsTopUp = onCall({
         provider: "mpesa",
       },
       reference,
+      ...(deskSplitCode ? { split_code: deskSplitCode } : {}),
       metadata: {
         chargeType: "sms_topup",
         targetProject: targetApp === 'pms' ? 'pms' : 'project2', // ← tells webhook which Firestore/field to settle in
@@ -193,19 +206,25 @@ export const chargeSmsTopUp = onCall({
 
     console.log("SMS top-up charge request:", JSON.stringify(chargePayload, null, 2));
 
-    const paystackResponse = await axios.post(
-      `${PAYSTACK_API_BASE}/charge`,
-      chargePayload,
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`,
-          "Content-Type": "application/json",
-        },
+    let paystackResponse;
+    try {
+      paystackResponse = await axios.post(
+        `${PAYSTACK_API_BASE}/charge`,
+        chargePayload,
+        {
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      if (!paystackResponse.data.status) {
+        throw new HttpsError("internal", `Paystack error: ${paystackResponse.data.message}`);
       }
-    );
-
-    if (!paystackResponse.data.status) {
-      throw new HttpsError("internal", `Paystack error: ${paystackResponse.data.message}`);
+    } catch (chargeError) {
+      // The charge never started: free a first-purchase reservation taken for it.
+      if (deskCommission) await releaseFirstPurchaseReservation(String(deskCommission.entityKey), reference);
+      throw chargeError;
     }
 
     const txData = paystackResponse.data.data;
@@ -222,6 +241,7 @@ export const chargeSmsTopUp = onCall({
       status: txData.status || "pending",
       displayText: txData.display_text || null,
       accountReference: txData.account_reference || null,
+      ...(deskCommission ? { deskCommission } : {}),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -314,6 +334,9 @@ async function handleSmsTopUp(
       `amountKes: ${amountKes}, gross: ${safeGross}, fees: ${safeFees}, received: ${safeReceived}`
     );
 
+    // The pending document (written by chargeSmsTopUp) carries deskCommission when a desk split was attached.
+    const pendingTopUp = (await db2.collection("sms-topup-transactions").doc(reference).get()).data();
+
     // 1. Mark the pending transaction as success in project-2
     await db2.collection("sms-topup-transactions").doc(reference).set(
       {
@@ -391,6 +414,9 @@ async function handleSmsTopUp(
       { merge: true }
     );
 
+    // 6. Desk fact (only when the purchase carried a desk commission); never throws, create-only per reference.
+    await recordSmsPurchaseEvent({ reference, tokens, data, pending: pendingTopUp });
+
     console.log(
       `✅ SMS top-up settled (project-2):\n` +
       `   User:   ${userId}\n` +
@@ -449,6 +475,9 @@ async function handlePmsSmsTopUp(
     const safeGross = Number.isFinite(grossAmount) ? grossAmount : amountKes;
     const safeFees = Number.isFinite(paystackFees) ? paystackFees : 0;
     const safeReceived = Number.isFinite(amountReceived) ? amountReceived : safeGross - safeFees;
+
+    // The pending document (written by chargeSmsTopUp) carries deskCommission when a desk split was attached.
+    const pendingTopUp = (await db.collection("sms-topup-transactions").doc(reference).get()).data();
 
     // 1. Mark the pending transaction as success — default project
     await db.collection("sms-topup-transactions").doc(reference).set(
@@ -526,6 +555,9 @@ async function handlePmsSmsTopUp(
       },
       { merge: true }
     );
+
+    // 6. Desk fact (only when the purchase carried a desk commission); never throws, create-only per reference.
+    await recordSmsPurchaseEvent({ reference, tokens, data, pending: pendingTopUp });
 
     console.log(
       `✅ PMS SMS top-up settled:\n` +
@@ -1354,8 +1386,8 @@ export const setupAccount = onCall({
     const userData = userDoc.data();
     const userTier = userData?.tier?.toUpperCase() || "SOLO";
 
-    // Determine commission rate based on tier
-    const commissionRate = TIER_RATES[userTier as keyof typeof TIER_RATES] || TIER_RATES.SOLO;
+    // Determine the take rate from the tier (one table: ./desk/rent RENT_TAKE_RATE_BY_TIER; unknown tiers use SOLO)
+    const commissionRate = rentRateForTier(userTier);
 
     console.log(`Setting up account for user ${userId} with tier ${userTier} at ${commissionRate}%`);
 
@@ -1568,174 +1600,17 @@ export const processPayment = onCall({
       );
     }
 
-    const { userId, userName, invoiceId, billingMonth, arrears, agentId } = metadata;
-
-    // Get agent's payment info (subaccount)
-    const agentDoc = await db.collection("users").doc(agentId).get();
-
-    if (!agentDoc.exists) {
-      throw new HttpsError(
-        "not-found",
-        "Agent not found in database"
-      );
-    }
-
-    const agentData = agentDoc.data();
-    const paymentInfo = agentData?.paymentInfo;
-
-    if (!paymentInfo || !paymentInfo.accountId) {
-      throw new HttpsError(
-        "failed-precondition",
-        "Agent has not set up payment account. Please configure payment details first."
-      );
-    }
-
-    const subaccountCode = paymentInfo.accountId;
-    const commissionRate = paymentInfo.split || 2.1;
-
-    console.log(`Processing payment for user ${userId}, agent ${agentId}, amount ${amount}`);
-
-    // Get or create split code
-    const splitCode = await getOrCreateSplitCode(subaccountCode, commissionRate, agentId);
-
-    // Format phone number for Paystack Kenya M-Pesa charge (+254XXXXXXXXX format)
-    let formattedPhone = phone.replace(/[\s-]/g, ''); // Remove spaces and dashes, keep +
-    
-    // Ensure it has the + prefix and 254 country code
-    if (formattedPhone.startsWith('+254')) {
-      // Already correct format
-      formattedPhone = formattedPhone;
-    } else if (formattedPhone.startsWith('254')) {
-      // Add the + prefix
-      formattedPhone = '+' + formattedPhone;
-    } else if (formattedPhone.startsWith('0')) {
-      // Convert from local (0XXXXXXXXX) to international (+254XXXXXXXXX)
-      formattedPhone = '+254' + formattedPhone.substring(1);
-    } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
-      // Just the last 9 digits
-      formattedPhone = '+254' + formattedPhone;
-    } else if (formattedPhone.startsWith('+')) {
-      // Has + but might not have 254
-      if (!formattedPhone.startsWith('+254')) {
-        formattedPhone = '+254' + formattedPhone.substring(1);
-      }
-    }
-    
-    console.log(`Formatted phone for M-Pesa charge (+254 format): ${phone} -> ${formattedPhone}`);
-
-    // Convert amount to cents
-    const amountInCents = Math.round(amount * 100);
-
-    // Charge payload with split_code
-    const chargePayload = {
-      email: email,
-      amount: amountInCents,
-      currency: currency,
-      mobile_money: {
-        phone: formattedPhone,
-        provider: provider,
-      },
-      reference: `INV_${userId}_${Date.now()}`,
-      split_code: splitCode,  // Use split_code instead of split object
-      metadata: {
-        userId: userId,
-        userName: userName,
-        invoiceId: invoiceId,
-        billingMonth: billingMonth,
-        arrears: arrears,
-        agentId: agentId,
-        originalAmount: amount,
-      },
-    };
-
-    console.log('Paystack charge request:', JSON.stringify(chargePayload, null, 2));
-
-    const paystackResponse = await axios.post(
-      `${PAYSTACK_API_BASE}/charge`,
-      chargePayload,
-      { headers: {
-        'Authorization': `Bearer ${PAYSTACK_SECRET_KEY.value()}`,
-        'Content-Type': 'application/json'
-      } }
-    );
-
-    console.log('Paystack response:', JSON.stringify(paystackResponse.data, null, 2));
-
-    if (!paystackResponse.data.status) {
-      throw new HttpsError(
-        "internal",
-        `Paystack API error: ${paystackResponse.data.message}`
-      );
-    }
-
-    const transactionData = paystackResponse.data.data;
-
-    console.log(`Payment charge initiated: ${transactionData.reference}, status: ${transactionData.status}`);
-
-    // Create payment record
-    const paymentRecord = {
-      userName: userName,
-      agentId: agentId,
-      amount: amount,
-      arrears: arrears,
-      invoiceId: invoiceId,
-      billingMonth: billingMonth,
-      currency: currency,
-      phone: formattedPhone,
-      provider: provider,
-      reference: transactionData.reference,
-      status: transactionData.status || "pending",  // Can be "pay_offline", "pending", etc.
-      displayText: transactionData.display_text,
-      accountReference: transactionData.account_reference,  // M-Pesa specific reference
-      initiatedAt: new Date().toISOString(),
-      subaccountCode: subaccountCode,
-      commissionRate: commissionRate,
-      splitCode: splitCode,
-    };
-
-    // Write to payments collection
-    await db
-      .collection("payments")
-      .doc(userId)
-      .collection("billingMonths")
-      .doc(billingMonth)
-      .set(
-        {
-          payments: admin.firestore.FieldValue.arrayUnion(paymentRecord),
-          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-    // Create transaction record
-    await db.collection("transactions").doc(transactionData.reference).set({
-      userName: userName,
-      email: email,
-      phone: formattedPhone,
-      provider: provider,
-      currency: currency,
-      userId: userId,
-      agentId: agentId,
-      invoiceId: invoiceId,
-      billingMonth: billingMonth,
-      amount: amount,
-      arrears: arrears,
-      status: transactionData.status || "pending",
-      reference: transactionData.reference,
-      displayText: transactionData.display_text,
-      accountReference: transactionData.account_reference,
-      splitCode: splitCode,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // One function starts every rent STK push (landlord's tier take, split, charge, records): ./desk/rentCharge.
+    const result = await initiateRentCharge({ email, amount, currency, phone, provider, metadata });
 
     return {
       success: true,
       message: "Payment initialized successfully",
       data: {
-        reference: transactionData.reference,
-        status: transactionData.status,
-        displayText: transactionData.display_text || "Check your phone for the M-Pesa prompt",
-        accountReference: transactionData.account_reference,
+        reference: result.reference,
+        status: result.status,
+        displayText: result.displayText,
+        accountReference: result.accountReference,
       },
     };
   } catch (error: any) {
@@ -1802,7 +1677,7 @@ export const chargeCustomer = onCall({
     }
 
     const subaccountCode = paymentInfo.accountId;
-    const commissionRate = 2.5; // Fixed 2.5% commission for cyber services
+    const commissionRate = (await getDeskConfig()).platformCutPct; // desk's platform cut (config), same as desk's tickets
 
     console.log(`Processing cyber charge for agent ${id} (${pId}), amount ${amount}, service: ${service}`);
 
@@ -1943,6 +1818,7 @@ interface PaystackWebhookData {
     reference: string;
     amount: number;
     fees?: number;
+    paid_at?: string;
     amount_received?: number;
     channel?: string; // e.g. "mobile_money" (M-Pesa) or "card" — used to split PNS booking income by channel
     gateway_response: string;
@@ -2002,6 +1878,9 @@ export const paystackCallback = onRequest({
 
       // === DETERMINE CHARGE TYPE ===
       const chargeType = metadata.chargeType || determineChargeType(reference);
+
+      // Real amount / fee / time of this payment, for the desk events MyChama platform charges may produce.
+      const mychamaFacts: MyChamaChargeFacts = { amountKobo: data.amount, feesKobo: data.fees, paidAt: data.paid_at };
 
       console.log(`Identified charge type: ${chargeType}`);
 
@@ -2074,21 +1953,26 @@ export const paystackCallback = onRequest({
         await handleMyChamaPayment(reference, metadata.chamaId, data.amount);
       }
       else if (chargeType === 'mychama_sms_topup' || reference.startsWith('MCS-')) {
-        await handleMyChamaSmsTopup(reference, metadata.chamaId);
+        await handleMyChamaSmsTopup(reference, metadata.chamaId, undefined, undefined, mychamaFacts);
       }
       else if (chargeType === 'mychama_plan_billing' || reference.startsWith('MCP-')) {
-        await handleMyChamaPlanBilling(reference, metadata.chamaId, metadata.plan);
+        await handleMyChamaPlanBilling(reference, metadata.chamaId, metadata.plan, undefined, undefined, mychamaFacts);
       }
       else if (chargeType === 'mychama_report_credit_topup' || reference.startsWith('MCX-')) {
-        await handleMyChamaReportCreditTopup(reference, metadata.chamaId);
+        await handleMyChamaReportCreditTopup(reference, metadata.chamaId, undefined, undefined, mychamaFacts);
       }
       else if (chargeType === 'mychama_report_alacarte' || reference.startsWith('MCR-')) {
-        await handleMyChamaReportAlacarte(reference, metadata.chamaId);
+        await handleMyChamaReportAlacarte(reference, metadata.chamaId, undefined, undefined, mychamaFacts);
       }
 
       else {
         console.warn(`Unknown reference type: ${reference}`);
       }
+    }
+
+    // Refunds: a desk fact exists only for charges that carried a desk commission; anything else is ignored.
+    if ((event.event as string) === "refund.processed") {
+      await recordRefundEvent((event as { data?: unknown }).data);
     }
 
     // Handle failed payments
@@ -2102,11 +1986,15 @@ export const paystackCallback = onRequest({
       // Update appropriate collection based on charge type
       if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
         const targetDb = data.metadata?.targetProject === "pms" ? db : db2;
-        await targetDb.collection("sms-topup-transactions").doc(reference).update({
+        const pendingRef = targetDb.collection("sms-topup-transactions").doc(reference);
+        const failedPending = await pendingRef.get().catch(() => null);
+        await pendingRef.update({
           status: "failed",
           failedAt: admin.firestore.FieldValue.serverTimestamp(),
           failureReason: data.gateway_response,
         }).catch(e => console.error("Failed to update sms-topup failure:", e));
+        // A failed charge frees the first-purchase reservation it held.
+        if (failedPending?.exists) await releaseSmsReservationFor(failedPending.data(), reference);
       }
 
       else if (chargeType === 'report_charge' || reference.startsWith('REPORT_')) {
@@ -2414,7 +2302,8 @@ async function handleCyberCharge(
     const grossAmount = data.amount / 100;
     const paystackFees = data.fees ? data.fees / 100 : 0;
     const netAfterPaystack = grossAmount - paystackFees;
-    const platformCommission = (netAfterPaystack * 2.5) / 100;
+    const cutPct = (await getDeskConfig()).platformCutPct; // must always agree with desk's tickets
+    const platformCommission = (netAfterPaystack * cutPct) / 100;
     const agentNetIncome = netAfterPaystack - platformCommission;
 
     console.log(
@@ -2432,7 +2321,7 @@ async function handleCyberCharge(
       netAfterPaystack,
       platformCommission,
       agentNetIncome,
-      commissionRate: 2.5,
+      commissionRate: cutPct,
       currency: "KES",
       status: "success",
       type: "cyber_service",
@@ -2525,7 +2414,11 @@ async function handlePlotYanguSubscriptionCharge(
 
     console.log(`Successfully activated subscription for user ${userId}`);
 
-    if (agentId) {
+    // Desk-owned landlords (deskCommission written by PMS) are recorded as a desk event; the legacy 45% agent income
+    // below is for legacy attributions only. The two paths are mutually exclusive.
+    if (subscriptionData?.deskCommission) {
+      await recordSubscriptionEvent({ reference, data, subscription: subscriptionData, planId: typeof planId === "string" ? planId : undefined });
+    } else if (agentId) {
       try {
         const grossAmount = data.amount / 100;
         const paystackFees = data.fees ? data.fees / 100 : 0;
@@ -2657,6 +2550,9 @@ async function handleAgentPayment(
         });
       }
     }
+
+    // Desk fact for a desk-initiated rent payment (transaction carries deskCommission); never throws.
+    await recordRentPaymentEvent({ reference, data, transaction: transactionData });
 
     console.log(`Successfully processed agent payment: ${reference}`);
 
@@ -3146,7 +3042,7 @@ export const createUserWithFirebaseAuth = onCall({
       firestoreUserData.isTrial = true; // marks this as an unpaid trial grant, not a real subscription
       firestoreUserData.subscriptionExpiry = admin.firestore.Timestamp.fromDate(trialEnd);
       firestoreUserData.trialStartedAt = admin.firestore.FieldValue.serverTimestamp();
-      firestoreUserData.tokens = 100; // signup bonus
+      firestoreUserData.tokens = PMS_SIGNUP_FREE_TOKENS; // signup bonus (free tokens never earn desk commission)
     } else {
       // Agent-created accounts use provided values or defaults
       firestoreUserData.tier = userData.tier || 'free';

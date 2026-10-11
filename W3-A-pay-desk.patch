@@ -1,0 +1,2404 @@
+From 53343a06c393893ca6e9cc626f63be4b01aeb9f1 Mon Sep 17 00:00:00 2001
+From: W3-A <w3a@samuhia.co.ke>
+Date: Sun, 11 Oct 2026 19:33:08 +0000
+Subject: [PATCH] desk: W3-A PAY desk patch (desk module,
+ SMS/rent/subscription/MyChama/refund events, desk cut from config, 50 signup
+ tokens, samuhia rebrand, tests, notes)
+
+---
+ docs/desk/W3-A-notes.md                   |  32 ++
+ docs/mychama/track-C-notes.md             |   2 +-
+ functions/src/desk/config.ts              | 101 +++++++
+ functions/src/desk/db.ts                  |  22 ++
+ functions/src/desk/events.ts              | 146 +++++++++
+ functions/src/desk/hooks.ts               | 130 ++++++++
+ functions/src/desk/index.ts               |  11 +
+ functions/src/desk/money.ts               |  82 +++++
+ functions/src/desk/owner.ts               |  32 ++
+ functions/src/desk/paystack.ts            |   7 +
+ functions/src/desk/rent.ts                |  35 +++
+ functions/src/desk/rentCharge.ts          | 128 ++++++++
+ functions/src/desk/sms.ts                 | 127 ++++++++
+ functions/src/desk/split.ts               |  61 ++++
+ functions/src/desk/types.ts               |  38 +++
+ functions/src/index.ts                    | 294 ++++++------------
+ functions/src/mychama/webhook/dispatch.ts |  22 +-
+ functions/src/mychama/webhook/handlers.ts |  29 +-
+ functions/src/mychama/webhook/index.ts    |   4 +-
+ functions/test/desk-fake-firestore.js     |  77 +++++
+ functions/test/desk-money.check.js        |  86 ++++++
+ functions/test/desk-static.check.js       |  34 +++
+ functions/test/desk-webhooks.check.js     | 352 ++++++++++++++++++++++
+ public/site.webmanifest                   |   4 +-
+ src/Contact.tsx                           |   8 +-
+ src/Faq.tsx                               |   2 +-
+ 26 files changed, 1650 insertions(+), 216 deletions(-)
+ create mode 100644 docs/desk/W3-A-notes.md
+ create mode 100644 functions/src/desk/config.ts
+ create mode 100644 functions/src/desk/db.ts
+ create mode 100644 functions/src/desk/events.ts
+ create mode 100644 functions/src/desk/hooks.ts
+ create mode 100644 functions/src/desk/index.ts
+ create mode 100644 functions/src/desk/money.ts
+ create mode 100644 functions/src/desk/owner.ts
+ create mode 100644 functions/src/desk/paystack.ts
+ create mode 100644 functions/src/desk/rent.ts
+ create mode 100644 functions/src/desk/rentCharge.ts
+ create mode 100644 functions/src/desk/sms.ts
+ create mode 100644 functions/src/desk/split.ts
+ create mode 100644 functions/src/desk/types.ts
+ create mode 100644 functions/test/desk-fake-firestore.js
+ create mode 100644 functions/test/desk-money.check.js
+ create mode 100644 functions/test/desk-static.check.js
+ create mode 100644 functions/test/desk-webhooks.check.js
+
+diff --git a/docs/desk/W3-A-notes.md b/docs/desk/W3-A-notes.md
+new file mode 100644
+index 0000000..0041a40
+--- /dev/null
++++ b/docs/desk/W3-A-notes.md
+@@ -0,0 +1,32 @@
++# W3-A — PAY desk patch: notes
++
++Start state: PAY `main` as uploaded (`PAY-main.zip`, no git history; baseline commit `9530166` created from it). Kernel read from CYBER `functions-desk/src` (money.ts, config.ts, types.ts, paystack/splits.ts, commissions/plan.ts).
++
++## What is done
++* `functions/src/desk/**`: money (kernel vectors pass), config (`getDeskConfig`, 60 s cache), `resolveDeskOwner`, `getOrCreateDeskSplit` (shared `desk_split_codes` key/shape), `writeDeskEvent` (create-only, same validation as the desk trigger), first-purchase reserve/release, SMS plan + settle, rent tier table + split plan, extracted `initiateRentCharge`, hooks for rent / Plot Yangu subscription / MyChama / refund events.
++* SMS: `chargeSmsTopUp` (PMS) resolves `pms:<landlordCode>`, reserves the first purchase in a transaction (30-minute live window), attaches `split_code`, stores `deskCommission` on `sms-topup-transactions/{ref}`. `handlePmsSmsTopUp` and `handleSmsTopUp` write `sms_purchase:<ref>` after the token credit, only when `deskCommission` exists. `charge.failed` and a failed Paystack call release the reservation. Free signup tokens (now `PMS_SIGNUP_FREE_TOKENS = 50`) never earn commission.
++* Rent: `processPayment` now delegates to `initiateRentCharge` (take = `rentTake(amount, tier rate, KES 250 cap)`, tier read from `users/{landlord}.tier` at charge time, split via `getOrCreateDeskSplit`, `takeMinor`/shares on `transactions/{ref}`). `setupAccount` uses the same table (`RENT_TAKE_RATE_BY_TIER`). `handleAgentPayment` writes `rent_payment` when the transaction has `deskCommission`.
++* MyChama: handlers take an additive `facts` argument (amount, real fee, paid_at) and write the event after the transactional apply OR when already applied (heals a crash between the two); `dispatch.ts` passes `fees`/`paid_at`; the legacy `paystackCallback` passes the same facts. Chama's `deskCommission` may carry only `agentCode`; the id comes from `desk_agents`.
++* Plot Yangu subscriptions: `deskCommission` on `subscriptions/{ref}` -> `subscription_payment` (plan, Nairobi `periodMonth`); the legacy 45% block runs only when it is absent (mutually exclusive).
++* Refunds: `refund.processed` on both webhooks -> `refund:<refund_reference|id|reference>` only when a non-refund `desk_events` doc has that `paystackRef`.
++* `platformCutPct` from `getDeskConfig()` in `chargeCustomer` and `handleCyberCharge`. Samuhia rebrand (`@samuhia.co.ke`, contact emails, FAQ link, manifest, notes).
++
++## NOT done for real (and why)
++1. **`desk_runRentBatch` trigger — not shipped.** PMS's repo was not supplied and PAY only shows PMS through its client (`users/{landlord}/tenants/{localId}` with `name`, `users/{landlord}/invoices` with `tenantId` (number), `totalAmount`, `amountPaid`, `arrears`, `isPaid`). Nothing in the supplied code shows the tenant phone field on those records, nor whether desk's opaque `tenantIds` are PMS local ids or `tenants/{uid}`. Guessing would be invented fields. Everything the trigger needs is in place and tested: `initiateRentCharge({ …, desk: { agentId, batchId } })` (owner -> three-way, non-owner -> two-way, resolution failure -> two-way + audit) and the `rent_payment` event. **Needed to finish:** PMS tenant/invoice types and the tenantId convention; then the trigger (transaction `requested -> processing`, ≤200 tenants, 5 at a time, per-tenant dedupe doc) is a small addition.
++2. **Register SMS desk commission — resolution not shipped.** The Register repo was not supplied; `chargeSmsTopUp` only receives `schoolId`/`schoolName` from the client and nothing in PAY shows the school document, its KNEC code field, or how a caller belongs to a school. Register top-ups therefore carry no desk part (plain charge, as today). The settle (`handleSmsTopUp`) and failure paths are already wired: once a school top-up stores `deskCommission` on its pending document, the event is written. **Needed:** Register's school document path/fields and membership rule.
++3. Real gates not run here: the sandbox has no npm access, so `npm ci`, `tsc --noEmit`, `npm run build`, root `tsc -b && build` could not run. I type-checked with stand-in declarations (no errors in the changed code other than stand-in noise) and ran the tests against stand-in `firebase-admin`/`firebase-functions`/`axios` modules. **Run the gates before merging.** `check:mychama-contract` passes; `test-fees`, `test-migrate`, `mychama-track-a` pass; `test-money-plane`'s callable sections fail identically on the untouched baseline here (stand-in callable runtime), its webhook/signature sections pass.
++
++## Tests added
++`functions/test/desk-money.check.js` (kernel vectors), `desk-webhooks.check.js` (25 flow checks: SMS first/second purchase, reserve->success / reserve->failure release, live/expired reservation, replay, desk failure never blocks, rent cap/tiers/three-way/non-owner, subscription, MyChama MCS/MCP/MCX/MCR + none for contributions/MGR, refunds, config cache, event validation), `desk-static.check.js`, helper `desk-fake-firestore.js`. Run: `cd functions && npm run build && node test/desk-money.check.js && node test/desk-webhooks.check.js && node test/desk-static.check.js`.
++
++## Emulator tests to run (need Java; not run here)
++`firebase emulators:exec --only firestore "node functions/test/desk-webhooks.check.js"` after pointing `deskDb`/`mychamaDb` at emulator-backed apps as `scripts/mychama/test-money-plane.mjs --emulator` does. Specifically confirm on the real emulator: (a) two concurrent `planDeskSmsCharge` calls produce exactly one first-purchase reservation; (b) `create()` of an existing `desk_events` doc raises code 6; (c) `FieldValue.delete()` clears both reservation fields; (d) the desk events trigger (CYBER) turns `sms_purchase` into `firstPurchaseUsed=true` and clears the reservation. Trigger tests for `desk_runRentBatch` follow the trigger.
++
++## Findings and Requests
++* `handleSmsTopUp` / `handlePmsSmsTopUp` / `handlePlotYanguSubscriptionCharge` are not idempotent (a replayed `charge.success` credits tokens / resets expiry again). Desk events are safe (create-only) and the desk write never throws, so it adds no retry; fixing the double credit needs a status transaction — Request to the owner of those handlers.
++* `processPayment` has no `request.auth` check and trusts client-supplied `agentId`/`amount` (unchanged; the take now uses the amount sent). Request: authenticate and price from the invoice.
++* `chargeSmsTopUp` writes the pending document after the charge starts; a webhook arriving first would not find `deskCommission`. Window is milliseconds (STK needs a PIN); moving the write before the charge is a safe follow-up.
++* Paystack `refund.processed` payload: relied on `data.transaction_reference` and `data.refund_reference` (from memory of Paystack's docs; could not verify offline). Confirm against the dashboard's sample event.
++* `refund.processed` on `mychamaPaystackCallback` required a 3-line edit in `mychama/webhook/index.ts` (a third MyChama file, necessarily).
++* `track-C-pay-experience.patch` (historical patch file) still contains the old text; left untouched.
++* Deploy with explicit names (`--only functions:<name>`); IAM: none needed.
+diff --git a/docs/mychama/track-C-notes.md b/docs/mychama/track-C-notes.md
+index 78c8eec..33c829e 100644
+--- a/docs/mychama/track-C-notes.md
++++ b/docs/mychama/track-C-notes.md
+@@ -12,7 +12,7 @@ The prompt assumed landlords log in with a custom hashed-password flow. They don
+ ## Brand — Samuhia Payments
+ * Source: `samuhia-site-logo-studio.html` ("Samuhia PAYMENTS": amber-brown `#B8741A`, deep `#96600F`, green `#0F6B54`, font Schibsted Grotesk). Logo SVGs → `public/brand/`; `BrandLogo` component; favicon/PWA/Apple icons and all 40 iOS launch screens regenerated; manifest, `index.html`, theme colours, service-worker cache names renamed.
+ * **One-file restyle:** `src/theme/tokens.css` re-points the Tailwind ramps the screens already use — `indigo`→Payments amber, `blue`/`purple`→Samuhia green, `gray`→warm neutrals; red/green/yellow/orange keep their meaning. Retune the brand by editing that file only.
+-* Left alone on purpose: company contact emails and the FAQ link on `cogvana.co.ke`, the `@cogvana.co.ke` address generated server-side in `functions/src/index.ts`, `public/index.html` and `public/site.webmanifest` (both are "Cogvana Corporation" leftovers, not the app). The footer now reads "© 2026 Samuhia Payments" — adjust if the legal entity should be named.
++* Rebranded in W3-A: company contact emails, the FAQ link, the server-generated Paystack customer address (`@samuhia.co.ke`) and the web manifest now say Samuhia. The footer reads "© 2026 Samuhia Payments" — adjust if the legal entity should be named.
+ 
+ ## Connector UI (`src/mychama/`)
+ `ChamaConnectorProvider` listens to `chamaSnapshots/{uid}` (UI always renders from it) and calls `mychamaSync` once per user per page load (`login` for a fresh sign-in, else `reload`; manual Refresh = `manual`; the server throttles). `ChamaSection` is dropped into `AgentView` (after the stat cards) and `TenantView` (above the tabs); it receives rent figures as props and never reads rental data (verified: nothing under `src/mychama` queries Firestore except the snapshot document).
+diff --git a/functions/src/desk/config.ts b/functions/src/desk/config.ts
+new file mode 100644
+index 0000000..7c63965
+--- /dev/null
++++ b/functions/src/desk/config.ts
+@@ -0,0 +1,101 @@
++// Desk configuration — TypeScript port of the desk kernel's config.ts (CYBER functions-desk/src/config.ts).
++// DEFAULT_DESK_CONFIG must stay identical to the kernel's so PAY and desk always compute the same shares.
++// Runtime-editable in `desk_config/global` (admin dash only). Money in minor units, rates in percent.
++import { DESK, deskDb } from "./db";
++
++export type Rank = "clerk" | "senior" | "lead";
++export type Product = "chama" | "school" | "pms";
++
++export interface DeskConfig {
++  creditCostMinor: number;               // what Samuhia pays per SMS credit: KES 0.20 = 20
++  platformCutPct: number;                // CYBER_ charge cut, taken after Paystack fees
++  expectedPaystackFeePct: number;        // only used to derive SMS margin shares (1.5)
++  smsShareOfMarginPct: number;           // 40
++  firstPurchaseThresholdMinor: number;   // 20000 = KES 200
++  subShareByRank: Record<Rank, number>;  // % of net after fees
++  reportShareByRank: Record<Rank, number>;
++  rentDeskSharePct: number;              // 30 (% of Plot Yangu's take)
++  rentTakeCapMinor: number;              // 25000 = KES 250 per transaction
++  milestone: { blockSize: number; bonusMinor: number; lifetimeCapMinor: number; minPaidMonths: number };
++  paystackAccounts: Record<Product, "main" | "separate">;
++  projects: { chama: string; school: string };
++  topDesk: { dailyPayoutCapMinor: number };
++  delegate: Record<Product, string>;
++  support: { rateMinorPerConfirmed: number; maxConfirmedPerDay: number; monthlyCapMinor: number };
++  prices: {
++    importMinor: number;
++    manualTiers: { upToRecords: number; priceMinor: number }[];
++    manualCapMinor: number;
++    manualServiceFeeMinor: number;
++    commsMinor: number;
++  };
++}
++
++export const DEFAULT_DESK_CONFIG: DeskConfig = {
++  creditCostMinor: 20,
++  platformCutPct: 2.5,
++  expectedPaystackFeePct: 1.5,
++  smsShareOfMarginPct: 40,
++  firstPurchaseThresholdMinor: 20000,
++  subShareByRank: { clerk: 25, senior: 30, lead: 30 },
++  reportShareByRank: { clerk: 25, senior: 30, lead: 30 },
++  rentDeskSharePct: 30,
++  rentTakeCapMinor: 25000,
++  milestone: { blockSize: 10, bonusMinor: 200000, lifetimeCapMinor: 1000000, minPaidMonths: 2 },
++  paystackAccounts: { chama: "main", school: "main", pms: "main" },
++  projects: { chama: "", school: "" },
++  topDesk: { dailyPayoutCapMinor: 5_000_000 },
++  delegate: { chama: "", school: "", pms: "" },
++  support: { rateMinorPerConfirmed: 0, maxConfirmedPerDay: 5, monthlyCapMinor: 0 },
++  prices: {
++    importMinor: 20000,
++    manualTiers: [
++      { upToRecords: 10, priceMinor: 20000 },
++      { upToRecords: 25, priceMinor: 40000 },
++      { upToRecords: 50, priceMinor: 60000 },
++      { upToRecords: 100, priceMinor: 80000 },
++      { upToRecords: 1_000_000, priceMinor: 100000 },
++    ],
++    manualCapMinor: 100000,
++    manualServiceFeeMinor: 20000,
++    commsMinor: 10000,
++  },
++};
++
++/** Deep-merge stored overrides over defaults. Pure. */
++export function mergeConfig(stored: Partial<DeskConfig> | undefined): DeskConfig {
++  const s = stored ?? {};
++  return {
++    ...DEFAULT_DESK_CONFIG,
++    ...s,
++    subShareByRank: { ...DEFAULT_DESK_CONFIG.subShareByRank, ...s.subShareByRank },
++    reportShareByRank: { ...DEFAULT_DESK_CONFIG.reportShareByRank, ...s.reportShareByRank },
++    milestone: { ...DEFAULT_DESK_CONFIG.milestone, ...s.milestone },
++    paystackAccounts: { ...DEFAULT_DESK_CONFIG.paystackAccounts, ...s.paystackAccounts },
++    projects: { ...DEFAULT_DESK_CONFIG.projects, ...s.projects },
++    topDesk: { ...DEFAULT_DESK_CONFIG.topDesk, ...s.topDesk },
++    delegate: { ...DEFAULT_DESK_CONFIG.delegate, ...s.delegate },
++    support: { ...DEFAULT_DESK_CONFIG.support, ...s.support },
++    prices: { ...DEFAULT_DESK_CONFIG.prices, ...s.prices },
++  };
++}
++
++type ReadDoc = () => Promise<Partial<DeskConfig> | undefined>;
++let cache: { at: number; cfg: DeskConfig } | null = null;
++
++/** Cached 60 s. */
++export async function loadDeskConfig(read: ReadDoc, now = Date.now()): Promise<DeskConfig> {
++  if (cache && now - cache.at < 60_000) return cache.cfg;
++  const cfg = mergeConfig(await read());
++  cache = { at: now, cfg };
++  return cfg;
++}
++export function clearDeskConfigCache(): void { cache = null; }
++
++/** The live desk configuration (`desk_config/global` over the defaults), cached for 60 seconds. */
++export function getDeskConfig(): Promise<DeskConfig> {
++  return loadDeskConfig(async () => {
++    const snap = await deskDb().collection(DESK.config).doc("global").get();
++    return snap.exists ? (snap.data() as Partial<DeskConfig>) : undefined;
++  });
++}
+diff --git a/functions/src/desk/db.ts b/functions/src/desk/db.ts
+new file mode 100644
+index 0000000..fb763b1
+--- /dev/null
++++ b/functions/src/desk/db.ts
+@@ -0,0 +1,22 @@
++// Shared Firestore handle and collection names for the desk module.
++// CYBER, PAY and PMS share ONE Firebase project and ONE database, so desk's collections are read and written directly.
++import * as admin from "firebase-admin";
++
++/** Collection names — identical to DESK_COLLECTIONS in the desk kernel's contract.ts (only the ones PAY touches). */
++export const DESK = {
++  config: "desk_config",
++  agents: "desk_agents",
++  customers: "desk_customers",
++  audit: "desk_audit",
++  events: "desk_events",
++  splitCodes: "desk_split_codes",
++} as const;
++
++/** The project's default Firestore (the same one index.ts calls `db`). */
++export function deskDb(): admin.firestore.Firestore {
++  if (!admin.apps.length) admin.initializeApp();
++  return admin.firestore();
++}
++
++/** desk_customers document id for an entity key (the kernel replaces "/" so keys are valid ids). */
++export const customerDocId = (entityKey: string): string => entityKey.replace(/\//g, "_");
+diff --git a/functions/src/desk/events.ts b/functions/src/desk/events.ts
+new file mode 100644
+index 0000000..a367d05
+--- /dev/null
++++ b/functions/src/desk/events.ts
+@@ -0,0 +1,146 @@
++// Create-only desk facts and audit rows, plus the small pure helpers every webhook uses to build them.
++import { DESK, deskDb } from "./db";
++import type { Product } from "./config";
++import type { DeskAuditEntry, DeskCommission, DeskEventDoc, DeskEventType } from "./types";
++
++const TYPES: DeskEventType[] = ["sms_purchase", "subscription_payment", "report_purchase", "rent_payment", "refund"];
++const PRODUCTS: Product[] = ["chama", "school", "pms"];
++const isMinor = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
++const isPeriod = (s: unknown): boolean => typeof s === "string" && /^\d{4}-(0[1-9]|1[0-2])$/.test(s);
++
++/** Same checks the desk events trigger applies — an event that would be rejected there is never written here. */
++export function validateDeskEvent(e: DeskEventDoc): string | null {
++  if (!e || typeof e !== "object") return "event is empty";
++  if (typeof e.eventId !== "string" || !e.eventId || e.eventId.includes("/")) return "invalid eventId";
++  if (!TYPES.includes(e.type)) return "unknown event type";
++  if (!PRODUCTS.includes(e.product)) return "unknown product";
++  if (typeof e.entityKey !== "string" || !e.entityKey) return "missing entityKey";
++  if (typeof e.agentId !== "string" || !e.agentId) return "missing agentId";
++  if (typeof e.paystackRef !== "string" || !e.paystackRef) return "missing paystackRef";
++  if (!isMinor(e.grossMinor) || !isMinor(e.feeMinor) || e.feeMinor > e.grossMinor) return "invalid gross or fee";
++  if (typeof e.agentSharePct !== "number" || !(e.agentSharePct >= 0 && e.agentSharePct < 100)) return "invalid agentSharePct";
++  if (typeof e.paidAt !== "number" || !Number.isFinite(e.paidAt) || e.paidAt <= 0) return "invalid paidAt";
++  if (e.type === "refund" && (typeof e.originalRef !== "string" || !e.originalRef)) return "refund without originalRef";
++  if (e.periodMonth !== undefined && !isPeriod(e.periodMonth)) return "invalid periodMonth";
++  return null;
++}
++
++/**
++ * Create-only write to desk_events/{eventId}. "Already exists" is success (a replayed webhook), reported as `false`.
++ * Throws on an invalid event or a transient Firestore error — callers decide whether that may block (it must never block a payment).
++ */
++export async function writeDeskEvent(event: DeskEventDoc): Promise<boolean> {
++  const bad = validateDeskEvent(event);
++  if (bad) throw new Error(`Invalid desk event ${event?.eventId ?? ""}: ${bad}`);
++  const doc: Record<string, unknown> = { ...event };
++  for (const k of Object.keys(doc)) if (doc[k] === undefined) delete doc[k];
++  try {
++    await deskDb().collection(DESK.events).doc(event.eventId).create(doc);
++    return true;
++  } catch (err) {
++    const e = err as { code?: unknown; message?: string };
++    if (e.code === 6 || e.code === "already-exists" || /already exists/i.test(e.message ?? "")) return false;
++    throw err;
++  }
++}
++
++/** Append-only audit row. Never throws: an audit failure must not break a payment path. Returns the row id or "". */
++export async function writeDeskAudit(entry: DeskAuditEntry): Promise<string> {
++  try {
++    const ref = deskDb().collection(DESK.audit).doc();
++    await ref.create({ ...entry, meta: entry.meta ?? {}, at: Date.now(), source: "pay" });
++    return ref.id;
++  } catch (err) {
++    console.error("desk audit write failed:", entry.action, (err as Error)?.message);
++    return "";
++  }
++}
++
++/** "YYYY-MM" of an instant in Africa/Nairobi (UTC+3, no daylight saving). */
++export function monthKeyEAT(ms: number): string {
++  const d = new Date(ms + 3 * 3_600_000);
++  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
++}
++
++/** Entity keys look like "chama:SMC-0042", "school:<KNEC code>", "pms:<landlordCode>". */
++export function productOfEntityKey(entityKey: unknown): Product | null {
++  if (typeof entityKey !== "string") return null;
++  const p = entityKey.split(":")[0];
++  return p === "chama" || p === "school" || p === "pms" ? p : null;
++}
++
++const numeric = (v: unknown): number | null => {
++  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
++  return typeof n === "number" && Number.isFinite(n) ? n : null;
++};
++
++export interface PaystackMoneyFacts { grossMinor: number; feeMinor: number; paidAt: number }
++/** The real gross and fee (minor units) and paid time from a Paystack charge.success `data` object. null when gross is unusable. */
++export function paystackMoneyFacts(data: unknown, now = Date.now()): PaystackMoneyFacts | null {
++  const d = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
++  const gross = numeric(d.amount);
++  if (gross === null || !Number.isSafeInteger(gross) || gross < 0) return null;
++  const feeRaw = numeric(d.fees);
++  const fee = feeRaw !== null && Number.isSafeInteger(feeRaw) && feeRaw >= 0 ? feeRaw : 0;
++  const paid = typeof d.paid_at === "string" ? Date.parse(d.paid_at) : NaN;
++  return { grossMinor: gross, feeMinor: fee, paidAt: Number.isFinite(paid) && paid > 0 ? paid : now };
++}
++
++/** Validates the `deskCommission` object a charge stored on its pending document. null when it is absent or unusable. */
++export function readDeskCommission(raw: unknown): DeskCommission | null {
++  if (!raw || typeof raw !== "object") return null;
++  const c = raw as Record<string, unknown>;
++  const agentId = typeof c.agentId === "string" ? c.agentId : "";
++  const agentCode = typeof c.agentCode === "string" ? c.agentCode : "";
++  // Chama stores only the desk CODE (the id is looked up in desk_agents); the PAY-side charges store both.
++  if (!agentId && !agentCode) return null;
++  if (typeof c.entityKey !== "string" || !c.entityKey || !productOfEntityKey(c.entityKey)) return null;
++  const share = numeric(c.sharePct);
++  if (share === null || !(share >= 0 && share < 100)) return null;
++  return {
++    agentId,
++    agentCode,
++    sharePct: share,
++    rule: typeof c.rule === "string" ? c.rule : "",
++    entityKey: c.entityKey,
++  };
++}
++
++/** desk_agents lookup by desk code (COG-0001 …). */
++export async function findDeskAgentByCode(agentCode: string): Promise<{ agentId: string } | null> {
++  if (typeof agentCode !== "string" || !agentCode) return null;
++  const snap = await deskDb().collection(DESK.agents).where("agentCode", "==", agentCode).limit(1).get();
++  if (snap.empty) return null;
++  const d = snap.docs[0].data() as { agentId?: unknown };
++  return { agentId: typeof d.agentId === "string" && d.agentId ? d.agentId : snap.docs[0].id };
++}
++
++const pause = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
++
++export type EventOutcome = "written" | "duplicate" | "skipped" | "failed";
++
++/**
++ * writeDeskEvent for payment paths that must not be disturbed: retries a transient failure, and never throws.
++ * An invalid event is skipped; a persistent failure is audited WITH the full event so it can be re-created by hand.
++ */
++export async function writeDeskEventResilient(event: DeskEventDoc, retryDelayMs = 250): Promise<EventOutcome> {
++  for (let attempt = 1; attempt <= 3; attempt++) {
++    try {
++      return (await writeDeskEvent(event)) ? "written" : "duplicate";
++    } catch (err) {
++      const msg = String((err as Error)?.message ?? err);
++      if (/^Invalid desk event/.test(msg)) {
++        console.error("Desk event rejected:", msg);
++        await writeDeskAudit({ action: "desk_event_skipped", agentId: event.agentId, entityKey: event.entityKey, meta: { eventId: event.eventId, reason: msg } });
++        return "skipped";
++      }
++      if (attempt === 3) {
++        console.error("Desk event write failed after retries:", event.eventId, msg);
++        await writeDeskAudit({ action: "desk_event_write_failed", agentId: event.agentId, entityKey: event.entityKey, meta: { eventId: event.eventId, event, error: msg.slice(0, 300) } });
++        return "failed";
++      }
++      await pause(retryDelayMs * attempt);
++    }
++  }
++  return "failed";
++}
+diff --git a/functions/src/desk/hooks.ts b/functions/src/desk/hooks.ts
+new file mode 100644
+index 0000000..026a7a5
+--- /dev/null
++++ b/functions/src/desk/hooks.ts
+@@ -0,0 +1,130 @@
++// Webhook-side desk facts for everything except SMS (see sms.ts): rent, Plot Yangu subscriptions, MyChama platform
++// charges and refunds. Each writes ONLY when the charge carries a deskCommission (written by whoever attached the split).
++import { DESK, deskDb } from "./db";
++import {
++  findDeskAgentByCode, monthKeyEAT, paystackMoneyFacts, productOfEntityKey, readDeskCommission, writeDeskAudit,
++  writeDeskEvent, writeDeskEventResilient, type EventOutcome,
++} from "./events";
++import type { DeskEventDoc, DeskEventType } from "./types";
++
++/** rent_payment — from the `transactions/{reference}` document written by initiateRentCharge. */
++export async function recordRentPaymentEvent(p: { reference: string; data: unknown; transaction: unknown; retryDelayMs?: number }): Promise<EventOutcome> {
++  const c = readDeskCommission((p.transaction as { deskCommission?: unknown } | undefined)?.deskCommission);
++  if (!c) return "skipped";
++  const money = paystackMoneyFacts(p.data);
++  const product = productOfEntityKey(c.entityKey);
++  if (!money || !product) {
++    await writeDeskAudit({ action: "desk_event_skipped", agentId: c.agentId, entityKey: c.entityKey, meta: { reference: p.reference, reason: "unusable_settlement_facts" } });
++    return "skipped";
++  }
++  return writeDeskEventResilient({
++    eventId: `rent_payment:${p.reference}`, type: "rent_payment", product, entityKey: c.entityKey, agentId: c.agentId,
++    paystackRef: p.reference, grossMinor: money.grossMinor, feeMinor: money.feeMinor, agentSharePct: c.sharePct, paidAt: money.paidAt,
++  }, p.retryDelayMs);
++}
++
++/** subscription_payment — Plot Yangu, from `subscriptions/{reference}` when PMS stored a deskCommission on it. */
++export async function recordSubscriptionEvent(p: { reference: string; data: unknown; subscription: unknown; planId?: string; retryDelayMs?: number }): Promise<EventOutcome> {
++  const c = readDeskCommission((p.subscription as { deskCommission?: unknown } | undefined)?.deskCommission);
++  if (!c) return "skipped";
++  const money = paystackMoneyFacts(p.data);
++  const product = productOfEntityKey(c.entityKey);
++  if (!money || !product) {
++    await writeDeskAudit({ action: "desk_event_skipped", agentId: c.agentId, entityKey: c.entityKey, meta: { reference: p.reference, reason: "unusable_settlement_facts" } });
++    return "skipped";
++  }
++  return writeDeskEventResilient({
++    eventId: `subscription_payment:${p.reference}`, type: "subscription_payment", product, entityKey: c.entityKey, agentId: c.agentId,
++    paystackRef: p.reference, grossMinor: money.grossMinor, feeMinor: money.feeMinor, agentSharePct: c.sharePct, paidAt: money.paidAt,
++    periodMonth: monthKeyEAT(money.paidAt), ...(p.planId ? { plan: p.planId } : {}),
++  }, p.retryDelayMs);
++}
++
++// ───────────────────────────── MyChama platform charges ─────────────────────────────
++export type MyChamaDeskKind = "sms_topup" | "plan_billing" | "report_credit_topup" | "report_alacarte";
++const EVENT_TYPE: Record<MyChamaDeskKind, DeskEventType> = {
++  sms_topup: "sms_purchase", plan_billing: "subscription_payment", report_credit_topup: "report_purchase", report_alacarte: "report_purchase",
++};
++/** What the Paystack charge payload adds to a MyChama handler: the real amount and fee (minor units) and the payment time. */
++export interface MyChamaChargeFacts { amountKobo?: unknown; feesKobo?: unknown; paidAt?: unknown }
++
++/**
++ * After the transactional apply succeeded (or was already applied): write the desk event for a MyChama platform charge,
++ * only if the INTENT document has a deskCommission (written by Chama). MCS- -> sms_purchase, MCP- -> subscription_payment
++ * (plan, periodMonth in Africa/Nairobi), MCX-/MCR- -> report_purchase. Contributions, loans and MGR never come here.
++ * Throws only on a transient error (the handlers are idempotent, so the webhook's 500 -> retry is safe).
++ */
++export async function recordMyChamaDeskEvent(p: {
++  kind: MyChamaDeskKind; reference: string; facts?: MyChamaChargeFacts; intent: Record<string, unknown> | undefined;
++}): Promise<EventOutcome> {
++  const c = readDeskCommission(p.intent?.deskCommission);
++  if (!c) return "skipped";
++  const money = paystackMoneyFacts({ amount: p.facts?.amountKobo, fees: p.facts?.feesKobo, paid_at: p.facts?.paidAt });
++  const product = productOfEntityKey(c.entityKey);
++  if (!money || !product) {
++    await writeDeskAudit({ action: "desk_event_skipped", agentId: c.agentId, entityKey: c.entityKey, meta: { reference: p.reference, reason: "unusable_settlement_facts" } });
++    return "skipped";
++  }
++  // Chama stores the desk CODE; the id comes from desk_agents. Prefer the id on the commission only when the code lookup fails.
++  let agentId = c.agentId;
++  if (c.agentCode) {
++    const found = await findDeskAgentByCode(c.agentCode);
++    if (found) agentId = found.agentId;
++  }
++  const type = EVENT_TYPE[p.kind];
++  const credits = Number(p.intent?.credits);
++  const planRaw = p.intent?.toPlan ?? p.intent?.plan;
++  const event: DeskEventDoc = {
++    eventId: `${type}:${p.reference}`, type, product, entityKey: c.entityKey, agentId, paystackRef: p.reference,
++    grossMinor: money.grossMinor, feeMinor: money.feeMinor, agentSharePct: c.sharePct, paidAt: money.paidAt,
++    ...(p.kind === "sms_topup" && Number.isSafeInteger(credits) && credits > 0 ? { credits } : {}),
++    ...(p.kind === "plan_billing" ? { periodMonth: monthKeyEAT(money.paidAt), ...(typeof planRaw === "string" ? { plan: planRaw } : {}) } : {}),
++  };
++  try {
++    return (await writeDeskEvent(event)) ? "written" : "duplicate";
++  } catch (err) {
++    if (/^Invalid desk event/.test((err as Error)?.message ?? "")) {
++      await writeDeskAudit({ action: "desk_event_skipped", agentId, entityKey: c.entityKey, meta: { reference: p.reference, reason: (err as Error).message } });
++      return "skipped";
++    }
++    throw err;
++  }
++}
++
++// ───────────────────────────── refunds ─────────────────────────────
++/** The refunded transaction's reference from a Paystack `refund.processed` payload (transaction_reference). */
++export function refundedReference(data: unknown): string {
++  const d = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
++  const direct = d.transaction_reference;
++  if (typeof direct === "string" && direct) return direct;
++  const nested = (d.transaction as { reference?: unknown } | undefined)?.reference;
++  return typeof nested === "string" ? nested : "";
++}
++
++/**
++ * refund.processed: when a desk_events document exists for the refunded transaction, write the `refund` event (the desk
++ * trigger turns it into reversal rows). Otherwise the refund is none of desk's business and is ignored.
++ */
++export async function recordRefundEvent(data: unknown): Promise<EventOutcome | "ignored"> {
++  const originalRef = refundedReference(data);
++  if (!originalRef) return "ignored";
++  const snap = await deskDb().collection(DESK.events).where("paystackRef", "==", originalRef).limit(10).get();
++  const original = snap.docs.map((d) => d.data() as Partial<DeskEventDoc>).find((e) => e.type !== "refund");
++  if (!original || !original.agentId || !original.entityKey || !original.product) return "ignored";
++  const d = data as Record<string, unknown>;
++  const id = [d.refund_reference, d.id, originalRef].find((v) => (typeof v === "string" && v !== "") || typeof v === "number");
++  const event: DeskEventDoc = {
++    eventId: `refund:${String(id)}`, type: "refund", product: original.product, entityKey: original.entityKey, agentId: original.agentId,
++    paystackRef: originalRef, grossMinor: original.grossMinor as number, feeMinor: original.feeMinor as number,
++    agentSharePct: original.agentSharePct as number, paidAt: Date.now(), originalRef,
++  };
++  try {
++    return (await writeDeskEvent(event)) ? "written" : "duplicate";
++  } catch (err) {
++    if (/^Invalid desk event/.test((err as Error)?.message ?? "")) {
++      await writeDeskAudit({ action: "desk_event_skipped", agentId: event.agentId, entityKey: event.entityKey, meta: { eventId: event.eventId, reason: (err as Error).message } });
++      return "skipped";
++    }
++    throw err;
++  }
++}
+diff --git a/functions/src/desk/index.ts b/functions/src/desk/index.ts
+new file mode 100644
+index 0000000..0289cf0
+--- /dev/null
++++ b/functions/src/desk/index.ts
+@@ -0,0 +1,11 @@
++// Desk module (W3-A). Pure exports only — nothing here is a deployable function. See notes for why the desk rent
++// batch trigger is not part of this module.
++export * from "./config";
++export * from "./money";
++export * from "./owner";
++export * from "./split";
++export * from "./events";
++export * from "./sms";
++export * from "./rent";
++export * from "./hooks";
++export type { DeskEventDoc, DeskCommission, DeskOwner } from "./types";
+diff --git a/functions/src/desk/money.ts b/functions/src/desk/money.ts
+new file mode 100644
+index 0000000..1738747
+--- /dev/null
++++ b/functions/src/desk/money.ts
+@@ -0,0 +1,82 @@
++/**
++ * Pure money logic — TypeScript port of the desk kernel's money.ts. No Firebase imports. Integer minor units only (KES x 100).
++ *
++ * Every desk charge is a Paystack PERCENTAGE split with bearer_type "all-proportional": Paystack deducts its real fee in
++ * proportion to the shares and settles each party's share automatically. An agent with share S% receives exactly S% of
++ * (gross - real fee). These functions choose the share % to put in the split and compute what each party netted.
++ * Keep this file in lock-step with the kernel; the vectors in functions/test/desk-money.check.js pin them together.
++ */
++import type { DeskConfig, Rank } from "./config";
++
++export function assertMinor(n: number, label = "amount"): void {
++  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError(`${label} must be a non-negative integer minor unit, got ${n}`);
++}
++/** 97.5 -> 9750 basis points. Shares are kept to 0.01%. */
++export const toBps = (pct: number): number => Math.round(pct * 100);
++/** Never overpay an agent: round DOWN to 0.01%. The epsilon guards binary-float artefacts (71.03 * 100). */
++export const floorPct2 = (pct: number): number => Math.floor(pct * 100 + 1e-9) / 100;
++export const roundPct2 = (pct: number): number => Math.round(pct * 100) / 100;
++
++export function pctHalfUp(amount: number, pct: number): number {
++  return Math.floor((amount * toBps(pct) + 5000) / 10000);
++}
++
++export type SplitRule =
++  | "service" | "subscription" | "report" | "sms_standard" | "sms_first_purchase" | "rent" | "no_margin";
++export interface SplitPlan { agentSharePct: number; rule: SplitRule }
++
++/** Agent keeps everything except the platform cut, which is taken AFTER Paystack's fee. */
++export function servicePlan(cfg: DeskConfig): SplitPlan {
++  return { agentSharePct: floorPct2(100 - cfg.platformCutPct), rule: "service" };
++}
++
++export function sharePlan(rank: Rank, kind: "subscription" | "report", cfg: DeskConfig): SplitPlan {
++  const pct = (kind === "subscription" ? cfg.subShareByRank : cfg.reportShareByRank)[rank];
++  return { agentSharePct: floorPct2(pct), rule: kind };
++}
++
++/**
++ * Agent target net = s * (gross - fee - creditCost), s = 40% (standard) or 100% (first purchase under the threshold).
++ * With proportional fee bearing the agent nets a * (gross - fee), so a = s * (1 - cost / (gross - fee)).
++ * The fee only turns a margin share into a share of the gross; it uses the configured expected Paystack fee.
++ */
++export function smsPlan(
++  p: { grossMinor: number; credits: number; firstPurchaseEligible: boolean }, cfg: DeskConfig,
++): SplitPlan {
++  assertMinor(p.grossMinor, "gross"); assertMinor(p.credits, "credits");
++  const expectedFee = Math.round((p.grossMinor * cfg.expectedPaystackFeePct) / 100);
++  const base = p.grossMinor - expectedFee;
++  const cost = p.credits * cfg.creditCostMinor;
++  if (base <= cost) return { agentSharePct: 0, rule: "no_margin" };
++  const first = p.firstPurchaseEligible && p.grossMinor < cfg.firstPurchaseThresholdMinor;
++  const s = first ? 1 : cfg.smsShareOfMarginPct / 100;
++  return { agentSharePct: floorPct2(s * (1 - cost / base) * 100), rule: first ? "sms_first_purchase" : "sms_standard" };
++}
++
++/** Plot Yangu's take on a rent payment: rate (0.7%-2% by tier) of rent, capped per transaction. */
++export function rentTake(rentMinor: number, ratePct: number, cfg: DeskConfig): number {
++  assertMinor(rentMinor, "rent");
++  return Math.min(pctHalfUp(rentMinor, ratePct), cfg.rentTakeCapMinor);
++}
++export interface RentPlan { landlordSharePct: number; agentSharePct: number; platformSharePct: number; takeMinor: number }
++/** Three-way split: landlord (100 - take%), desk agent (30% of take%), Samuhia (the rest). */
++export function rentPlan(p: { rentMinor: number; takeMinor: number }, cfg: DeskConfig): RentPlan {
++  if (!Number.isSafeInteger(p.rentMinor) || p.rentMinor <= 0) throw new RangeError("rent must be a positive integer");
++  const takeMinor = Math.min(p.takeMinor, cfg.rentTakeCapMinor);
++  const takePct = (takeMinor / p.rentMinor) * 100;
++  const agentSharePct = floorPct2((takePct * cfg.rentDeskSharePct) / 100);
++  const landlordSharePct = roundPct2(100 - takePct);
++  const platformSharePct = roundPct2(100 - landlordSharePct - agentSharePct);
++  if (platformSharePct < 0 || landlordSharePct <= 0) throw new RangeError("invalid rent split");
++  return { landlordSharePct, agentSharePct, platformSharePct, takeMinor };
++}
++
++export interface Settled { netMinor: number; agentMinor: number; platformMinor: number }
++/** From the webhook's real gross and fee: the agent's automatic payout, rounded down; remainder is Samuhia's. */
++export function settledAmounts(p: { grossMinor: number; feeMinor: number; agentSharePct: number }): Settled {
++  assertMinor(p.grossMinor, "gross"); assertMinor(p.feeMinor, "fee");
++  if (p.feeMinor > p.grossMinor) throw new RangeError("fee exceeds gross");
++  const netMinor = p.grossMinor - p.feeMinor;
++  const agentMinor = Math.floor((netMinor * toBps(p.agentSharePct)) / 10000);
++  return { netMinor, agentMinor, platformMinor: netMinor - agentMinor };
++}
+diff --git a/functions/src/desk/owner.ts b/functions/src/desk/owner.ts
+new file mode 100644
+index 0000000..468daee
+--- /dev/null
++++ b/functions/src/desk/owner.ts
+@@ -0,0 +1,32 @@
++// Who (if anyone) owns this customer on the desk? Read directly from the shared database.
++import { customerDocId, DESK, deskDb } from "./db";
++import type { DeskAgentDoc, DeskCustomerDoc, DeskOwner } from "./types";
++
++const VALID_RANKS = ["clerk", "senior", "lead"];
++
++/**
++ * desk_customers/{entityKey} must name an `ownerAgentId`, must not be `selfOwned`, and the owner must be an `active`
++ * desk_agents record with a payout subaccount in `agents/{id}.paymentInfo.accountId` (the main Paystack account).
++ * Returns null when any of that is missing — the charge then simply carries no desk part.
++ */
++export async function resolveDeskOwner(entityKey: string): Promise<DeskOwner | null> {
++  if (typeof entityKey !== "string" || !entityKey) return null;
++  const db = deskDb();
++  const cSnap = await db.collection(DESK.customers).doc(customerDocId(entityKey)).get();
++  if (!cSnap.exists) return null;
++  const c = cSnap.data() as Partial<DeskCustomerDoc>;
++  if (typeof c.ownerAgentId !== "string" || !c.ownerAgentId || c.selfOwned === true) return null;
++
++  const [dSnap, aSnap] = await Promise.all([
++    db.collection(DESK.agents).doc(c.ownerAgentId).get(),
++    db.collection("agents").doc(c.ownerAgentId).get(),
++  ]);
++  if (!dSnap.exists) return null;
++  const d = dSnap.data() as Partial<DeskAgentDoc>;
++  if (d.status !== "active" || typeof d.agentCode !== "string" || !d.agentCode) return null;
++  if (typeof d.rank !== "string" || !VALID_RANKS.includes(d.rank)) return null;
++
++  const sub = aSnap.exists ? (aSnap.data() as { paymentInfo?: { accountId?: unknown } }).paymentInfo?.accountId : undefined;
++  if (typeof sub !== "string" || !sub.startsWith("ACCT_")) return null;
++  return { agentId: c.ownerAgentId, agentCode: d.agentCode, rank: d.rank, subaccountCode: sub };
++}
+diff --git a/functions/src/desk/paystack.ts b/functions/src/desk/paystack.ts
+new file mode 100644
+index 0000000..76b61ca
+--- /dev/null
++++ b/functions/src/desk/paystack.ts
+@@ -0,0 +1,7 @@
++// The Paystack secret shared by index.ts and the desk module. Declared ONCE (index.ts imports it from here) so the
++// deploy manifest lists the parameter a single time. Bind it with `secrets: [PAYSTACK_SECRET_KEY]` on every function
++// that reaches Paystack or runs the desk code paths.
++import { defineSecret } from "firebase-functions/params";
++
++export const PAYSTACK_SECRET_KEY = defineSecret("PAYSTACK_SECRET_KEY");
++export const PAYSTACK_API_BASE = "https://api.paystack.co";
+diff --git a/functions/src/desk/rent.ts b/functions/src/desk/rent.ts
+new file mode 100644
+index 0000000..1440614
+--- /dev/null
++++ b/functions/src/desk/rent.ts
+@@ -0,0 +1,35 @@
++// Plot Yangu's take on rent. ONE constant table, read at charge time from the landlord's CURRENT tier.
++import { rentPlan, rentTake, roundPct2 } from "./money";
++import type { DeskConfig } from "./config";
++
++/** Owner-confirmed rent take by tier, % of rent (capped at cfg.rentTakeCapMinor per transaction). Unknown tiers use SOLO. */
++export const RENT_TAKE_RATE_BY_TIER = { ENTERPRISE: 0.7, PRO: 1.2, BUSINESS: 1.6, SOLO: 2.0 } as const;
++
++export function rentRateForTier(tier: unknown): number {
++  const key = typeof tier === "string" ? tier.trim().toUpperCase() : "";
++  return Object.prototype.hasOwnProperty.call(RENT_TAKE_RATE_BY_TIER, key)
++    ? RENT_TAKE_RATE_BY_TIER[key as keyof typeof RENT_TAKE_RATE_BY_TIER]
++    : RENT_TAKE_RATE_BY_TIER.SOLO;
++}
++
++export interface RentSplit {
++  ratePct: number; takeMinor: number; takePct: number;
++  landlordSharePct: number; agentSharePct: number; platformSharePct: number; threeWay: boolean;
++}
++
++/**
++ * Two-way (landlord / Samuhia) for a landlord's own charge or a non-owner desk; three-way (landlord 100 - take%,
++ * desk 30% of take%, Samuhia the rest) only when the initiating desk IS the landlord's owner.
++ */
++export function planRentSplit(p: { rentMinor: number; tier: unknown; ownerDesk: boolean }, cfg: DeskConfig): RentSplit {
++  const ratePct = rentRateForTier(p.tier);
++  const takeMinor = rentTake(p.rentMinor, ratePct, cfg);
++  if (p.ownerDesk) {
++    const r = rentPlan({ rentMinor: p.rentMinor, takeMinor }, cfg);
++    return { ratePct, takeMinor: r.takeMinor, takePct: roundPct2((r.takeMinor / p.rentMinor) * 100), landlordSharePct: r.landlordSharePct, agentSharePct: r.agentSharePct, platformSharePct: r.platformSharePct, threeWay: true };
++  }
++  const takePct = (takeMinor / p.rentMinor) * 100;
++  const landlordSharePct = roundPct2(100 - takePct);
++  if (landlordSharePct <= 0) throw new RangeError("invalid rent split");
++  return { ratePct, takeMinor, takePct: roundPct2(takePct), landlordSharePct, agentSharePct: 0, platformSharePct: roundPct2(100 - landlordSharePct), threeWay: false };
++}
+diff --git a/functions/src/desk/rentCharge.ts b/functions/src/desk/rentCharge.ts
+new file mode 100644
+index 0000000..502eb47
+--- /dev/null
++++ b/functions/src/desk/rentCharge.ts
+@@ -0,0 +1,128 @@
++// The ONE function that starts a rent STK push. processPayment (landlord / tenant initiated) calls it, and so will the
++// desk-initiated batch runner. Extracted from processPayment — the Paystack call, the records and the payload are the
++// same; what changed is the money: the landlord's share is 100 - take% where the take is rentTake(rent, tier rate, cap).
++import * as admin from "firebase-admin";
++import axios from "axios";
++import { HttpsError } from "firebase-functions/v2/https";
++import { deskDb } from "./db";
++import { getDeskConfig } from "./config";
++import { resolveDeskOwner } from "./owner";
++import { planRentSplit } from "./rent";
++import { getOrCreateDeskSplit, type SplitSub } from "./split";
++import { writeDeskAudit } from "./events";
++import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "./paystack";
++import type { DeskCommission } from "./types";
++
++export interface RentChargeInput {
++  email: string;
++  /** KES the tenant pays now (what the STK prompt asks for). */
++  amount: number;
++  currency: string;
++  phone: string;
++  provider: string;
++  metadata: { userId: string; userName: string; invoiceId: string; billingMonth: string; arrears: unknown; agentId: string };
++  /** Set only for a desk-initiated charge. The 3-way split applies only if this desk is the landlord's owner. */
++  desk?: { agentId: string; batchId: string };
++}
++
++export interface RentChargeResult { reference: string; status: string; displayText: string; accountReference?: string }
++
++/** +254XXXXXXXXX for Paystack's Kenya M-Pesa charge (same normalisation processPayment always used). */
++export function formatKenyaPhone(phone: string): string {
++  let p = String(phone).replace(/[\s-]/g, "");
++  if (p.startsWith("+254")) return p;
++  if (p.startsWith("254")) return "+" + p;
++  if (p.startsWith("0")) return "+254" + p.substring(1);
++  if (p.startsWith("7") || p.startsWith("1")) return "+254" + p;
++  if (p.startsWith("+")) return "+254" + p.substring(1);
++  return p;
++}
++
++export async function initiateRentCharge(input: RentChargeInput): Promise<RentChargeResult> {
++  const db = deskDb();
++  const { email, amount, currency, phone, provider, metadata } = input;
++  const { userId, userName, invoiceId, billingMonth, arrears, agentId } = metadata;
++
++  const rentMinor = Math.round(Number(amount) * 100);
++  if (!Number.isSafeInteger(rentMinor) || rentMinor <= 0) throw new HttpsError("invalid-argument", "Amount must be greater than zero");
++
++  // The landlord (PAY/PMS call the landlord `agent`: users/{uid}); paymentInfo.accountId = the landlord's rent subaccount.
++  const landlordDoc = await db.collection("users").doc(agentId).get();
++  if (!landlordDoc.exists) throw new HttpsError("not-found", "Agent not found in database");
++  const landlord = landlordDoc.data() as { paymentInfo?: { accountId?: string }; tier?: string; landlordCode?: string };
++  const landlordSub = landlord.paymentInfo?.accountId;
++  if (!landlordSub) throw new HttpsError("failed-precondition", "Agent has not set up payment account. Please configure payment details first.");
++
++  // Desk part: only a desk that OWNS this landlord earns on rent. Any failure degrades to the normal two-way split.
++  let ownerDesk: { agentId: string; agentCode: string; subaccountCode: string } | null = null;
++  const entityKey = landlord.landlordCode ? `pms:${landlord.landlordCode}` : "";
++  if (input.desk && entityKey) {
++    try {
++      const owner = await resolveDeskOwner(entityKey);
++      if (owner && owner.agentId === input.desk.agentId) ownerDesk = owner;
++    } catch (err) {
++      console.error("Desk rent resolution failed — charging with the normal two-way split:", (err as Error)?.message);
++      await writeDeskAudit({ action: "desk_rent_resolution_failed", agentId: input.desk.agentId, entityKey, meta: { batchId: input.desk.batchId, error: String((err as Error)?.message ?? err).slice(0, 300) } });
++    }
++  }
++
++  const cfg = await getDeskConfig();
++  // The landlord's CURRENT tier, read now (paymentInfo.split on the user document goes stale when the tier changes).
++  const plan = planRentSplit({ rentMinor, tier: landlord.tier, ownerDesk: ownerDesk !== null }, cfg);
++  const subs: SplitSub[] = [{ subaccount: landlordSub, sharePct: plan.landlordSharePct }];
++  if (ownerDesk && plan.agentSharePct > 0) subs.push({ subaccount: ownerDesk.subaccountCode, sharePct: plan.agentSharePct });
++  const splitCode = await getOrCreateDeskSplit(subs, "rent");
++
++  const formattedPhone = formatKenyaPhone(phone);
++  const reference = `INV_${userId}_${Date.now()}`;
++  const deskCommission: DeskCommission | null = ownerDesk && plan.agentSharePct > 0
++    ? { agentCode: ownerDesk.agentCode, agentId: ownerDesk.agentId, sharePct: plan.agentSharePct, rule: "rent", entityKey }
++    : null;
++
++  const chargePayload = {
++    email,
++    amount: rentMinor,
++    currency,
++    mobile_money: { phone: formattedPhone, provider },
++    reference,
++    split_code: splitCode,
++    metadata: {
++      userId, userName, invoiceId, billingMonth, arrears, agentId, originalAmount: amount,
++      ...(input.desk ? { deskBatchId: input.desk.batchId, deskAgentId: input.desk.agentId } : {}),
++    },
++  };
++
++  const paystackResponse = await axios.post(`${PAYSTACK_API_BASE}/charge`, chargePayload, {
++    headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`, "Content-Type": "application/json" },
++  });
++  if (!paystackResponse.data.status) {
++    throw new HttpsError("internal", `Paystack API error: ${paystackResponse.data.message}`);
++  }
++  const tx = paystackResponse.data.data;
++  const status = tx.status || "pending";   // can be "pay_offline", "pending", etc.
++
++  const paymentRecord = {
++    userName, agentId, amount, arrears, invoiceId, billingMonth, currency, phone: formattedPhone, provider,
++    reference: tx.reference, status, displayText: tx.display_text, accountReference: tx.account_reference,
++    initiatedAt: new Date().toISOString(), subaccountCode: landlordSub, commissionRate: plan.takePct, splitCode,
++  };
++  await db.collection("payments").doc(userId).collection("billingMonths").doc(billingMonth).set(
++    { payments: admin.firestore.FieldValue.arrayUnion(paymentRecord), lastUpdated: admin.firestore.FieldValue.serverTimestamp() },
++    { merge: true },
++  );
++
++  const txnDoc: Record<string, unknown> = {
++    userName, email, phone: formattedPhone, provider, currency, userId, agentId, invoiceId, billingMonth, amount, arrears,
++    status, reference: tx.reference, displayText: tx.display_text, accountReference: tx.account_reference, splitCode,
++    // the money, so the books can be audited from the document alone
++    tier: String(landlord.tier ?? "").toLowerCase() || null, takeRatePct: plan.ratePct, takeMinor: plan.takeMinor, takePct: plan.takePct,
++    landlordSharePct: plan.landlordSharePct, agentSharePct: plan.agentSharePct, platformSharePct: plan.platformSharePct,
++    createdAt: admin.firestore.FieldValue.serverTimestamp(),
++  };
++  if (deskCommission) txnDoc.deskCommission = deskCommission;
++  if (input.desk) { txnDoc.deskBatchId = input.desk.batchId; txnDoc.deskAgentId = input.desk.agentId; }
++  await db.collection("transactions").doc(tx.reference).set(txnDoc);
++
++  return { reference: tx.reference, status: tx.status, displayText: tx.display_text || "Check your phone for the M-Pesa prompt", accountReference: tx.account_reference };
++}
++
+diff --git a/functions/src/desk/sms.ts b/functions/src/desk/sms.ts
+new file mode 100644
+index 0000000..845c432
+--- /dev/null
++++ b/functions/src/desk/sms.ts
+@@ -0,0 +1,127 @@
++// SMS top-up commissions (Plot Yangu and MyRegister, both charged on the MAIN Paystack account by chargeSmsTopUp).
++//   plan   — when the charge starts: resolve the desk owner, reserve the first-purchase rule, build the split
++//   settle — in the webhook, after the tokens were credited: write the desk_events fact
++//   release— on a failed / abandoned charge: free the first-purchase reservation
++// A desk commission must NEVER block a customer's payment: every failure here degrades to "no desk split", leaves an
++// audit row and a log line, and the charge proceeds.
++import * as admin from "firebase-admin";
++import { customerDocId, DESK, deskDb } from "./db";
++import { getDeskConfig, type DeskConfig } from "./config";
++import { smsPlan } from "./money";
++import { resolveDeskOwner } from "./owner";
++import { getOrCreateDeskSplit } from "./split";
++import { paystackMoneyFacts, productOfEntityKey, readDeskCommission, writeDeskAudit, writeDeskEventResilient, type EventOutcome } from "./events";
++import type { DeskCommission, DeskCustomerDoc } from "./types";
++
++/** A first-purchase reservation older than this is dead (the charge was abandoned and never reported failed). */
++export const FIRST_PURCHASE_RESERVATION_MS = 30 * 60 * 1000;
++
++export type DeskSmsPlan =
++  | { applied: false; reason: string }
++  | { applied: true; splitCode: string; commission: DeskCommission; reservedFirstPurchase: boolean };
++
++interface ReserveOutcome { exists: boolean; sharePct: number; rule: string; reserved: boolean }
++
++/** Eligibility + share + reservation in ONE transaction, so two concurrent charges can never both be a "first purchase". */
++async function planAndReserve(
++  entityKey: string, reference: string, grossMinor: number, credits: number, cfg: DeskConfig, now: number,
++): Promise<ReserveOutcome> {
++  const db = deskDb();
++  const ref = db.collection(DESK.customers).doc(customerDocId(entityKey));
++  return db.runTransaction(async (tx) => {
++    const snap = await tx.get(ref);
++    if (!snap.exists) return { exists: false, sharePct: 0, rule: "no_customer", reserved: false };
++    const c = snap.data() as Partial<DeskCustomerDoc>;
++    const liveReservation = typeof c.firstPurchaseReservedRef === "string" && c.firstPurchaseReservedRef !== ""
++      && typeof c.firstPurchaseReservedAt === "number" && now - c.firstPurchaseReservedAt < FIRST_PURCHASE_RESERVATION_MS;
++    const eligible = c.firstPurchaseUsed !== true && !liveReservation;
++    const plan = smsPlan({ grossMinor, credits, firstPurchaseEligible: eligible }, cfg);
++    // The reservation is taken only when the first-purchase rule is what produced this share; the events trigger consumes it.
++    const reserved = plan.rule === "sms_first_purchase";
++    if (reserved) tx.update(ref, { firstPurchaseReservedRef: reference, firstPurchaseReservedAt: now });
++    return { exists: true, sharePct: plan.agentSharePct, rule: plan.rule, reserved };
++  });
++}
++
++/**
++ * Called by chargeSmsTopUp for a Plot Yangu landlord (and for a verified school, see notes). Returns the split to attach
++ * to the charge and the `deskCommission` to store on the pending document, or `applied:false` (the plain charge).
++ */
++export async function planDeskSmsCharge(p: {
++  entityKey: string; reference: string; grossMinor: number; credits: number; now?: number;
++}): Promise<DeskSmsPlan> {
++  const now = p.now ?? Date.now();
++  let reserved = false;
++  try {
++    if (!productOfEntityKey(p.entityKey)) return { applied: false, reason: "invalid_entity_key" };
++    const owner = await resolveDeskOwner(p.entityKey);
++    if (!owner) return { applied: false, reason: "no_desk_owner" };
++    const cfg = await getDeskConfig();
++    const out = await planAndReserve(p.entityKey, p.reference, p.grossMinor, p.credits, cfg, now);
++    reserved = out.reserved;
++    if (!out.exists || !(out.sharePct > 0)) {
++      return { applied: false, reason: out.rule };   // "no_margin": the desk earns nothing on this purchase
++    }
++    const splitCode = await getOrCreateDeskSplit([{ subaccount: owner.subaccountCode, sharePct: out.sharePct }], "sms");
++    return {
++      applied: true, splitCode, reservedFirstPurchase: out.reserved,
++      commission: { agentCode: owner.agentCode, agentId: owner.agentId, sharePct: out.sharePct, rule: out.rule, entityKey: p.entityKey },
++    };
++  } catch (err) {
++    console.error("Desk SMS commission failed — charging without a desk split:", p.reference, (err as Error)?.message);
++    if (reserved) await releaseFirstPurchaseReservation(p.entityKey, p.reference);
++    await writeDeskAudit({ action: "desk_sms_resolution_failed", entityKey: p.entityKey, meta: { reference: p.reference, error: String((err as Error)?.message ?? err).slice(0, 300) } });
++    return { applied: false, reason: "desk_resolution_failed" };
++  }
++}
++
++/** Frees the reservation, but only if it is still THIS charge's (a newer charge may legitimately hold it). */
++export async function releaseFirstPurchaseReservation(entityKey: string, reference: string): Promise<boolean> {
++  try {
++    const db = deskDb();
++    const ref = db.collection(DESK.customers).doc(customerDocId(entityKey));
++    return await db.runTransaction(async (tx) => {
++      const snap = await tx.get(ref);
++      if (!snap.exists || (snap.data() as Partial<DeskCustomerDoc>).firstPurchaseReservedRef !== reference) return false;
++      tx.update(ref, {
++        firstPurchaseReservedRef: admin.firestore.FieldValue.delete(),
++        firstPurchaseReservedAt: admin.firestore.FieldValue.delete(),
++      });
++      return true;
++    });
++  } catch (err) {
++    console.error("Could not release the first-purchase reservation:", reference, (err as Error)?.message);
++    await writeDeskAudit({ action: "desk_reservation_release_failed", entityKey, meta: { reference, error: String((err as Error)?.message ?? err).slice(0, 300) } });
++    return false;
++  }
++}
++
++/** charge.failed / abandoned: release the reservation recorded on the pending sms-topup-transactions document. */
++export async function releaseSmsReservationFor(pending: unknown, reference: string): Promise<boolean> {
++  const c = readDeskCommission((pending as { deskCommission?: unknown } | undefined)?.deskCommission);
++  return c ? releaseFirstPurchaseReservation(c.entityKey, reference) : false;
++}
++
++/**
++ * Settlement: after the token credit succeeded and ONLY if the pending document carries a deskCommission, write
++ * `sms_purchase:<reference>` with the REAL gross and fee from the webhook. Create-only, so a replayed webhook adds nothing.
++ * Never throws (the tokens are already credited; throwing would make Paystack replay the webhook and credit twice).
++ */
++export async function recordSmsPurchaseEvent(p: {
++  reference: string; tokens: number; data: unknown; pending: unknown; retryDelayMs?: number;
++}): Promise<EventOutcome> {
++  const commission = readDeskCommission((p.pending as { deskCommission?: unknown } | undefined)?.deskCommission);
++  if (!commission) return "skipped";
++  const money = paystackMoneyFacts(p.data);
++  const product = productOfEntityKey(commission.entityKey);
++  if (!money || !product || !Number.isSafeInteger(p.tokens) || p.tokens < 1) {
++    console.error("Desk SMS event not written — unusable settlement facts:", p.reference);
++    await writeDeskAudit({ action: "desk_event_skipped", agentId: commission.agentId, entityKey: commission.entityKey, meta: { reference: p.reference, reason: "unusable_settlement_facts" } });
++    return "skipped";
++  }
++  return writeDeskEventResilient({
++    eventId: `sms_purchase:${p.reference}`, type: "sms_purchase", product, entityKey: commission.entityKey,
++    agentId: commission.agentId, paystackRef: p.reference, grossMinor: money.grossMinor, feeMinor: money.feeMinor,
++    agentSharePct: commission.sharePct, paidAt: money.paidAt, credits: p.tokens,
++  }, p.retryDelayMs);
++}
+diff --git a/functions/src/desk/split.ts b/functions/src/desk/split.ts
+new file mode 100644
+index 0000000..9da073a
+--- /dev/null
++++ b/functions/src/desk/split.ts
+@@ -0,0 +1,61 @@
++// Paystack percentage splits for desk charges. Cached in `desk_split_codes` under the SAME key and document shape as the
++// desk kernel's paystack/splits.ts, so CYBER, PAY and PMS share entries. Never use the legacy splitCodes/{agentId} cache.
++import { createHash } from "crypto";
++import axios from "axios";
++import { DESK, deskDb } from "./db";
++import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "./paystack";
++import { toBps } from "./money";
++
++export interface SplitSub { subaccount: string; sharePct: number }
++
++/** Stable cache key: same subaccounts + same shares (to 0.01%) -> same Paystack split code. */
++export function splitKey(subs: readonly SplitSub[]): string {
++  const canon = [...subs].map((s) => `${s.subaccount}:${toBps(s.sharePct)}`).sort().join("|");
++  return createHash("sha256").update(canon).digest("hex").slice(0, 32);
++}
++
++/** Every share in (0,100), total < 100 (the main account keeps the remainder), subaccounts start ACCT_. */
++export function validateSplit(subs: readonly SplitSub[]): void {
++  if (subs.length === 0) throw new Error("Split needs at least one subaccount");
++  let total = 0;
++  for (const s of subs) {
++    if (typeof s.subaccount !== "string" || !s.subaccount.startsWith("ACCT_")) throw new Error("Invalid Paystack subaccount code");
++    if (!(s.sharePct > 0 && s.sharePct < 100)) throw new Error("Split share must be between 0 and 100");
++    total += toBps(s.sharePct);
++  }
++  if (total >= 10000) throw new Error("Split shares leave nothing for the platform");
++}
++
++/**
++ * Get or create a Paystack percentage split (bearer "all-proportional": the fee is shared in proportion, so every party
++ * receives its share of the amount AFTER Paystack's real fee). The main account takes the remainder.
++ */
++export async function getOrCreateDeskSplit(subs: readonly SplitSub[], label: string): Promise<string> {
++  validateSplit(subs);
++  const key = splitKey(subs);
++  const ref = deskDb().collection(DESK.splitCodes).doc(key);
++  const cached = await ref.get();
++  const hit = cached.exists ? (cached.data() as { splitCode?: unknown }).splitCode : undefined;
++  if (typeof hit === "string" && hit) return hit;
++
++  const res = await axios.post(`${PAYSTACK_API_BASE}/split`, {
++    name: `Desk ${label} ${key.slice(0, 8)}`.slice(0, 100),
++    type: "percentage",
++    currency: "KES",
++    subaccounts: subs.map((s) => ({ subaccount: s.subaccount, share: s.sharePct })),
++    bearer_type: "all-proportional",
++  }, { timeout: 15_000, headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`, "Content-Type": "application/json" } });
++  const splitCode = res.data?.status ? res.data?.data?.split_code : undefined;
++  if (typeof splitCode !== "string" || !splitCode) throw new Error(`Could not create split: ${res.data?.message ?? "no split code returned"}`);
++
++  try {
++    await ref.create({ splitCode, subs: subs.map((s) => ({ ...s })), label, createdAt: Date.now() });
++    return splitCode;
++  } catch (err) {
++    if ((err as { code?: number }).code === 6) { // a concurrent request cached first: use the stored code
++      const again = (await ref.get()).data() as { splitCode?: string } | undefined;
++      if (again?.splitCode) return again.splitCode;
++    }
++    throw err;
++  }
++}
+diff --git a/functions/src/desk/types.ts b/functions/src/desk/types.ts
+new file mode 100644
+index 0000000..d59409d
+--- /dev/null
++++ b/functions/src/desk/types.ts
+@@ -0,0 +1,38 @@
++// Document shapes the desk module reads and writes. DeskEventDoc mirrors the desk kernel's types.ts exactly.
++import type { Product, Rank } from "./config";
++
++export type DeskEventType =
++  | "sms_purchase" | "subscription_payment" | "report_purchase" | "rent_payment" | "refund";
++
++/**
++ * Create-only facts written by PAY AFTER a split charge succeeds.
++ * `eventId` = `<type>:<paystackRef>` so a replayed webhook can never double-count.
++ */
++export interface DeskEventDoc {
++  eventId: string; type: DeskEventType; product: Product; entityKey: string;
++  agentId: string; paystackRef: string; grossMinor: number; feeMinor: number;
++  /** The exact share % that was put into the Paystack split for the agent on this charge. */
++  agentSharePct: number; paidAt: number;
++  credits?: number; plan?: string; periodMonth?: string; originalRef?: string;
++}
++
++/** desk_customers/{entityKey} — owned by desk; PAY reads it and only touches the first-purchase reservation fields. */
++export interface DeskCustomerDoc {
++  entityKey: string; product: Product; ownerAgentId: string; attributedAt: number;
++  firstPurchaseUsed: boolean; firstPurchaseReservedRef?: string; firstPurchaseReservedAt?: number;
++  lastPaidAt?: number; selfOwned?: boolean; refunded?: boolean; paidPeriods: string[];
++}
++
++/** desk_agents/{uid}. */
++export interface DeskAgentDoc {
++  agentId: string; agentCode: string; status: string; rank: Rank;
++}
++
++/** What the charging code stores on the pending transaction document so the webhook can record the event. */
++export interface DeskCommission {
++  agentCode: string; agentId: string; sharePct: number; rule: string; entityKey: string;
++}
++
++export interface DeskOwner { agentId: string; agentCode: string; rank: Rank; subaccountCode: string }
++
++export interface DeskAuditEntry { action: string; agentId?: string; entityKey?: string; meta?: Record<string, unknown> }
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index 1467240..1cf25ec 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -4,7 +4,6 @@
+ 
+ import { onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
+ import { onRequest } from "firebase-functions/v2/https";
+-import { defineSecret } from "firebase-functions/params";
+ import * as admin from "firebase-admin";
+ import axios from "axios";
+ import * as crypto from "crypto";
+@@ -38,6 +37,12 @@ function myregisterDb(): admin.firestore.Firestore {
+   return myregisterDbCached;
+ }
+ 
++import { PAYSTACK_SECRET_KEY, PAYSTACK_API_BASE } from "./desk/paystack";
++import { getDeskConfig } from "./desk/config";
++import { rentRateForTier } from "./desk/rent";
++import { initiateRentCharge } from "./desk/rentCharge";
++import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
++import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
+ import { mychamaDb } from "./mychama/config";
+ import { MYCHAMA_HP_SECRETS } from "./mychama/sms";
+ import {
+@@ -54,16 +59,7 @@ export * from "./auth";
+ 
+ 
+ // ============= CONFIGURATION =============
+-const PAYSTACK_SECRET_KEY = defineSecret('PAYSTACK_SECRET_KEY');
+-const PAYSTACK_API_BASE = "https://api.paystack.co";
+-
+-// Tier commission rates
+-const TIER_RATES = {
+-  ENTERPRISE: 1.0,
+-  PRO: 1.9,
+-  BUSINESS: 1.5,
+-  SOLO: 2.4,
+-} as const;
++// PAYSTACK_SECRET_KEY / PAYSTACK_API_BASE are declared once in ./desk/paystack (shared with the desk module).
+ 
+ 
+ //declare const project2App: admin.app.App;
+@@ -100,6 +96,9 @@ const PMS_TIER_SMS_RATE: Record<string, number> = {
+   enterprise: 0.45,
+ };
+ 
++/** Free SMS tokens granted to a self sign-up. They are a gift, not a purchase: they never earn commission. */
++const PMS_SIGNUP_FREE_TOKENS = 50;
++
+ const PMS_DEFAULT_SMS_RATE = 0.75; // free / low / starter / anything unrecognized
+  
+ /**
+@@ -170,8 +169,21 @@ export const chargeSmsTopUp = onCall({
+     const amountInCents = Math.round(amountKes * 100);
+     const reference = `SMS_${userId}_${Date.now()}`;
+ 
++    // ── Desk commission (Plot Yangu landlords). It must never block the purchase: planDeskSmsCharge degrades to
++    //    "no desk split" (with an audit row) on any failure. MyRegister: see the notes — school ownership cannot be
++    //    verified from the data PAY can read, so Register top-ups carry no desk part.
++    let deskSplitCode: string | undefined;
++    let deskCommission: Record<string, unknown> | undefined;
++    if (targetApp === 'pms') {
++      const landlordCode = (await db.collection("users").doc(userId).get()).data()?.landlordCode;
++      if (typeof landlordCode === "string" && landlordCode) {
++        const plan = await planDeskSmsCharge({ entityKey: `pms:${landlordCode}`, reference, grossMinor: amountInCents, credits: Math.round(Number(tokens)) });
++        if (plan.applied) { deskSplitCode = plan.splitCode; deskCommission = { ...plan.commission }; }
++      }
++    }
++
+     const chargePayload = {
+-      email: `${userId}@cogvana.co.ke`,
++      email: `${userId}@samuhia.co.ke`,
+       amount: amountInCents,
+       currency: "KES",
+       mobile_money: {
+@@ -179,6 +191,7 @@ export const chargeSmsTopUp = onCall({
+         provider: "mpesa",
+       },
+       reference,
++      ...(deskSplitCode ? { split_code: deskSplitCode } : {}),
+       metadata: {
+         chargeType: "sms_topup",
+         targetProject: targetApp === 'pms' ? 'pms' : 'project2', // ← tells webhook which Firestore/field to settle in
+@@ -193,19 +206,25 @@ export const chargeSmsTopUp = onCall({
+ 
+     console.log("SMS top-up charge request:", JSON.stringify(chargePayload, null, 2));
+ 
+-    const paystackResponse = await axios.post(
+-      `${PAYSTACK_API_BASE}/charge`,
+-      chargePayload,
+-      {
+-        headers: {
+-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`,
+-          "Content-Type": "application/json",
+-        },
++    let paystackResponse;
++    try {
++      paystackResponse = await axios.post(
++        `${PAYSTACK_API_BASE}/charge`,
++        chargePayload,
++        {
++          headers: {
++            Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`,
++            "Content-Type": "application/json",
++          },
++        }
++      );
++      if (!paystackResponse.data.status) {
++        throw new HttpsError("internal", `Paystack error: ${paystackResponse.data.message}`);
+       }
+-    );
+-
+-    if (!paystackResponse.data.status) {
+-      throw new HttpsError("internal", `Paystack error: ${paystackResponse.data.message}`);
++    } catch (chargeError) {
++      // The charge never started: free a first-purchase reservation taken for it.
++      if (deskCommission) await releaseFirstPurchaseReservation(String(deskCommission.entityKey), reference);
++      throw chargeError;
+     }
+ 
+     const txData = paystackResponse.data.data;
+@@ -222,6 +241,7 @@ export const chargeSmsTopUp = onCall({
+       status: txData.status || "pending",
+       displayText: txData.display_text || null,
+       accountReference: txData.account_reference || null,
++      ...(deskCommission ? { deskCommission } : {}),
+       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+     });
+ 
+@@ -314,6 +334,9 @@ async function handleSmsTopUp(
+       `amountKes: ${amountKes}, gross: ${safeGross}, fees: ${safeFees}, received: ${safeReceived}`
+     );
+ 
++    // The pending document (written by chargeSmsTopUp) carries deskCommission when a desk split was attached.
++    const pendingTopUp = (await db2.collection("sms-topup-transactions").doc(reference).get()).data();
++
+     // 1. Mark the pending transaction as success in project-2
+     await db2.collection("sms-topup-transactions").doc(reference).set(
+       {
+@@ -391,6 +414,9 @@ async function handleSmsTopUp(
+       { merge: true }
+     );
+ 
++    // 6. Desk fact (only when the purchase carried a desk commission); never throws, create-only per reference.
++    await recordSmsPurchaseEvent({ reference, tokens, data, pending: pendingTopUp });
++
+     console.log(
+       `✅ SMS top-up settled (project-2):\n` +
+       `   User:   ${userId}\n` +
+@@ -450,6 +476,9 @@ async function handlePmsSmsTopUp(
+     const safeFees = Number.isFinite(paystackFees) ? paystackFees : 0;
+     const safeReceived = Number.isFinite(amountReceived) ? amountReceived : safeGross - safeFees;
+ 
++    // The pending document (written by chargeSmsTopUp) carries deskCommission when a desk split was attached.
++    const pendingTopUp = (await db.collection("sms-topup-transactions").doc(reference).get()).data();
++
+     // 1. Mark the pending transaction as success — default project
+     await db.collection("sms-topup-transactions").doc(reference).set(
+       {
+@@ -527,6 +556,9 @@ async function handlePmsSmsTopUp(
+       { merge: true }
+     );
+ 
++    // 6. Desk fact (only when the purchase carried a desk commission); never throws, create-only per reference.
++    await recordSmsPurchaseEvent({ reference, tokens, data, pending: pendingTopUp });
++
+     console.log(
+       `✅ PMS SMS top-up settled:\n` +
+       `   User:   ${userId} (${userTier} tier @ KES ${ratePerToken}/token)\n` +
+@@ -1354,8 +1386,8 @@ export const setupAccount = onCall({
+     const userData = userDoc.data();
+     const userTier = userData?.tier?.toUpperCase() || "SOLO";
+ 
+-    // Determine commission rate based on tier
+-    const commissionRate = TIER_RATES[userTier as keyof typeof TIER_RATES] || TIER_RATES.SOLO;
++    // Determine the take rate from the tier (one table: ./desk/rent RENT_TAKE_RATE_BY_TIER; unknown tiers use SOLO)
++    const commissionRate = rentRateForTier(userTier);
+ 
+     console.log(`Setting up account for user ${userId} with tier ${userTier} at ${commissionRate}%`);
+ 
+@@ -1568,174 +1600,17 @@ export const processPayment = onCall({
+       );
+     }
+ 
+-    const { userId, userName, invoiceId, billingMonth, arrears, agentId } = metadata;
+-
+-    // Get agent's payment info (subaccount)
+-    const agentDoc = await db.collection("users").doc(agentId).get();
+-
+-    if (!agentDoc.exists) {
+-      throw new HttpsError(
+-        "not-found",
+-        "Agent not found in database"
+-      );
+-    }
+-
+-    const agentData = agentDoc.data();
+-    const paymentInfo = agentData?.paymentInfo;
+-
+-    if (!paymentInfo || !paymentInfo.accountId) {
+-      throw new HttpsError(
+-        "failed-precondition",
+-        "Agent has not set up payment account. Please configure payment details first."
+-      );
+-    }
+-
+-    const subaccountCode = paymentInfo.accountId;
+-    const commissionRate = paymentInfo.split || 2.1;
+-
+-    console.log(`Processing payment for user ${userId}, agent ${agentId}, amount ${amount}`);
+-
+-    // Get or create split code
+-    const splitCode = await getOrCreateSplitCode(subaccountCode, commissionRate, agentId);
+-
+-    // Format phone number for Paystack Kenya M-Pesa charge (+254XXXXXXXXX format)
+-    let formattedPhone = phone.replace(/[\s-]/g, ''); // Remove spaces and dashes, keep +
+-    
+-    // Ensure it has the + prefix and 254 country code
+-    if (formattedPhone.startsWith('+254')) {
+-      // Already correct format
+-      formattedPhone = formattedPhone;
+-    } else if (formattedPhone.startsWith('254')) {
+-      // Add the + prefix
+-      formattedPhone = '+' + formattedPhone;
+-    } else if (formattedPhone.startsWith('0')) {
+-      // Convert from local (0XXXXXXXXX) to international (+254XXXXXXXXX)
+-      formattedPhone = '+254' + formattedPhone.substring(1);
+-    } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
+-      // Just the last 9 digits
+-      formattedPhone = '+254' + formattedPhone;
+-    } else if (formattedPhone.startsWith('+')) {
+-      // Has + but might not have 254
+-      if (!formattedPhone.startsWith('+254')) {
+-        formattedPhone = '+254' + formattedPhone.substring(1);
+-      }
+-    }
+-    
+-    console.log(`Formatted phone for M-Pesa charge (+254 format): ${phone} -> ${formattedPhone}`);
+-
+-    // Convert amount to cents
+-    const amountInCents = Math.round(amount * 100);
+-
+-    // Charge payload with split_code
+-    const chargePayload = {
+-      email: email,
+-      amount: amountInCents,
+-      currency: currency,
+-      mobile_money: {
+-        phone: formattedPhone,
+-        provider: provider,
+-      },
+-      reference: `INV_${userId}_${Date.now()}`,
+-      split_code: splitCode,  // Use split_code instead of split object
+-      metadata: {
+-        userId: userId,
+-        userName: userName,
+-        invoiceId: invoiceId,
+-        billingMonth: billingMonth,
+-        arrears: arrears,
+-        agentId: agentId,
+-        originalAmount: amount,
+-      },
+-    };
+-
+-    console.log('Paystack charge request:', JSON.stringify(chargePayload, null, 2));
+-
+-    const paystackResponse = await axios.post(
+-      `${PAYSTACK_API_BASE}/charge`,
+-      chargePayload,
+-      { headers: {
+-        'Authorization': `Bearer ${PAYSTACK_SECRET_KEY.value()}`,
+-        'Content-Type': 'application/json'
+-      } }
+-    );
+-
+-    console.log('Paystack response:', JSON.stringify(paystackResponse.data, null, 2));
+-
+-    if (!paystackResponse.data.status) {
+-      throw new HttpsError(
+-        "internal",
+-        `Paystack API error: ${paystackResponse.data.message}`
+-      );
+-    }
+-
+-    const transactionData = paystackResponse.data.data;
+-
+-    console.log(`Payment charge initiated: ${transactionData.reference}, status: ${transactionData.status}`);
+-
+-    // Create payment record
+-    const paymentRecord = {
+-      userName: userName,
+-      agentId: agentId,
+-      amount: amount,
+-      arrears: arrears,
+-      invoiceId: invoiceId,
+-      billingMonth: billingMonth,
+-      currency: currency,
+-      phone: formattedPhone,
+-      provider: provider,
+-      reference: transactionData.reference,
+-      status: transactionData.status || "pending",  // Can be "pay_offline", "pending", etc.
+-      displayText: transactionData.display_text,
+-      accountReference: transactionData.account_reference,  // M-Pesa specific reference
+-      initiatedAt: new Date().toISOString(),
+-      subaccountCode: subaccountCode,
+-      commissionRate: commissionRate,
+-      splitCode: splitCode,
+-    };
+-
+-    // Write to payments collection
+-    await db
+-      .collection("payments")
+-      .doc(userId)
+-      .collection("billingMonths")
+-      .doc(billingMonth)
+-      .set(
+-        {
+-          payments: admin.firestore.FieldValue.arrayUnion(paymentRecord),
+-          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+-        },
+-        { merge: true }
+-      );
+-
+-    // Create transaction record
+-    await db.collection("transactions").doc(transactionData.reference).set({
+-      userName: userName,
+-      email: email,
+-      phone: formattedPhone,
+-      provider: provider,
+-      currency: currency,
+-      userId: userId,
+-      agentId: agentId,
+-      invoiceId: invoiceId,
+-      billingMonth: billingMonth,
+-      amount: amount,
+-      arrears: arrears,
+-      status: transactionData.status || "pending",
+-      reference: transactionData.reference,
+-      displayText: transactionData.display_text,
+-      accountReference: transactionData.account_reference,
+-      splitCode: splitCode,
+-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+-    });
++    // One function starts every rent STK push (landlord's tier take, split, charge, records): ./desk/rentCharge.
++    const result = await initiateRentCharge({ email, amount, currency, phone, provider, metadata });
+ 
+     return {
+       success: true,
+       message: "Payment initialized successfully",
+       data: {
+-        reference: transactionData.reference,
+-        status: transactionData.status,
+-        displayText: transactionData.display_text || "Check your phone for the M-Pesa prompt",
+-        accountReference: transactionData.account_reference,
++        reference: result.reference,
++        status: result.status,
++        displayText: result.displayText,
++        accountReference: result.accountReference,
+       },
+     };
+   } catch (error: any) {
+@@ -1802,7 +1677,7 @@ export const chargeCustomer = onCall({
+     }
+ 
+     const subaccountCode = paymentInfo.accountId;
+-    const commissionRate = 2.5; // Fixed 2.5% commission for cyber services
++    const commissionRate = (await getDeskConfig()).platformCutPct; // desk's platform cut (config), same as desk's tickets
+ 
+     console.log(`Processing cyber charge for agent ${id} (${pId}), amount ${amount}, service: ${service}`);
+ 
+@@ -1943,6 +1818,7 @@ interface PaystackWebhookData {
+     reference: string;
+     amount: number;
+     fees?: number;
++    paid_at?: string;
+     amount_received?: number;
+     channel?: string; // e.g. "mobile_money" (M-Pesa) or "card" — used to split PNS booking income by channel
+     gateway_response: string;
+@@ -2003,6 +1879,9 @@ export const paystackCallback = onRequest({
+       // === DETERMINE CHARGE TYPE ===
+       const chargeType = metadata.chargeType || determineChargeType(reference);
+ 
++      // Real amount / fee / time of this payment, for the desk events MyChama platform charges may produce.
++      const mychamaFacts: MyChamaChargeFacts = { amountKobo: data.amount, feesKobo: data.fees, paidAt: data.paid_at };
++
+       console.log(`Identified charge type: ${chargeType}`);
+ 
+       // ── NEW: SMS top-up → settle in project 2 ────────────────────────────
+@@ -2074,16 +1953,16 @@ export const paystackCallback = onRequest({
+         await handleMyChamaPayment(reference, metadata.chamaId, data.amount);
+       }
+       else if (chargeType === 'mychama_sms_topup' || reference.startsWith('MCS-')) {
+-        await handleMyChamaSmsTopup(reference, metadata.chamaId);
++        await handleMyChamaSmsTopup(reference, metadata.chamaId, undefined, undefined, mychamaFacts);
+       }
+       else if (chargeType === 'mychama_plan_billing' || reference.startsWith('MCP-')) {
+-        await handleMyChamaPlanBilling(reference, metadata.chamaId, metadata.plan);
++        await handleMyChamaPlanBilling(reference, metadata.chamaId, metadata.plan, undefined, undefined, mychamaFacts);
+       }
+       else if (chargeType === 'mychama_report_credit_topup' || reference.startsWith('MCX-')) {
+-        await handleMyChamaReportCreditTopup(reference, metadata.chamaId);
++        await handleMyChamaReportCreditTopup(reference, metadata.chamaId, undefined, undefined, mychamaFacts);
+       }
+       else if (chargeType === 'mychama_report_alacarte' || reference.startsWith('MCR-')) {
+-        await handleMyChamaReportAlacarte(reference, metadata.chamaId);
++        await handleMyChamaReportAlacarte(reference, metadata.chamaId, undefined, undefined, mychamaFacts);
+       }
+ 
+       else {
+@@ -2091,6 +1970,11 @@ export const paystackCallback = onRequest({
+       }
+     }
+ 
++    // Refunds: a desk fact exists only for charges that carried a desk commission; anything else is ignored.
++    if ((event.event as string) === "refund.processed") {
++      await recordRefundEvent((event as { data?: unknown }).data);
++    }
++
+     // Handle failed payments
+     if (event.event === "charge.failed") {
+       const data = event.data;
+@@ -2102,11 +1986,15 @@ export const paystackCallback = onRequest({
+       // Update appropriate collection based on charge type
+       if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
+         const targetDb = data.metadata?.targetProject === "pms" ? db : db2;
+-        await targetDb.collection("sms-topup-transactions").doc(reference).update({
++        const pendingRef = targetDb.collection("sms-topup-transactions").doc(reference);
++        const failedPending = await pendingRef.get().catch(() => null);
++        await pendingRef.update({
+           status: "failed",
+           failedAt: admin.firestore.FieldValue.serverTimestamp(),
+           failureReason: data.gateway_response,
+         }).catch(e => console.error("Failed to update sms-topup failure:", e));
++        // A failed charge frees the first-purchase reservation it held.
++        if (failedPending?.exists) await releaseSmsReservationFor(failedPending.data(), reference);
+       }
+ 
+       else if (chargeType === 'report_charge' || reference.startsWith('REPORT_')) {
+@@ -2414,7 +2302,8 @@ async function handleCyberCharge(
+     const grossAmount = data.amount / 100;
+     const paystackFees = data.fees ? data.fees / 100 : 0;
+     const netAfterPaystack = grossAmount - paystackFees;
+-    const platformCommission = (netAfterPaystack * 2.5) / 100;
++    const cutPct = (await getDeskConfig()).platformCutPct; // must always agree with desk's tickets
++    const platformCommission = (netAfterPaystack * cutPct) / 100;
+     const agentNetIncome = netAfterPaystack - platformCommission;
+ 
+     console.log(
+@@ -2432,7 +2321,7 @@ async function handleCyberCharge(
+       netAfterPaystack,
+       platformCommission,
+       agentNetIncome,
+-      commissionRate: 2.5,
++      commissionRate: cutPct,
+       currency: "KES",
+       status: "success",
+       type: "cyber_service",
+@@ -2525,7 +2414,11 @@ async function handlePlotYanguSubscriptionCharge(
+ 
+     console.log(`Successfully activated subscription for user ${userId}`);
+ 
+-    if (agentId) {
++    // Desk-owned landlords (deskCommission written by PMS) are recorded as a desk event; the legacy 45% agent income
++    // below is for legacy attributions only. The two paths are mutually exclusive.
++    if (subscriptionData?.deskCommission) {
++      await recordSubscriptionEvent({ reference, data, subscription: subscriptionData, planId: typeof planId === "string" ? planId : undefined });
++    } else if (agentId) {
+       try {
+         const grossAmount = data.amount / 100;
+         const paystackFees = data.fees ? data.fees / 100 : 0;
+@@ -2658,6 +2551,9 @@ async function handleAgentPayment(
+       }
+     }
+ 
++    // Desk fact for a desk-initiated rent payment (transaction carries deskCommission); never throws.
++    await recordRentPaymentEvent({ reference, data, transaction: transactionData });
++
+     console.log(`Successfully processed agent payment: ${reference}`);
+ 
+   } catch (error: any) {
+@@ -3146,7 +3042,7 @@ export const createUserWithFirebaseAuth = onCall({
+       firestoreUserData.isTrial = true; // marks this as an unpaid trial grant, not a real subscription
+       firestoreUserData.subscriptionExpiry = admin.firestore.Timestamp.fromDate(trialEnd);
+       firestoreUserData.trialStartedAt = admin.firestore.FieldValue.serverTimestamp();
+-      firestoreUserData.tokens = 100; // signup bonus
++      firestoreUserData.tokens = PMS_SIGNUP_FREE_TOKENS; // signup bonus (free tokens never earn desk commission)
+     } else {
+       // Agent-created accounts use provided values or defaults
+       firestoreUserData.tier = userData.tier || 'free';
+diff --git a/functions/src/mychama/webhook/dispatch.ts b/functions/src/mychama/webhook/dispatch.ts
+index 20dd10b..7b83fa5 100644
+--- a/functions/src/mychama/webhook/dispatch.ts
++++ b/functions/src/mychama/webhook/dispatch.ts
+@@ -8,6 +8,7 @@ import {
+   handleMyChamaReportCreditTopup, handleMyChamaSmsTopup,
+ } from "./handlers";
+ import { isSafeChamaId, parseMyChamaReference } from "./util";
++import { recordRefundEvent } from "../../desk/hooks";
+ 
+ export interface PaystackChargeData {
+   reference?: unknown;
+@@ -16,6 +17,9 @@ export interface PaystackChargeData {
+   status?: unknown;
+   gateway_response?: unknown;
+   metadata?: unknown;
++  /** Paystack's real fee for the charge, in minor units — the desk events record it (never an estimate). */
++  fees?: unknown;
++  paid_at?: unknown;
+ }
+ 
+ export type DispatchOutcome = "handled" | "ignored_non_mychama" | "ignored_invalid";
+@@ -50,24 +54,25 @@ export async function dispatchChargeSuccess(data: PaystackChargeData): Promise<D
+   }
+   const paid = data.amount;
+   const cur = data.currency;
++  const facts = { amountKobo: data.amount, feesKobo: data.fees, paidAt: data.paid_at };
+ 
+   switch (parsed.kind) {
+     case "payment":
+       await handleMyChamaPayment(reference, chamaId, paid, cur);
+       break;
+     case "sms_topup":
+-      await handleMyChamaSmsTopup(reference, chamaId, paid, cur);
++      await handleMyChamaSmsTopup(reference, chamaId, paid, cur, facts);
+       break;
+     case "plan_billing": {
+       const plan = typeof meta.plan === "string" ? meta.plan : typeof meta.toPlan === "string" ? meta.toPlan : undefined;
+-      await handleMyChamaPlanBilling(reference, chamaId, plan, paid, cur);
++      await handleMyChamaPlanBilling(reference, chamaId, plan, paid, cur, facts);
+       break;
+     }
+     case "report_credit_topup":
+-      await handleMyChamaReportCreditTopup(reference, chamaId, paid, cur);
++      await handleMyChamaReportCreditTopup(reference, chamaId, paid, cur, facts);
+       break;
+     case "report_alacarte":
+-      await handleMyChamaReportAlacarte(reference, chamaId, paid, cur);
++      await handleMyChamaReportAlacarte(reference, chamaId, paid, cur, facts);
+       break;
+   }
+   return "handled";
+@@ -100,3 +105,12 @@ export async function dispatchChargeFailed(data: PaystackChargeData): Promise<Di
+   });
+   return "handled";
+ }
++
++/**
++ * refund.processed: writes a desk `refund` event when a desk_events document exists for the refunded transaction
++ * (any product's — desk events live in this project's database); otherwise ignored. Throws only on a transient error.
++ */
++export async function dispatchRefundProcessed(data: unknown): Promise<"handled"> {
++  await recordRefundEvent(data);
++  return "handled";
++}
+diff --git a/functions/src/mychama/webhook/handlers.ts b/functions/src/mychama/webhook/handlers.ts
+index e444d16..c06cd78 100644
+--- a/functions/src/mychama/webhook/handlers.ts
++++ b/functions/src/mychama/webhook/handlers.ts
+@@ -5,6 +5,7 @@
+ import * as admin from "firebase-admin";
+ import { mychamaDb } from "../config";
+ import { sendMyChamaSms } from "../sms";
++import { recordMyChamaDeskEvent, type MyChamaChargeFacts, type MyChamaDeskKind } from "../../desk/hooks";
+ 
+ // ============================================================================
+ // MYCHAMA — payment application, SMS top-up, plan billing
+@@ -436,7 +437,8 @@ export async function handleMyChamaSmsTopup(
+   reference: string,
+   chamaIdHint?: string,
+   paidKobo?: number,
+-  currency?: string
++  currency?: string,
++  facts?: MyChamaChargeFacts
+ ): Promise<void> {
+   const db2 = mychamaDb();
+   const chamaId = chamaIdHint || reference.split("-")[1];
+@@ -462,6 +464,7 @@ export async function handleMyChamaSmsTopup(
+     return "applied" as const;
+   });
+   logOutcome("MyChama SMS top-up", reference, out);
++  await emitDeskEvent("sms_topup", reference, `chamas/${chamaId}/smsTopUps/${reference}`, out, facts);
+ }
+ 
+ /**
+@@ -476,7 +479,8 @@ export async function handleMyChamaPlanBilling(
+   chamaIdHint?: string,
+   plan?: string,
+   paidKobo?: number,
+-  currency?: string
++  currency?: string,
++  facts?: MyChamaChargeFacts
+ ): Promise<void> {
+   const db2 = mychamaDb();
+   const chamaId = chamaIdHint || reference.split("-")[1];
+@@ -517,6 +521,7 @@ export async function handleMyChamaPlanBilling(
+     return "applied" as const;
+   });
+   logOutcome("MyChama plan billing", reference, out);
++  await emitDeskEvent("plan_billing", reference, `chamas/${chamaId}/planBilling/${reference}`, out, facts);
+ }
+ 
+ /**
+@@ -532,7 +537,8 @@ export async function handleMyChamaReportCreditTopup(
+   reference: string,
+   chamaIdHint?: string,
+   paidKobo?: number,
+-  currency?: string
++  currency?: string,
++  facts?: MyChamaChargeFacts
+ ): Promise<void> {
+   const db2 = mychamaDb();
+   const chamaId = chamaIdHint || reference.split("-")[1];
+@@ -566,6 +572,7 @@ export async function handleMyChamaReportCreditTopup(
+     return "applied" as const;
+   });
+   logOutcome("MyChama report-credit top-up", reference, out);
++  await emitDeskEvent("report_credit_topup", reference, `chamas/${chamaId}/reportCreditTopUps/${reference}`, out, facts);
+ }
+ 
+ /**
+@@ -584,7 +591,8 @@ export async function handleMyChamaReportAlacarte(
+   reference: string,
+   chamaIdHint?: string,
+   paidKobo?: number,
+-  currency?: string
++  currency?: string,
++  facts?: MyChamaChargeFacts
+ ): Promise<void> {
+   const db2 = mychamaDb();
+   const chamaId = chamaIdHint || reference.split("-")[1];
+@@ -606,6 +614,19 @@ export async function handleMyChamaReportAlacarte(
+     return "applied" as const;
+   });
+   logOutcome("MyChama report à-la-carte", reference, out);
++  await emitDeskEvent("report_alacarte", reference, `chamas/${chamaId}/reportAlacartePurchases/${reference}`, out, facts);
++}
++
++/**
++ * Desk fact for a MyChama PLATFORM charge (SMS credits, plan billing, report credits / à-la-carte) — never contributions,
++ * loans or MGR. Runs after the transactional apply succeeded OR was already applied (so a crash between the apply and this
++ * write is healed by Paystack's retry); writes only if the intent document carries a deskCommission (written by Chama).
++ * Create-only per reference, so a replay never adds a second row. A transient Firestore error throws -> HTTP 500 -> retry.
++ */
++async function emitDeskEvent(kind: MyChamaDeskKind, reference: string, intentPath: string, out: string, facts?: MyChamaChargeFacts): Promise<void> {
++  if (out !== "applied" && out !== "already") return;
++  const intent = (await mychamaDb().doc(intentPath).get()).data();
++  await recordMyChamaDeskEvent({ kind, reference, facts, intent });
+ }
+ 
+ /** "missing" / a block reason are logged (no phones, no secrets); "applied"/"already" are quiet. */
+diff --git a/functions/src/mychama/webhook/index.ts b/functions/src/mychama/webhook/index.ts
+index 24179ec..ad15b0a 100644
+--- a/functions/src/mychama/webhook/index.ts
++++ b/functions/src/mychama/webhook/index.ts
+@@ -6,7 +6,7 @@
+ import { onRequest } from "firebase-functions/v2/https";
+ import { REGION, MYCHAMA_PAYSTACK_SECRET_KEY } from "../config";
+ import { MYCHAMA_HP_SECRETS } from "../sms";
+-import { dispatchChargeFailed, dispatchChargeSuccess, type PaystackChargeData } from "./dispatch";
++import { dispatchChargeFailed, dispatchChargeSuccess, dispatchRefundProcessed, type PaystackChargeData } from "./dispatch";
+ import { verifyPaystackSignature } from "./util";
+ 
+ export { reconcileMyChamaIntentsV2 } from "./reconcile";
+@@ -54,6 +54,8 @@ export const mychamaPaystackCallback = onRequest(
+         }
+       } else if (event.event === "charge.failed") {
+         await dispatchChargeFailed(data);
++      } else if (event.event === "refund.processed") {
++        await dispatchRefundProcessed(data);
+       }
+       // every other event type: acknowledged, nothing to do
+       res.status(200).json({ received: true });
+diff --git a/functions/test/desk-fake-firestore.js b/functions/test/desk-fake-firestore.js
+new file mode 100644
+index 0000000..2b4144a
+--- /dev/null
++++ b/functions/test/desk-fake-firestore.js
+@@ -0,0 +1,77 @@
++/* In-memory Firestore for the desk checks (same approach as scripts/mychama/_fake-firestore.mjs, plus what the desk code
++ * needs: create() with ALREADY_EXISTS, where(==).limit(), auto ids, and FieldValue.delete() inside update()). */
++const admin = require("firebase-admin");
++const clone = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
++const DEL = admin.firestore.FieldValue.delete();
++const isDelete = (v) => v !== null && typeof v === "object" && typeof DEL.isEqual === "function" && DEL.isEqual(v);
++let auto = 0;
++
++function applyUpdate(cur, data) {
++  const next = { ...cur };
++  for (const [k, v] of Object.entries(data)) { if (isDelete(v)) delete next[k]; else next[k] = clone(v); }
++  return next;
++}
++
++class Snap {
++  constructor(db, path, data) { this.ref = new DocRef(db, path); this.id = this.ref.id; this._d = data; this.exists = data !== undefined; }
++  data() { return this._d === undefined ? undefined : clone(this._d); }
++}
++class QSnap { constructor(docs) { this.docs = docs; this.size = docs.length; this.empty = docs.length === 0; } }
++class DocRef {
++  constructor(db, path) { this._db = db; this.path = path; this.id = path.split("/").pop(); }
++  collection(name) { return new CollRef(this._db, `${this.path}/${name}`); }
++  async get() { return new Snap(this._db, this.path, this._db.store.get(this.path)); }
++  async set(data, opts) {
++    const cur = this._db.store.get(this.path);
++    this._db.store.set(this.path, opts && opts.merge && cur ? applyUpdate(cur, data) : applyUpdate({}, data));
++  }
++  async create(data) {
++    if (this._db.store.has(this.path)) throw Object.assign(new Error(`6 ALREADY_EXISTS: ${this.path}`), { code: 6 });
++    this._db.store.set(this.path, applyUpdate({}, data));
++  }
++  async update(data) {
++    const cur = this._db.store.get(this.path);
++    if (cur === undefined) throw Object.assign(new Error(`NOT_FOUND: ${this.path}`), { code: 5 });
++    this._db.store.set(this.path, applyUpdate(cur, data));
++  }
++  async delete() { this._db.store.delete(this.path); }
++}
++class CollRef {
++  constructor(db, path, filters = [], lim = null) { this._db = db; this.path = path; this._f = filters; this._l = lim; }
++  doc(id) { return new DocRef(this._db, `${this.path}/${id || "auto" + ++auto}`); }
++  where(field, op, value) { if (op !== "==") throw new Error("fake: unsupported op " + op); return new CollRef(this._db, this.path, [...this._f, { field, value }], this._l); }
++  limit(n) { return new CollRef(this._db, this.path, this._f, n); }
++  async get() {
++    const depth = this.path.split("/").length + 1;
++    let docs = [];
++    for (const [p, d] of this._db.store) {
++      if (!p.startsWith(this.path + "/") || p.split("/").length !== depth) continue;
++      if (this._f.every(({ field, value }) => d[field] === value)) docs.push(new Snap(this._db, p, d));
++    }
++    if (this._l !== null) docs = docs.slice(0, this._l);
++    return new QSnap(docs);
++  }
++}
++class FakeDb {
++  constructor() { this.store = new Map(); }
++  doc(path) { return new DocRef(this, path); }
++  collection(path) { return new CollRef(this, path); }
++  async runTransaction(fn) {
++    const writes = [];
++    const tx = {
++      get: async (r) => r.get(),
++      set: (r, d, o) => writes.push(() => r.set(d, o)),
++      create: (r, d) => writes.push(() => r.create(d)),
++      update: (r, d) => writes.push(() => r.update(d)),
++      delete: (r) => writes.push(() => r.delete()),
++    };
++    const out = await fn(tx);
++    for (const w of writes) await w();
++    return out;
++  }
++  seed(path, data) { this.store.set(path, clone(data)); }
++  read(path) { return clone(this.store.get(path)); }
++  list(prefix) { return [...this.store.keys()].filter((p) => p.startsWith(prefix + "/")); }
++  reset() { this.store.clear(); }
++}
++module.exports = { FakeDb };
+diff --git a/functions/test/desk-money.check.js b/functions/test/desk-money.check.js
+new file mode 100644
+index 0000000..0501efe
+--- /dev/null
++++ b/functions/test/desk-money.check.js
+@@ -0,0 +1,86 @@
++/* Desk money kernel port — the kernel's vectors, exact.
++ * Run:  cd functions && npm run build && node test/desk-money.check.js   (exit 1 on failure) */
++const assert = require("assert");
++const path = require("path");
++const lib = (p) => require(path.join(__dirname, "..", "lib", "desk", p));
++const M = lib("money");
++const { DEFAULT_DESK_CONFIG: cfg, mergeConfig } = lib("config");
++const R = lib("rent");
++
++let passed = 0, failed = 0;
++const ok = (name, fn) => { try { fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
++
++ok("floorPct2 never overpays and survives float artefacts", () => {
++  assert.strictEqual(M.floorPct2(71.03), 71.03);
++  assert.strictEqual(M.floorPct2(71.039999), 71.03);
++  assert.strictEqual(M.floorPct2(0.375 * 100 / 100), 0.37);
++});
++ok("toBps", () => { assert.strictEqual(M.toBps(97.5), 9750); assert.strictEqual(M.toBps(71.03), 7103); assert.strictEqual(M.toBps(0.45), 45); });
++ok("service 97.5: gross 20000 fee 300 -> agent 19207", () => {
++  const plan = M.servicePlan(cfg);
++  assert.strictEqual(plan.agentSharePct, 97.5);
++  assert.strictEqual(M.settledAmounts({ grossMinor: 20000, feeMinor: 300, agentSharePct: plan.agentSharePct }).agentMinor, 19207);
++});
++ok("SMS first purchase: gross 15000, 214 credits, cost 20 -> share 71.03", () => {
++  const p = M.smsPlan({ grossMinor: 15000, credits: 214, firstPurchaseEligible: true }, cfg);
++  assert.deepStrictEqual(p, { agentSharePct: 71.03, rule: "sms_first_purchase" });
++});
++ok("SMS standard: gross 50000, 714 credits -> agent within 2 minor units of 13988", () => {
++  const p = M.smsPlan({ grossMinor: 50000, credits: 714, firstPurchaseEligible: false }, cfg);
++  assert.strictEqual(p.rule, "sms_standard");
++  const expectedFee = Math.round(50000 * cfg.expectedPaystackFeePct / 100);
++  const s = M.settledAmounts({ grossMinor: 50000, feeMinor: expectedFee, agentSharePct: p.agentSharePct });
++  assert.ok(Math.abs(s.agentMinor - 13988) <= 2, `agent ${s.agentMinor}`);
++});
++ok("SMS: first-purchase rule needs eligibility AND gross under the threshold; no margin -> 0", () => {
++  assert.strictEqual(M.smsPlan({ grossMinor: 25000, credits: 300, firstPurchaseEligible: true }, cfg).rule, "sms_standard");
++  assert.deepStrictEqual(M.smsPlan({ grossMinor: 1000, credits: 500, firstPurchaseEligible: true }, cfg), { agentSharePct: 0, rule: "no_margin" });
++});
++ok("subscription: senior 30% on gross 99900 fee 1499 -> 29520", () => {
++  const plan = M.sharePlan("senior", "subscription", cfg);
++  assert.strictEqual(plan.agentSharePct, 30);
++  assert.strictEqual(M.settledAmounts({ grossMinor: 99900, feeMinor: 1499, agentSharePct: 30 }).agentMinor, 29520);
++  assert.strictEqual(M.sharePlan("clerk", "report", cfg).agentSharePct, 25);
++});
++ok("rent 800000 at 1.5% -> landlord 98.5, agent 0.45, platform 1.05", () => {
++  const take = M.rentTake(800000, 1.5, cfg);
++  assert.strictEqual(take, 12000);
++  const p = M.rentPlan({ rentMinor: 800000, takeMinor: take }, cfg);
++  assert.deepStrictEqual([p.landlordSharePct, p.agentSharePct, p.platformSharePct], [98.5, 0.45, 1.05]);
++});
++ok("rent 2000000 at 2% is capped at KES 250 -> landlord 98.75, agent 0.37", () => {
++  const take = M.rentTake(2000000, 2, cfg);
++  assert.strictEqual(take, 25000);
++  const p = M.rentPlan({ rentMinor: 2000000, takeMinor: take }, cfg);
++  assert.strictEqual(p.landlordSharePct, 98.75); assert.strictEqual(p.agentSharePct, 0.37);
++});
++ok("rent tier table: ENTERPRISE 0.7 PRO 1.2 BUSINESS 1.6 SOLO 2.0; unknown tiers use SOLO; case-insensitive", () => {
++  assert.deepStrictEqual({ ...R.RENT_TAKE_RATE_BY_TIER }, { ENTERPRISE: 0.7, PRO: 1.2, BUSINESS: 1.6, SOLO: 2.0 });
++  for (const t of ["free", "low", "starter", "", undefined, null, "toString", "__proto__"]) assert.strictEqual(R.rentRateForTier(t), 2.0, String(t));
++  assert.strictEqual(R.rentRateForTier("pro"), 1.2); assert.strictEqual(R.rentRateForTier(" Enterprise "), 0.7);
++});
++ok("planRentSplit: owner desk -> three-way; anyone else -> two-way with the same take", () => {
++  const owner = R.planRentSplit({ rentMinor: 800000, tier: "business", ownerDesk: true }, cfg);
++  const other = R.planRentSplit({ rentMinor: 800000, tier: "business", ownerDesk: false }, cfg);
++  assert.strictEqual(owner.takeMinor, 12800); assert.strictEqual(other.takeMinor, 12800);   // 1.6% of 8000.00
++  assert.strictEqual(owner.threeWay, true); assert.strictEqual(other.threeWay, false);
++  assert.strictEqual(other.agentSharePct, 0); assert.strictEqual(other.landlordSharePct, 98.4);
++  assert.strictEqual(owner.landlordSharePct, 98.4); assert.strictEqual(owner.agentSharePct, 0.48);
++  const capped = R.planRentSplit({ rentMinor: 2000000, tier: "solo", ownerDesk: false }, cfg);
++  assert.strictEqual(capped.takeMinor, 25000); assert.strictEqual(capped.landlordSharePct, 98.75);
++});
++ok("settledAmounts rejects a fee above the gross and non-integers", () => {
++  assert.throws(() => M.settledAmounts({ grossMinor: 100, feeMinor: 101, agentSharePct: 10 }), RangeError);
++  assert.throws(() => M.settledAmounts({ grossMinor: 10.5, feeMinor: 1, agentSharePct: 10 }), RangeError);
++});
++ok("DEFAULT_DESK_CONFIG equals the kernel's defaults; mergeConfig deep-merges", () => {
++  assert.strictEqual(cfg.creditCostMinor, 20); assert.strictEqual(cfg.platformCutPct, 2.5);
++  assert.strictEqual(cfg.expectedPaystackFeePct, 1.5); assert.strictEqual(cfg.smsShareOfMarginPct, 40);
++  assert.strictEqual(cfg.firstPurchaseThresholdMinor, 20000); assert.strictEqual(cfg.rentDeskSharePct, 30); assert.strictEqual(cfg.rentTakeCapMinor, 25000);
++  assert.deepStrictEqual(cfg.subShareByRank, { clerk: 25, senior: 30, lead: 30 });
++  const m = mergeConfig({ platformCutPct: 3, subShareByRank: { clerk: 20 } });
++  assert.strictEqual(m.platformCutPct, 3); assert.strictEqual(m.subShareByRank.clerk, 20); assert.strictEqual(m.subShareByRank.senior, 30);
++});
++
++console.log(`\n${passed} passed, ${failed} failed`);
++process.exit(failed ? 1 : 0);
+diff --git a/functions/test/desk-static.check.js b/functions/test/desk-static.check.js
+new file mode 100644
+index 0000000..96fc401
+--- /dev/null
++++ b/functions/test/desk-static.check.js
+@@ -0,0 +1,34 @@
++/* Static regressions for the W3-A text/constant changes.  Run: node functions/test/desk-static.check.js */
++const fs = require("fs"), path = require("path"), assert = require("assert");
++const root = path.join(__dirname, "..", "..");
++const read = (p) => fs.readFileSync(path.join(root, p), "utf8");
++function walk(dir, out = []) {
++  for (const e of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
++    if (["node_modules", "lib", "dist", ".git"].includes(e.name)) continue;
++    const rel = path.join(dir, e.name);
++    if (e.isDirectory()) walk(rel, out); else out.push(rel);
++  }
++  return out;
++}
++let failed = 0;
++const ok = (n, f) => { try { f(); console.log("  ✓", n); } catch (e) { failed++; console.error("  ✗", n, "\n", e.message); } };
++const idx = read("functions/src/index.ts");
++
++ok("no 'cogvana' left in functions/src, src, public, docs, README, index.html", () => {
++  const files = [...walk("functions/src"), ...walk("src"), ...walk("public"), ...walk("docs"), "README.md", "index.html"].filter((f) => !/\.(png|jpe?g|ico|woff2?|webp|svg)$/i.test(f));
++  const hits = files.filter((f) => /cogvana/i.test(fs.readFileSync(path.join(root, f), "utf8")));
++  assert.deepStrictEqual(hits, []);
++});
++ok("signup grant is the named constant PMS_SIGNUP_FREE_TOKENS = 50", () => {
++  assert.match(idx, /const PMS_SIGNUP_FREE_TOKENS = 50;/);
++  assert.match(idx, /firestoreUserData\.tokens = PMS_SIGNUP_FREE_TOKENS/);
++  assert.doesNotMatch(idx, /tokens = 100/);
++});
++ok("the hard-coded 2.5 cut is gone from chargeCustomer and handleCyberCharge", () => {
++  assert.doesNotMatch(idx, /commissionRate = 2\.5/); assert.doesNotMatch(idx, /netAfterPaystack \* 2\.5/); assert.doesNotMatch(idx, /commissionRate: 2\.5/);
++  assert.match(idx, /getDeskConfig\(\)\)\.platformCutPct/);
++});
++ok("the legacy splitCodes cache is not used by the desk module", () => {
++  for (const f of walk("functions/src/desk")) assert.doesNotMatch(fs.readFileSync(path.join(root, f), "utf8"), /["'`]splitCodes["'`]/);
++});
++console.log(failed ? `${failed} failed` : "all passed"); process.exit(failed ? 1 : 0);
+diff --git a/functions/test/desk-webhooks.check.js b/functions/test/desk-webhooks.check.js
+new file mode 100644
+index 0000000..6ca0428
+--- /dev/null
++++ b/functions/test/desk-webhooks.check.js
+@@ -0,0 +1,352 @@
++/* Desk money paths against an in-memory Firestore (no emulator needed; Paystack mocked at axios).
++ * Run:  cd functions && npm run build && node test/desk-webhooks.check.js   (exit 1 on failure) */
++process.env.PAYSTACK_SECRET_KEY = "sk_test_unit";
++process.env.MYCHAMA_PAYSTACK_SECRET_KEY = "sk_test_unit_mychama";
++process.env.MYCHAMA_ID_PEPPER = "unit-pepper";
++const assert = require("assert");
++const crypto = require("crypto");
++const path = require("path");
++const { FakeDb } = require("./desk-fake-firestore");
++const lib = (p) => require(path.join(__dirname, "..", "lib", p));
++
++const deskdb = lib("desk/db");
++const cfgMod = lib("desk/config");
++const sms = lib("desk/sms");
++const hooks = lib("desk/hooks");
++const events = lib("desk/events");
++const splitMod = lib("desk/split");
++const rentCharge = lib("desk/rentCharge");
++const mychamaCfg = lib("mychama/config");
++const handlers = lib("mychama/webhook/handlers");
++const dispatch = lib("mychama/webhook/dispatch");
++const axios = require("axios");
++
++const plot = new FakeDb();     // the shared project database (desk_*, users, transactions…)
++const chama = new FakeDb();    // MyChama's database
++deskdb.deskDb = () => plot;
++mychamaCfg.mychamaDb = () => chama;
++mychamaCfg.plotDb = () => plot;
++
++let paystackCalls = [];
++let paystackImpl;
++const defaultPaystack = async (url, body) => {
++  if (url.endsWith("/split")) return { data: { status: true, data: { split_code: "SPL_" + crypto.createHash("md5").update(JSON.stringify(body.subaccounts)).digest("hex").slice(0, 10) } } };
++  if (url.endsWith("/charge")) return { data: { status: true, data: { reference: body.reference, status: "pay_offline", display_text: "Enter your M-Pesa PIN" } } };
++  throw new Error("unexpected Paystack call " + url);
++};
++axios.post = async (url, body, opts) => { paystackCalls.push({ url, body, opts }); return paystackImpl(url, body, opts); };
++
++let passed = 0, failed = 0;
++async function t(name, fn) {
++  try {
++    plot.reset(); chama.reset(); cfgMod.clearDeskConfigCache(); paystackCalls = []; paystackImpl = defaultPaystack;
++    await fn(); passed++; console.log("  ✓", name);
++  } catch (e) { failed++; console.error("  ✗", name, "\n", e); }
++}
++const splitCalls = () => paystackCalls.filter((c) => c.url.endsWith("/split"));
++const chargeCalls = () => paystackCalls.filter((c) => c.url.endsWith("/charge"));
++const eventDocs = () => plot.list("desk_events").map((p) => plot.read(p));
++const auditRows = () => plot.list("desk_audit").map((p) => plot.read(p));
++
++const ENTITY = "pms:PYL-0001";
++function seedDesk({ entity = ENTITY, used = false, agent = {}, sub = "ACCT_agent1", selfOwned = false } = {}) {
++  plot.seed(`desk_customers/${entity}`, { entityKey: entity, product: entity.split(":")[0], ownerAgentId: "ag1", attributedAt: 1, firstPurchaseUsed: used, selfOwned, paidPeriods: [] });
++  plot.seed("desk_agents/ag1", { agentId: "ag1", agentCode: "COG-0001", status: "active", rank: "senior", ...agent });
++  if (sub) plot.seed("agents/ag1", { paymentInfo: { accountId: sub } });
++}
++const settle = { amount: 15000, fees: 225, paid_at: "2026-10-09T10:00:00.000Z" };
++
++(async () => {
++  console.log("owner resolution");
++  await t("requires ownerAgentId, not selfOwned, an active desk agent and a payout subaccount", async () => {
++    const { resolveDeskOwner } = lib("desk/owner");
++    assert.strictEqual(await resolveDeskOwner(ENTITY), null);
++    seedDesk();
++    assert.deepStrictEqual(await resolveDeskOwner(ENTITY), { agentId: "ag1", agentCode: "COG-0001", rank: "senior", subaccountCode: "ACCT_agent1" });
++    seedDesk({ selfOwned: true }); assert.strictEqual(await resolveDeskOwner(ENTITY), null);
++    seedDesk({ agent: { status: "suspended" } }); assert.strictEqual(await resolveDeskOwner(ENTITY), null);
++    seedDesk({ sub: null }); plot.store.delete("agents/ag1"); assert.strictEqual(await resolveDeskOwner(ENTITY), null);
++    seedDesk({ sub: "not-a-subaccount" }); assert.strictEqual(await resolveDeskOwner(ENTITY), null);
++  });
++
++  console.log("split cache");
++  await t("getOrCreateDeskSplit shares the kernel's key and document shape, validates, and reuses the cache", async () => {
++    const subs = [{ subaccount: "ACCT_b", sharePct: 10.5 }, { subaccount: "ACCT_a", sharePct: 20 }];
++    const canon = ["ACCT_a:2000", "ACCT_b:1050"].join("|");
++    const key = crypto.createHash("sha256").update(canon).digest("hex").slice(0, 32);
++    assert.strictEqual(splitMod.splitKey(subs), key);
++    const code = await splitMod.getOrCreateDeskSplit(subs, "rent");
++    const doc = plot.read(`desk_split_codes/${key}`);
++    assert.strictEqual(doc.splitCode, code); assert.strictEqual(doc.label, "rent"); assert.ok(doc.createdAt); assert.deepStrictEqual(doc.subs.map((s) => s.subaccount).sort(), ["ACCT_a", "ACCT_b"]);
++    assert.strictEqual(splitCalls()[0].body.bearer_type, "all-proportional");
++    assert.strictEqual(await splitMod.getOrCreateDeskSplit(subs, "rent"), code);
++    assert.strictEqual(splitCalls().length, 1);
++    for (const bad of [[], [{ subaccount: "main", sharePct: 5 }], [{ subaccount: "ACCT_x", sharePct: 0 }], [{ subaccount: "ACCT_x", sharePct: 100 }], [{ subaccount: "ACCT_x", sharePct: 60 }, { subaccount: "ACCT_y", sharePct: 40 }]]) {
++      await assert.rejects(() => splitMod.getOrCreateDeskSplit(bad, "x"));
++    }
++    assert.strictEqual(plot.list("desk_split_codes").length, 1);
++  });
++
++  console.log("SMS top-ups");
++  await t("desk-owned first purchase of KES 150 gives the desk 71.03%, reserves once, and the settle writes ONE event", async () => {
++    seedDesk();
++    const plan = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_u1_1", grossMinor: 15000, credits: 214 });
++    assert.strictEqual(plan.applied, true); assert.strictEqual(plan.commission.sharePct, 71.03); assert.strictEqual(plan.commission.rule, "sms_first_purchase");
++    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_agent1", share: 71.03 }]);
++    const cust = plot.read(`desk_customers/${ENTITY}`);
++    assert.strictEqual(cust.firstPurchaseReservedRef, "SMS_u1_1"); assert.ok(cust.firstPurchaseReservedAt > 0);
++    const pending = { reference: "SMS_u1_1", deskCommission: plan.commission };
++    assert.strictEqual(await sms.recordSmsPurchaseEvent({ reference: "SMS_u1_1", tokens: 214, data: settle, pending }), "written");
++    const [e] = eventDocs();
++    assert.deepStrictEqual(e, { eventId: "sms_purchase:SMS_u1_1", type: "sms_purchase", product: "pms", entityKey: ENTITY, agentId: "ag1", paystackRef: "SMS_u1_1", grossMinor: 15000, feeMinor: 225, agentSharePct: 71.03, paidAt: Date.parse(settle.paid_at), credits: 214 });
++    // replayed webhook: no second event
++    assert.strictEqual(await sms.recordSmsPurchaseEvent({ reference: "SMS_u1_1", tokens: 214, data: settle, pending }), "duplicate");
++    assert.strictEqual(eventDocs().length, 1);
++  });
++  await t("after the first purchase is consumed, the second purchase earns 40% of margin (standard rule)", async () => {
++    seedDesk({ used: true });
++    const plan = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_u1_2", grossMinor: 50000, credits: 714 });
++    assert.strictEqual(plan.applied, true); assert.strictEqual(plan.commission.rule, "sms_standard"); assert.strictEqual(plan.commission.sharePct, 28.4);
++    assert.strictEqual(plan.reservedFirstPurchase, false);
++    assert.strictEqual(plot.read(`desk_customers/${ENTITY}`).firstPurchaseReservedRef, undefined);
++  });
++  await t("a first purchase at or above KES 200 is standard and takes no reservation", async () => {
++    seedDesk();
++    const plan = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_u1_3", grossMinor: 25000, credits: 357 });
++    assert.strictEqual(plan.commission.rule, "sms_standard"); assert.strictEqual(plan.reservedFirstPurchase, false);
++  });
++  await t("reserve -> failure releases; reserve -> success keeps it for the events trigger; only the holder can release", async () => {
++    seedDesk();
++    const plan = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_u1_4", grossMinor: 15000, credits: 214 });
++    const pending = { deskCommission: plan.commission };
++    assert.strictEqual(await sms.releaseFirstPurchaseReservation(ENTITY, "SMS_someone_else"), false);
++    assert.strictEqual(plot.read(`desk_customers/${ENTITY}`).firstPurchaseReservedRef, "SMS_u1_4");
++    assert.strictEqual(await sms.releaseSmsReservationFor(pending, "SMS_u1_4"), true);
++    const c = plot.read(`desk_customers/${ENTITY}`);
++    assert.strictEqual(c.firstPurchaseReservedRef, undefined); assert.strictEqual(c.firstPurchaseReservedAt, undefined); assert.strictEqual(c.ownerAgentId, "ag1");
++    const again = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_u1_5", grossMinor: 15000, credits: 214 });
++    assert.strictEqual(again.commission.rule, "sms_first_purchase");   // the first purchase is still available
++  });
++  await t("a live reservation blocks a concurrent first purchase; a reservation older than 30 minutes does not", async () => {
++    seedDesk();
++    const now = Date.now();
++    await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_a", grossMinor: 15000, credits: 214, now });
++    const during = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_b", grossMinor: 15000, credits: 214, now: now + 60_000 });
++    assert.strictEqual(during.commission.rule, "sms_standard");
++    assert.strictEqual(plot.read(`desk_customers/${ENTITY}`).firstPurchaseReservedRef, "SMS_a");
++    const after = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_c", grossMinor: 15000, credits: 214, now: now + 31 * 60_000 });
++    assert.strictEqual(after.commission.rule, "sms_first_purchase");
++    assert.strictEqual(plot.read(`desk_customers/${ENTITY}`).firstPurchaseReservedRef, "SMS_c");
++  });
++  await t("no event without deskCommission; unowned customers get a plain charge; the 50 free tokens are not a purchase", async () => {
++    assert.strictEqual(await sms.recordSmsPurchaseEvent({ reference: "SMS_x", tokens: 10, data: settle, pending: { reference: "SMS_x" } }), "skipped");
++    assert.strictEqual(await sms.recordSmsPurchaseEvent({ reference: "SMS_x", tokens: 10, data: settle, pending: undefined }), "skipped");
++    assert.strictEqual(eventDocs().length, 0);
++    const plan = await sms.planDeskSmsCharge({ entityKey: "pms:NOBODY", reference: "SMS_y", grossMinor: 15000, credits: 214 });
++    assert.deepStrictEqual(plan, { applied: false, reason: "no_desk_owner" });
++    assert.strictEqual(paystackCalls.length, 0);
++  });
++  await t("a desk failure never blocks the charge: no split, audit row, reservation released", async () => {
++    seedDesk();
++    paystackImpl = async () => { throw new Error("Paystack is down"); };
++    const plan = await sms.planDeskSmsCharge({ entityKey: ENTITY, reference: "SMS_z", grossMinor: 15000, credits: 214 });
++    assert.deepStrictEqual(plan, { applied: false, reason: "desk_resolution_failed" });
++    assert.strictEqual(plot.read(`desk_customers/${ENTITY}`).firstPurchaseReservedRef, undefined);
++    const rows = auditRows(); assert.strictEqual(rows.length, 1);
++    assert.strictEqual(rows[0].action, "desk_sms_resolution_failed"); assert.strictEqual(rows[0].entityKey, ENTITY); assert.match(rows[0].meta.error, /Paystack is down/);
++  });
++  await t("an unusable settlement (fee above gross) is skipped with an audit row, never thrown", async () => {
++    const pending = { deskCommission: { agentId: "ag1", agentCode: "COG-0001", sharePct: 71.03, rule: "sms_first_purchase", entityKey: ENTITY } };
++    assert.strictEqual(await sms.recordSmsPurchaseEvent({ reference: "SMS_q", tokens: 5, data: { amount: 100, fees: 500 }, pending }), "skipped");
++    assert.strictEqual(eventDocs().length, 0); assert.strictEqual(auditRows()[0].action, "desk_event_skipped");
++  });
++
++  console.log("rent");
++  const seedLandlord = (extra = {}) => plot.seed("users/L1", { tier: "pro", landlordCode: "PYL-0001", paymentInfo: { accountId: "ACCT_landlord" }, ...extra });
++  const rentInput = (extra = {}) => ({ email: "t@samuhia.co.ke", amount: 8000, currency: "KES", phone: "0712345678", provider: "mpesa", metadata: { userId: "T1", userName: "Tess", invoiceId: "inv1", billingMonth: "2026-10", arrears: 0, agentId: "L1" }, ...extra });
++  await t("a landlord's own rent charge: tier take from the CURRENT tier, landlord share 100 - take%, persisted on the transaction", async () => {
++    seedLandlord({ paymentInfo: { accountId: "ACCT_landlord", split: 2.4 } });   // stale split must be ignored
++    const r = await rentCharge.initiateRentCharge(rentInput());
++    assert.match(r.reference, /^INV_T1_\d+$/);
++    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 98.8 }]);   // PRO 1.2%
++    const charge = chargeCalls()[0].body; assert.strictEqual(charge.amount, 800000); assert.ok(charge.split_code.startsWith("SPL_")); assert.strictEqual(charge.metadata.deskBatchId, undefined);
++    const txn = plot.read(`transactions/${r.reference}`);
++    assert.strictEqual(txn.takeMinor, 9600); assert.strictEqual(txn.landlordSharePct, 98.8); assert.strictEqual(txn.agentSharePct, 0); assert.strictEqual(txn.platformSharePct, 1.2);
++    assert.strictEqual(txn.tier, "pro"); assert.strictEqual(txn.deskCommission, undefined);
++    assert.ok(plot.read("payments/T1/billingMonths/2026-10"));
++  });
++  await t("rent take is capped at KES 250; unknown tiers use SOLO 2%", async () => {
++    seedLandlord({ tier: "free" });
++    const r = await rentCharge.initiateRentCharge(rentInput({ amount: 20000 }));
++    const txn = plot.read(`transactions/${r.reference}`);
++    assert.strictEqual(txn.takeMinor, 25000); assert.strictEqual(txn.landlordSharePct, 98.75);
++    const small = await rentCharge.initiateRentCharge(rentInput({ amount: 8000 }));
++    assert.strictEqual(plot.read(`transactions/${small.reference}`).takeMinor, 16000);   // 2.0% of 8000
++  });
++  await t("desk batch charge by the OWNER desk uses the three-way split and records deskCommission; the webhook writes ONE rent event with the real fee", async () => {
++    seedLandlord({ tier: "business" }); seedDesk();
++    const r = await rentCharge.initiateRentCharge(rentInput({ desk: { agentId: "ag1", batchId: "rb_1" } }));
++    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 98.4 }, { subaccount: "ACCT_agent1", share: 0.48 }]);
++    const charge = chargeCalls()[0].body; assert.strictEqual(charge.metadata.deskBatchId, "rb_1"); assert.strictEqual(charge.metadata.deskAgentId, "ag1");
++    const txn = plot.read(`transactions/${r.reference}`);
++    assert.deepStrictEqual(txn.deskCommission, { agentCode: "COG-0001", agentId: "ag1", sharePct: 0.48, rule: "rent", entityKey: ENTITY });
++    const data = { amount: 800000, fees: 12000, paid_at: "2026-10-09T08:00:00Z" };
++    assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data, transaction: txn }), "written");
++    assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data, transaction: txn }), "duplicate");
++    const [e] = eventDocs(); assert.strictEqual(eventDocs().length, 1);
++    assert.strictEqual(e.type, "rent_payment"); assert.strictEqual(e.grossMinor, 800000); assert.strictEqual(e.feeMinor, 12000); assert.strictEqual(e.agentSharePct, 0.48); assert.strictEqual(e.eventId, `rent_payment:${r.reference}`);
++  });
++  await t("a batch from a NON-owner desk uses the normal two-way split and writes no desk commission", async () => {
++    seedLandlord({ tier: "business" }); seedDesk(); plot.seed("desk_agents/ag2", { agentId: "ag2", agentCode: "COG-0002", status: "active", rank: "clerk" });
++    const r = await rentCharge.initiateRentCharge(rentInput({ desk: { agentId: "ag2", batchId: "rb_2" } }));
++    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 98.4 }]);
++    const txn = plot.read(`transactions/${r.reference}`); assert.strictEqual(txn.deskCommission, undefined); assert.strictEqual(txn.agentSharePct, 0);
++    assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data: { amount: 800000, fees: 12000 }, transaction: txn }), "skipped");
++    assert.strictEqual(eventDocs().length, 0);
++  });
++  await t("a desk-resolution failure on a batch still charges (two-way) and audits why", async () => {
++    seedLandlord(); seedDesk();
++    const realGet = plot.collection.bind(plot);
++    plot.collection = (p) => { if (p === "desk_customers") throw new Error("desk db unavailable"); return realGet(p); };
++    try {
++      const r = await rentCharge.initiateRentCharge(rentInput({ desk: { agentId: "ag1", batchId: "rb_3" } }));
++      assert.strictEqual(plot.read(`transactions/${r.reference}`).deskCommission, undefined);
++    } finally { plot.collection = realGet; }
++    assert.ok(auditRows().some((a) => a.action === "desk_rent_resolution_failed"));
++  });
++  await t("rent charge refuses a missing landlord, missing payout account and a non-positive amount", async () => {
++    await assert.rejects(() => rentCharge.initiateRentCharge(rentInput()), (e) => e.code === "not-found");
++    plot.seed("users/L1", { tier: "pro" });
++    await assert.rejects(() => rentCharge.initiateRentCharge(rentInput()), (e) => e.code === "failed-precondition");
++    seedLandlord();
++    await assert.rejects(() => rentCharge.initiateRentCharge(rentInput({ amount: 0 })), (e) => e.code === "invalid-argument");
++    assert.strictEqual(chargeCalls().length, 0);
++  });
++
++  console.log("Plot Yangu subscriptions");
++  await t("a subscription carrying deskCommission produces exactly one event (plan, Nairobi period); none without it", async () => {
++    const subscription = { deskCommission: { agentCode: "COG-0001", agentId: "ag1", sharePct: 30, rule: "subscription", entityKey: ENTITY } };
++    const data = { amount: 99900, fees: 1499, paid_at: "2026-10-31T22:30:00Z" };   // 01:30 on 1 Nov in Nairobi
++    assert.strictEqual(await hooks.recordSubscriptionEvent({ reference: "SUB_1", data, subscription, planId: "pro" }), "written");
++    assert.strictEqual(await hooks.recordSubscriptionEvent({ reference: "SUB_1", data, subscription, planId: "pro" }), "duplicate");
++    const [e] = eventDocs(); assert.strictEqual(eventDocs().length, 1);
++    assert.strictEqual(e.type, "subscription_payment"); assert.strictEqual(e.plan, "pro"); assert.strictEqual(e.periodMonth, "2026-11");
++    assert.strictEqual(e.grossMinor, 99900); assert.strictEqual(e.feeMinor, 1499); assert.strictEqual(e.agentSharePct, 30);
++    assert.strictEqual(await hooks.recordSubscriptionEvent({ reference: "SUB_2", data, subscription: { planId: "pro" } }), "skipped");
++    assert.strictEqual(eventDocs().length, 1);
++  });
++
++  console.log("MyChama platform charges");
++  const CH = "sunrise01";
++  const dc = { agentCode: "COG-0001", sharePct: 40, rule: "sms_standard", entityKey: "chama:SMC-0042", agentId: "" };
++  const facts = (amount, fees, paidAt = "2026-10-09T09:00:00Z") => ({ amountKobo: amount, feesKobo: fees, paidAt });
++  await t("MCS- sms top-up: one sms_purchase event with the real fee, agentId looked up by agent code; a replay adds nothing", async () => {
++    plot.seed("desk_agents/ag1", { agentId: "ag1", agentCode: "COG-0001", status: "active", rank: "senior" });
++    const ref = `MCS-${CH}-1760000000000-ABC123`;
++    chama.seed(`chamas/${CH}`, { smsCredits: 0 });
++    chama.seed(`chamas/${CH}/smsTopUps/${ref}`, { amountKes: 500, credits: 500, status: "pending", deskCommission: dc });
++    await handlers.handleMyChamaSmsTopup(ref, CH, 50000, "KES", facts(50000, 750));
++    await handlers.handleMyChamaSmsTopup(ref, CH, 50000, "KES", facts(50000, 750));   // replay
++    assert.strictEqual(chama.read(`chamas/${CH}`).smsCredits, 500);   // credited once (existing behaviour)
++    const evs = eventDocs(); assert.strictEqual(evs.length, 1);
++    assert.deepStrictEqual(evs[0], { eventId: `sms_purchase:${ref}`, type: "sms_purchase", product: "chama", entityKey: "chama:SMC-0042", agentId: "ag1", paystackRef: ref, grossMinor: 50000, feeMinor: 750, agentSharePct: 40, paidAt: Date.parse("2026-10-09T09:00:00Z"), credits: 500 });
++  });
++  await t("MCP- plan billing: exactly one subscription_payment (plan, periodMonth in Africa/Nairobi)", async () => {
++    plot.seed("desk_agents/ag1", { agentId: "ag1", agentCode: "COG-0001", status: "active", rank: "senior" });
++    const ref = `MCP-${CH}-1760000000000-ABC123`;
++    chama.seed(`chamas/${CH}`, { plan: "starter" });
++    chama.seed(`chamas/${CH}/planBilling/${ref}`, { amountKes: 999, toPlan: "basic", status: "pending", deskCommission: { ...dc, rule: "subscription", sharePct: 30 } });
++    await dispatch.dispatchChargeSuccess({ reference: ref, amount: 99900, currency: "KES", status: "success", fees: 1499, paid_at: "2026-10-31T22:30:00Z", metadata: { plan: "basic" } });
++    await dispatch.dispatchChargeSuccess({ reference: ref, amount: 99900, currency: "KES", status: "success", fees: 1499, paid_at: "2026-10-31T22:30:00Z", metadata: { plan: "basic" } });
++    const evs = eventDocs(); assert.strictEqual(evs.length, 1);
++    assert.strictEqual(evs[0].type, "subscription_payment"); assert.strictEqual(evs[0].plan, "basic"); assert.strictEqual(evs[0].periodMonth, "2026-11");
++    assert.strictEqual(evs[0].feeMinor, 1499); assert.strictEqual(evs[0].grossMinor, 99900); assert.strictEqual(evs[0].agentSharePct, 30);
++    assert.strictEqual(chama.read(`chamas/${CH}`).plan, "basic");
++  });
++  await t("MCX- / MCR- report purchases map to report_purchase", async () => {
++    plot.seed("desk_agents/ag1", { agentId: "ag1", agentCode: "COG-0001", status: "active", rank: "senior" });
++    const x = `MCX-${CH}-1760000000001-AAA111`, r = `MCR-${CH}-1760000000002-BBB222`;
++    chama.seed(`chamas/${CH}`, { reportCreditsBalance: 0 });
++    chama.seed(`chamas/${CH}/reportCreditTopUps/${x}`, { amountKes: 200, credits: 10, status: "pending", deskCommission: { ...dc, rule: "report", sharePct: 30 } });
++    chama.seed(`chamas/${CH}/reportAlacartePurchases/${r}`, { amountKes: 100, status: "pending", deskCommission: { ...dc, rule: "report", sharePct: 30 } });
++    await dispatch.dispatchChargeSuccess({ reference: x, amount: 20000, currency: "KES", status: "success", fees: 300 });
++    await dispatch.dispatchChargeSuccess({ reference: r, amount: 10000, currency: "KES", status: "success", fees: 150 });
++    const evs = eventDocs().sort((a, b) => a.paystackRef.localeCompare(b.paystackRef));
++    assert.deepStrictEqual(evs.map((e) => e.type), ["report_purchase", "report_purchase"]);
++    assert.deepStrictEqual(evs.map((e) => e.feeMinor), [150, 300]);   // MCR- sorts before MCX-
++  });
++  await t("no event for contributions, loans, MGR, or intents without deskCommission", async () => {
++    plot.seed("desk_agents/ag1", { agentId: "ag1", agentCode: "COG-0001", status: "active", rank: "senior" });
++    chama.seed(`chamas/${CH}`, { name: "S" });
++    chama.seed(`chamas/${CH}/members/m1`, { name: "Ann", status: "active", creditBalance: 0, totalContributed: 0 });
++    chama.seed(`chamas/${CH}/contributions/c1`, { memberId: "m1", periodKey: "2026-10", amount: 1000, paidAmount: 0, status: "pending" });
++    const cnt = `MCA-${CH}-CNT-1760000000000-AAAAAA`;
++    chama.seed(`chamas/${CH}/paymentIntents/${cnt}`, { chamaId: CH, memberId: "m1", purpose: "contribution", reference: cnt, amount: 1000, grossAmount: 1000, currency: "KES", status: "pending", contributionId: "c1", deskCommission: dc });
++    await dispatch.dispatchChargeSuccess({ reference: cnt, amount: 100000, currency: "KES", status: "success", fees: 1500 });
++    const mgr = `MCA-${CH}-MGR-1760000000000-BBBBBB`;
++    chama.seed(`chamas/${CH}/paymentIntents/${mgr}`, { chamaId: CH, memberId: "m1", purpose: "mgr", reference: mgr, amount: 500, grossAmount: 500, currency: "KES", status: "pending", deskCommission: dc });
++    await dispatch.dispatchChargeSuccess({ reference: mgr, amount: 50000, currency: "KES", status: "success", fees: 750 });
++    const plain = `MCS-${CH}-1760000000009-CCC333`;
++    chama.seed(`chamas/${CH}/smsTopUps/${plain}`, { amountKes: 100, status: "pending" });
++    await dispatch.dispatchChargeSuccess({ reference: plain, amount: 10000, currency: "KES", status: "success", fees: 150 });
++    assert.strictEqual(eventDocs().length, 0);
++  });
++  await t("a MyChama event with an unusable commission is skipped with an audit row and does not throw", async () => {
++    const ref = `MCS-${CH}-1760000000010-DDD444`;
++    chama.seed(`chamas/${CH}`, { smsCredits: 0 });
++    chama.seed(`chamas/${CH}/smsTopUps/${ref}`, { amountKes: 100, status: "pending", deskCommission: { ...dc, entityKey: "chama:SMC-1" } });
++    await handlers.handleMyChamaSmsTopup(ref, CH, 10000, "KES", facts(10000, 20000));   // fee above gross
++    assert.strictEqual(eventDocs().length, 0); assert.ok(auditRows().some((a) => a.action === "desk_event_skipped"));
++    assert.strictEqual(chama.read(`chamas/${CH}`).smsCredits, 100);
++  });
++
++  console.log("refunds");
++  await t("refund.processed writes a refund event only when a desk event exists for the refunded reference", async () => {
++    seedDesk();
++    const pending = { deskCommission: { agentCode: "COG-0001", agentId: "ag1", sharePct: 71.03, rule: "sms_first_purchase", entityKey: ENTITY } };
++    await sms.recordSmsPurchaseEvent({ reference: "SMS_r1", tokens: 214, data: settle, pending });
++    assert.strictEqual(await hooks.recordRefundEvent({ transaction_reference: "SMS_r1", refund_reference: "RF_1", amount: "150.00" }), "written");
++    assert.strictEqual(await hooks.recordRefundEvent({ transaction_reference: "SMS_r1", refund_reference: "RF_1" }), "duplicate");
++    const refund = plot.read("desk_events/refund:RF_1");
++    assert.strictEqual(refund.type, "refund"); assert.strictEqual(refund.originalRef, "SMS_r1"); assert.strictEqual(refund.paystackRef, "SMS_r1"); assert.strictEqual(refund.agentId, "ag1"); assert.strictEqual(refund.entityKey, ENTITY);
++    assert.strictEqual(await hooks.recordRefundEvent({ transaction_reference: "CONTRIBUTION_REF", refund_reference: "RF_2" }), "ignored");
++    assert.strictEqual(await hooks.recordRefundEvent({}), "ignored");
++    assert.strictEqual(await hooks.recordRefundEvent(undefined), "ignored");
++    assert.strictEqual(plot.read("desk_events/refund:RF_2"), undefined);
++    // a refund event alone never counts as "a desk event exists for the reference"
++    plot.store.delete("desk_events/sms_purchase:SMS_r1");
++    assert.strictEqual(await hooks.recordRefundEvent({ transaction_reference: "SMS_r1", refund_reference: "RF_3" }), "ignored");
++    // the MyChama webhook route
++    plot.seed("desk_events/sms_purchase:MCS-x", { eventId: "sms_purchase:MCS-x", type: "sms_purchase", product: "chama", entityKey: "chama:SMC-0042", agentId: "ag1", paystackRef: "MCS-x", grossMinor: 50000, feeMinor: 750, agentSharePct: 40, paidAt: 1 });
++    assert.strictEqual(await dispatch.dispatchRefundProcessed({ transaction_reference: "MCS-x", id: 987 }), "handled");
++    assert.ok(plot.read("desk_events/refund:987"));
++  });
++
++  console.log("config");
++  await t("getDeskConfig reads desk_config/global over the defaults and caches for 60 s", async () => {
++    assert.strictEqual((await cfgMod.getDeskConfig()).platformCutPct, 2.5);
++    plot.seed("desk_config/global", { platformCutPct: 3 });
++    assert.strictEqual((await cfgMod.getDeskConfig()).platformCutPct, 2.5);   // cached
++    cfgMod.clearDeskConfigCache();
++    const c = await cfgMod.getDeskConfig(); assert.strictEqual(c.platformCutPct, 3); assert.strictEqual(c.rentTakeCapMinor, 25000);
++    const t0 = Date.now();
++    plot.seed("desk_config/global", { platformCutPct: 4 });
++    assert.strictEqual((await cfgMod.loadDeskConfig(async () => ({ platformCutPct: 9 }), t0 + 30_000)).platformCutPct, 3);
++    assert.strictEqual((await cfgMod.loadDeskConfig(async () => ({ platformCutPct: 9 }), t0 + 61_000)).platformCutPct, 9);
++  });
++
++  console.log("event validation");
++  await t("writeDeskEvent is create-only and refuses malformed events", async () => {
++    const base = { eventId: "rent_payment:R1", type: "rent_payment", product: "pms", entityKey: ENTITY, agentId: "ag1", paystackRef: "R1", grossMinor: 1000, feeMinor: 15, agentSharePct: 0.4, paidAt: 5 };
++    assert.strictEqual(await events.writeDeskEvent(base), true);
++    assert.strictEqual(await events.writeDeskEvent({ ...base, grossMinor: 9999 }), false);
++    assert.strictEqual(plot.read("desk_events/rent_payment:R1").grossMinor, 1000);   // first write wins
++    for (const bad of [{ ...base, eventId: "x/y" }, { ...base, feeMinor: 2000 }, { ...base, agentSharePct: 100 }, { ...base, grossMinor: 10.5 }, { ...base, type: "x" }, { ...base, type: "refund" }, { ...base, periodMonth: "2026-13" }, { ...base, paidAt: 0 }]) {
++      await assert.rejects(() => events.writeDeskEvent(bad), /Invalid desk event/);
++    }
++    assert.strictEqual(events.monthKeyEAT(Date.parse("2026-12-31T21:00:00Z")), "2027-01");
++  });
++
++  console.log(`\n${passed} passed, ${failed} failed`);
++  process.exit(failed ? 1 : 0);
++})();
+diff --git a/public/site.webmanifest b/public/site.webmanifest
+index 12bd4c8..5f0e1ae 100644
+--- a/public/site.webmanifest
++++ b/public/site.webmanifest
+@@ -1,6 +1,6 @@
+ {
+-  "name": "Cogvana Corporation - Educational & Property Tech Solutions",
+-  "short_name": "Cogvana",
++  "name": "Samuhia Corporation - Educational & Property Tech Solutions",
++  "short_name": "Samuhia",
+   "description": "AI-powered educational platforms and property management solutions across Kenya, Uganda, and Tanzania",
+   "start_url": "/",
+   "display": "standalone",
+diff --git a/src/Contact.tsx b/src/Contact.tsx
+index aa10050..1466bd6 100644
+--- a/src/Contact.tsx
++++ b/src/Contact.tsx
+@@ -10,8 +10,8 @@ const Contact: React.FC = () => {
+     {
+       icon: Mail,
+       title: 'General Inquiries',
+-      value: 'info@cogvana.co.ke',
+-      href: 'mailto:info@cogvana.co.ke',
++      value: 'info@samuhia.co.ke',
++      href: 'mailto:info@samuhia.co.ke',
+       color: 'text-blue-600',
+       bgColor: 'bg-blue-50',
+       description: 'For general questions and support'
+@@ -19,8 +19,8 @@ const Contact: React.FC = () => {
+     {
+       icon: Mail,
+       title: 'Sales & Business',
+-      value: 'sales@cogvana.co.ke',
+-      href: 'mailto:sales@cogvana.co.ke',
++      value: 'sales@samuhia.co.ke',
++      href: 'mailto:sales@samuhia.co.ke',
+       color: 'text-green-600',
+       bgColor: 'bg-green-50',
+       description: 'For business inquiries and partnerships'
+diff --git a/src/Faq.tsx b/src/Faq.tsx
+index a587bd2..f24eebb 100644
+--- a/src/Faq.tsx
++++ b/src/Faq.tsx
+@@ -143,7 +143,7 @@ export default function FAQPage() {
+                 Contact Us
+               </button>
+               <a
+-                href="https://cogvana.co.ke/"
++                href="https://samuhia.co.ke/"
+                 target="_blank"
+                 rel="noopener noreferrer"
+                 className="inline-flex items-center justify-center bg-gray-100 text-gray-700 font-semibold px-6 py-3 rounded-lg hover:bg-gray-200 transition duration-300"
+-- 
+2.43.0
+

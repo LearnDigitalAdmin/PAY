@@ -1,0 +1,86 @@
+/* Desk money kernel port — the kernel's vectors, exact.
+ * Run:  cd functions && npm run build && node test/desk-money.check.js   (exit 1 on failure) */
+const assert = require("assert");
+const path = require("path");
+const lib = (p) => require(path.join(__dirname, "..", "lib", "desk", p));
+const M = lib("money");
+const { DEFAULT_DESK_CONFIG: cfg, mergeConfig } = lib("config");
+const R = lib("rent");
+
+let passed = 0, failed = 0;
+const ok = (name, fn) => { try { fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
+
+ok("floorPct2 never overpays and survives float artefacts", () => {
+  assert.strictEqual(M.floorPct2(71.03), 71.03);
+  assert.strictEqual(M.floorPct2(71.039999), 71.03);
+  assert.strictEqual(M.floorPct2(0.375 * 100 / 100), 0.37);
+});
+ok("toBps", () => { assert.strictEqual(M.toBps(97.5), 9750); assert.strictEqual(M.toBps(71.03), 7103); assert.strictEqual(M.toBps(0.45), 45); });
+ok("service 97.5: gross 20000 fee 300 -> agent 19207", () => {
+  const plan = M.servicePlan(cfg);
+  assert.strictEqual(plan.agentSharePct, 97.5);
+  assert.strictEqual(M.settledAmounts({ grossMinor: 20000, feeMinor: 300, agentSharePct: plan.agentSharePct }).agentMinor, 19207);
+});
+ok("SMS first purchase: gross 15000, 214 credits, cost 20 -> share 71.03", () => {
+  const p = M.smsPlan({ grossMinor: 15000, credits: 214, firstPurchaseEligible: true }, cfg);
+  assert.deepStrictEqual(p, { agentSharePct: 71.03, rule: "sms_first_purchase" });
+});
+ok("SMS standard: gross 50000, 714 credits -> agent within 2 minor units of 13988", () => {
+  const p = M.smsPlan({ grossMinor: 50000, credits: 714, firstPurchaseEligible: false }, cfg);
+  assert.strictEqual(p.rule, "sms_standard");
+  const expectedFee = Math.round(50000 * cfg.expectedPaystackFeePct / 100);
+  const s = M.settledAmounts({ grossMinor: 50000, feeMinor: expectedFee, agentSharePct: p.agentSharePct });
+  assert.ok(Math.abs(s.agentMinor - 13988) <= 2, `agent ${s.agentMinor}`);
+});
+ok("SMS: first-purchase rule needs eligibility AND gross under the threshold; no margin -> 0", () => {
+  assert.strictEqual(M.smsPlan({ grossMinor: 25000, credits: 300, firstPurchaseEligible: true }, cfg).rule, "sms_standard");
+  assert.deepStrictEqual(M.smsPlan({ grossMinor: 1000, credits: 500, firstPurchaseEligible: true }, cfg), { agentSharePct: 0, rule: "no_margin" });
+});
+ok("subscription: senior 30% on gross 99900 fee 1499 -> 29520", () => {
+  const plan = M.sharePlan("senior", "subscription", cfg);
+  assert.strictEqual(plan.agentSharePct, 30);
+  assert.strictEqual(M.settledAmounts({ grossMinor: 99900, feeMinor: 1499, agentSharePct: 30 }).agentMinor, 29520);
+  assert.strictEqual(M.sharePlan("clerk", "report", cfg).agentSharePct, 25);
+});
+ok("rent 800000 at 1.5% -> landlord 98.5, agent 0.45, platform 1.05", () => {
+  const take = M.rentTake(800000, 1.5, cfg);
+  assert.strictEqual(take, 12000);
+  const p = M.rentPlan({ rentMinor: 800000, takeMinor: take }, cfg);
+  assert.deepStrictEqual([p.landlordSharePct, p.agentSharePct, p.platformSharePct], [98.5, 0.45, 1.05]);
+});
+ok("rent 2000000 at 2% is capped at KES 250 -> landlord 98.75, agent 0.37", () => {
+  const take = M.rentTake(2000000, 2, cfg);
+  assert.strictEqual(take, 25000);
+  const p = M.rentPlan({ rentMinor: 2000000, takeMinor: take }, cfg);
+  assert.strictEqual(p.landlordSharePct, 98.75); assert.strictEqual(p.agentSharePct, 0.37);
+});
+ok("rent tier table: ENTERPRISE 0.7 PRO 1.2 BUSINESS 1.6 SOLO 2.0; unknown tiers use SOLO; case-insensitive", () => {
+  assert.deepStrictEqual({ ...R.RENT_TAKE_RATE_BY_TIER }, { ENTERPRISE: 0.7, PRO: 1.2, BUSINESS: 1.6, SOLO: 2.0 });
+  for (const t of ["free", "low", "starter", "", undefined, null, "toString", "__proto__"]) assert.strictEqual(R.rentRateForTier(t), 2.0, String(t));
+  assert.strictEqual(R.rentRateForTier("pro"), 1.2); assert.strictEqual(R.rentRateForTier(" Enterprise "), 0.7);
+});
+ok("planRentSplit: owner desk -> three-way; anyone else -> two-way with the same take", () => {
+  const owner = R.planRentSplit({ rentMinor: 800000, tier: "business", ownerDesk: true }, cfg);
+  const other = R.planRentSplit({ rentMinor: 800000, tier: "business", ownerDesk: false }, cfg);
+  assert.strictEqual(owner.takeMinor, 12800); assert.strictEqual(other.takeMinor, 12800);   // 1.6% of 8000.00
+  assert.strictEqual(owner.threeWay, true); assert.strictEqual(other.threeWay, false);
+  assert.strictEqual(other.agentSharePct, 0); assert.strictEqual(other.landlordSharePct, 98.4);
+  assert.strictEqual(owner.landlordSharePct, 98.4); assert.strictEqual(owner.agentSharePct, 0.48);
+  const capped = R.planRentSplit({ rentMinor: 2000000, tier: "solo", ownerDesk: false }, cfg);
+  assert.strictEqual(capped.takeMinor, 25000); assert.strictEqual(capped.landlordSharePct, 98.75);
+});
+ok("settledAmounts rejects a fee above the gross and non-integers", () => {
+  assert.throws(() => M.settledAmounts({ grossMinor: 100, feeMinor: 101, agentSharePct: 10 }), RangeError);
+  assert.throws(() => M.settledAmounts({ grossMinor: 10.5, feeMinor: 1, agentSharePct: 10 }), RangeError);
+});
+ok("DEFAULT_DESK_CONFIG equals the kernel's defaults; mergeConfig deep-merges", () => {
+  assert.strictEqual(cfg.creditCostMinor, 20); assert.strictEqual(cfg.platformCutPct, 2.5);
+  assert.strictEqual(cfg.expectedPaystackFeePct, 1.5); assert.strictEqual(cfg.smsShareOfMarginPct, 40);
+  assert.strictEqual(cfg.firstPurchaseThresholdMinor, 20000); assert.strictEqual(cfg.rentDeskSharePct, 30); assert.strictEqual(cfg.rentTakeCapMinor, 25000);
+  assert.deepStrictEqual(cfg.subShareByRank, { clerk: 25, senior: 30, lead: 30 });
+  const m = mergeConfig({ platformCutPct: 3, subShareByRank: { clerk: 20 } });
+  assert.strictEqual(m.platformCutPct, 3); assert.strictEqual(m.subShareByRank.clerk, 20); assert.strictEqual(m.subShareByRank.senior, 30);
+});
+
+console.log(`\n${passed} passed, ${failed} failed`);
+process.exit(failed ? 1 : 0);

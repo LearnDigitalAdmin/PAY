@@ -5,6 +5,7 @@
 import * as admin from "firebase-admin";
 import { mychamaDb } from "../config";
 import { sendMyChamaSms } from "../sms";
+import { recordMyChamaDeskEvent, type MyChamaChargeFacts, type MyChamaDeskKind } from "../../desk/hooks";
 
 // ============================================================================
 // MYCHAMA — payment application, SMS top-up, plan billing
@@ -436,7 +437,8 @@ export async function handleMyChamaSmsTopup(
   reference: string,
   chamaIdHint?: string,
   paidKobo?: number,
-  currency?: string
+  currency?: string,
+  facts?: MyChamaChargeFacts
 ): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
@@ -462,6 +464,7 @@ export async function handleMyChamaSmsTopup(
     return "applied" as const;
   });
   logOutcome("MyChama SMS top-up", reference, out);
+  await emitDeskEvent("sms_topup", reference, `chamas/${chamaId}/smsTopUps/${reference}`, out, facts);
 }
 
 /**
@@ -476,7 +479,8 @@ export async function handleMyChamaPlanBilling(
   chamaIdHint?: string,
   plan?: string,
   paidKobo?: number,
-  currency?: string
+  currency?: string,
+  facts?: MyChamaChargeFacts
 ): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
@@ -517,6 +521,7 @@ export async function handleMyChamaPlanBilling(
     return "applied" as const;
   });
   logOutcome("MyChama plan billing", reference, out);
+  await emitDeskEvent("plan_billing", reference, `chamas/${chamaId}/planBilling/${reference}`, out, facts);
 }
 
 /**
@@ -532,7 +537,8 @@ export async function handleMyChamaReportCreditTopup(
   reference: string,
   chamaIdHint?: string,
   paidKobo?: number,
-  currency?: string
+  currency?: string,
+  facts?: MyChamaChargeFacts
 ): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
@@ -566,6 +572,7 @@ export async function handleMyChamaReportCreditTopup(
     return "applied" as const;
   });
   logOutcome("MyChama report-credit top-up", reference, out);
+  await emitDeskEvent("report_credit_topup", reference, `chamas/${chamaId}/reportCreditTopUps/${reference}`, out, facts);
 }
 
 /**
@@ -584,7 +591,8 @@ export async function handleMyChamaReportAlacarte(
   reference: string,
   chamaIdHint?: string,
   paidKobo?: number,
-  currency?: string
+  currency?: string,
+  facts?: MyChamaChargeFacts
 ): Promise<void> {
   const db2 = mychamaDb();
   const chamaId = chamaIdHint || reference.split("-")[1];
@@ -606,6 +614,19 @@ export async function handleMyChamaReportAlacarte(
     return "applied" as const;
   });
   logOutcome("MyChama report à-la-carte", reference, out);
+  await emitDeskEvent("report_alacarte", reference, `chamas/${chamaId}/reportAlacartePurchases/${reference}`, out, facts);
+}
+
+/**
+ * Desk fact for a MyChama PLATFORM charge (SMS credits, plan billing, report credits / à-la-carte) — never contributions,
+ * loans or MGR. Runs after the transactional apply succeeded OR was already applied (so a crash between the apply and this
+ * write is healed by Paystack's retry); writes only if the intent document carries a deskCommission (written by Chama).
+ * Create-only per reference, so a replay never adds a second row. A transient Firestore error throws -> HTTP 500 -> retry.
+ */
+async function emitDeskEvent(kind: MyChamaDeskKind, reference: string, intentPath: string, out: string, facts?: MyChamaChargeFacts): Promise<void> {
+  if (out !== "applied" && out !== "already") return;
+  const intent = (await mychamaDb().doc(intentPath).get()).data();
+  await recordMyChamaDeskEvent({ kind, reference, facts, intent });
 }
 
 /** "missing" / a block reason are logged (no phones, no secrets); "applied"/"already" are quiet. */
