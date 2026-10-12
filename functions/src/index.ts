@@ -9,6 +9,7 @@ import axios from "axios";
 import * as crypto from "crypto";
 import { hash } from "@node-rs/argon2";
 import { onSchedule } from "firebase-functions/v2/scheduler";
+import { onDocumentCreated } from "firebase-functions/v2/firestore";
 
 
 
@@ -41,6 +42,7 @@ import { PAYSTACK_SECRET_KEY, PAYSTACK_API_BASE } from "./desk/paystack";
 import { getDeskConfig } from "./desk/config";
 import { rentRateForTier } from "./desk/rent";
 import { initiateRentCharge } from "./desk/rentCharge";
+import { runRentBatch } from "./desk/rentBatch";
 import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
 import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
 import { mychamaDb } from "./mychama/config";
@@ -3202,3 +3204,17 @@ export const expireBusinessTrials = onSchedule({
 
 
 
+
+// ============= DESK: RENT STK BATCHES =============
+// desk_initiateRentStk (CYBER) writes desk_rent_batches/{id} as `requested`; this runs it. No retry: a charge must never repeat.
+export const desk_runRentBatch = onDocumentCreated({
+  document: "desk_rent_batches/{batchId}",
+  region: "africa-south1",
+  timeoutSeconds: 540,
+  memory: "512MiB",
+  maxInstances: 5,
+  retry: false,
+  secrets: [PAYSTACK_SECRET_KEY],
+}, async (event) => {
+  await runRentBatch(event.params.batchId);
+});
