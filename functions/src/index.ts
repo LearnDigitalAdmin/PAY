@@ -43,6 +43,7 @@ import { getDeskConfig } from "./desk/config";
 import { rentRateForTier } from "./desk/rent";
 import { initiateRentCharge } from "./desk/rentCharge";
 import { runRentBatch } from "./desk/rentBatch";
+export { deskSmsCommission } from "./deskSmsEndpoint";
 import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
 import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
 import { mychamaDb } from "./mychama/config";
@@ -172,8 +173,9 @@ export const chargeSmsTopUp = onCall({
     const reference = `SMS_${userId}_${Date.now()}`;
 
     // ── Desk commission (Plot Yangu landlords). It must never block the purchase: planDeskSmsCharge degrades to
-    //    "no desk split" (with an audit row) on any failure. MyRegister: see the notes — school ownership cannot be
-    //    verified from the data PAY can read, so Register top-ups carry no desk part.
+    //    "no desk split" (with an audit row) on any failure. MyRegister charges on its own project and asks PAY for
+    //    its desk part through deskSmsCommission (it verifies the buyer belongs to the school first); this path
+    //    therefore never plans for schools.
     let deskSplitCode: string | undefined;
     let deskCommission: Record<string, unknown> | undefined;
     if (targetApp === 'pms') {

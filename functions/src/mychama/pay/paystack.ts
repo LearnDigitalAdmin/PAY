@@ -1,6 +1,8 @@
 // TRACK B — Paystack /charge for MyChama self-pay. Port of Chama shared/paystack.py::charge_mobile_money,
-// with ONE deliberate difference (decision A): `split_code` is sent in the payload, exactly as CYBER's
-// MCW charge does (Chama's Python only puts it in metadata, which does not route the money).
+// with ONE deliberate difference (decision A): the money is ROUTED in the payload (Chama's Python only puts the
+// split code in metadata, which does not route the money). Routing is by SUBACCOUNT + a flat `transaction_charge`
+// (not the chama's 100% percentage split), so the chama receives exactly the net amount: Paystack keeps
+// `transaction_charge` in the main account (which also bears Paystack's fee) and pays the subaccount the rest.
 import axios from "axios";
 
 export const PAYSTACK_API_BASE = "https://api.paystack.co";
@@ -12,7 +14,8 @@ export interface ChargeMobileMoneyParams {
   phoneE164: string;
   provider: "mpesa" | "airtel";
   reference: string;
-  splitCode: string;
+  subaccountCode: string;            // chamas/{id}.settlementSubaccountCode
+  transactionChargeSubunits: number; // gross - net, in kobo (fees.mainAccountChargeSubunits)
   metadata: Record<string, unknown>;
 }
 
@@ -31,7 +34,9 @@ export async function chargeMobileMoney(p: ChargeMobileMoneyParams): Promise<Cha
       currency: "KES",
       mobile_money: { phone: p.phoneE164, provider: p.provider },
       reference: p.reference,
-      split_code: p.splitCode,
+      subaccount: p.subaccountCode,
+      transaction_charge: p.transactionChargeSubunits,
+      bearer: "account",
       metadata: p.metadata,
     },
     {

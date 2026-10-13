@@ -68,7 +68,7 @@ const code = async (p) => { try { await p; } catch (e) { return e?.details?.code
 const CH = "sunrise01";
 const PHONE = "+254712345678";
 async function seedChama(id = CH, extra = {}) {
-  await db.seed(`chamas/${id}`, { name: "Sunrise", plan: "starter", status: "active", settlementSplitCode: "SPL_new", settlementSplitKeyVersion: 2, smsCredits: 0, ...extra });
+  await db.seed(`chamas/${id}`, { name: "Sunrise", plan: "starter", status: "active", settlementSplitCode: "SPL_new", settlementSplitKeyVersion: 2, settlementSubaccountCode: "ACCT_new", smsCredits: 0, ...extra });
   await db.seed(`chamas/${id}/members/m1`, { name: "Ann", status: "active", phone: "0712345678", phoneNormalized: PHONE, creditBalance: 0, totalContributed: 0 });
   await db.seed(`chamas/${id}/members/m2`, { name: "Bob", status: "active", phone: "0722000000", phoneNormalized: "+254722000000", creditBalance: 0, totalContributed: 0 });
   await db.seed(`chamas/${id}/contributions/c1`, { memberId: "m1", periodKey: "2026-10", amount: 1000, paidAmount: 0, status: "pending" });
@@ -277,7 +277,10 @@ await t("happy path: intent shaped like Chama's, charge with NEW key + split_cod
   const c = chargeCalls[0];
   assert.equal(c.url, "https://api.paystack.co/charge");
   assert.equal(c.opts.headers.Authorization, "Bearer sk_test_unit_secret");
-  assert.equal(c.body.amount, kobo(f.gross)); assert.equal(c.body.currency, "KES"); assert.equal(c.body.split_code, "SPL_new");
+  assert.equal(c.body.amount, kobo(f.gross)); assert.equal(c.body.currency, "KES");
+  // routed by subaccount + flat charge so the chama is paid exactly the net (never the split code)
+  assert.equal(c.body.split_code, undefined); assert.equal(c.body.subaccount, "ACCT_new"); assert.equal(c.body.bearer, "account");
+  assert.equal(c.body.amount - c.body.transaction_charge, kobo(1000)); assert.equal(c.body.transaction_charge, fees.mainAccountChargeSubunits(f.gross, 1000));
   assert.deepEqual(c.body.mobile_money, { phone: PHONE, provider: "mpesa" }); assert.equal(c.body.reference, res.reference);
   assert.equal(c.body.metadata.chargeType, "mychama_payment"); assert.equal(c.body.metadata.targetProject, "mychama1");
   assert.equal(c.body.metadata.memberId, "m1"); assert.equal(c.body.metadata.splitCode, "SPL_new");
@@ -354,6 +357,8 @@ await t("chama gates: no split / old-account split / free plan => online_collect
   await seedChama(CH, { settlementSplitCode: undefined });
   assert.equal(await code(call(base())), "online_collection_disabled");
   await seedChama(CH, { settlementSplitKeyVersion: undefined });            // split code exists but belongs to the OLD account
+  assert.equal(await code(call(base())), "online_collection_disabled");
+  await seedChama(CH, { settlementSubaccountCode: undefined });             // no subaccount to route the exact net to
   assert.equal(await code(call(base())), "online_collection_disabled");
   await seedChama(CH, { plan: "free" });
   assert.equal(await code(call(base())), "online_collection_disabled");

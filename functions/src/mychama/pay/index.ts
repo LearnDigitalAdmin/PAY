@@ -8,7 +8,7 @@ import { MYCHAMA_PATHS } from "../contract";
 import type { ChamaLinkDoc, PayInitiateRequest, PayInitiateResponse } from "../contract";
 import {
   MAX_INTENTS_PER_HOUR, PAYMENT_INTENT_TTL_SECONDS, contributionFees, loanRepaymentFees, mgrContributionFees,
-  onlineCollectionAllowed, type FeeBreakdown,
+  mainAccountChargeSubunits, onlineCollectionAllowed, type FeeBreakdown,
 } from "./fees";
 import { chargeMobileMoney } from "./paystack";
 import { recordResult, releaseKey, reserveKey } from "./idempotency";
@@ -69,7 +69,7 @@ export const mychamaPayInitiate = onCall(
         throw myChamaError("chama_unavailable", "This chama isn't available right now.", "failed-precondition");
       }
       plan = chama.plan || "free";
-      if (!onlineCollectionAllowed(plan) || !chama.settlementSplitCode || chama.settlementSplitKeyVersion !== SPLIT_KEY_VERSION) {
+      if (!onlineCollectionAllowed(plan) || !chama.settlementSplitCode || chama.settlementSplitKeyVersion !== SPLIT_KEY_VERSION || !chama.settlementSubaccountCode) {
         throw myChamaError("online_collection_disabled", "This chama can't collect online payments yet.", "failed-precondition");
       }
 
@@ -186,7 +186,8 @@ export const mychamaPayInitiate = onCall(
         phoneE164: phone,
         provider,
         reference,
-        splitCode: chama.settlementSplitCode,
+        subaccountCode: chama.settlementSubaccountCode,
+        transactionChargeSubunits: mainAccountChargeSubunits(fee.gross, fee.net),
         metadata: {
           chargeType: "mychama_payment",
           targetProject: "mychama1",
