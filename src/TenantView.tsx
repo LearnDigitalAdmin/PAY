@@ -418,10 +418,12 @@ const TenantView: React.FC = () => {
                               className={`px-2 py-1 text-xs font-semibold rounded-full ${
                                 invoice.isPaid
                                   ? 'bg-green-100 text-green-800'
-                                  : 'bg-red-100 text-red-800'
+                                  : invoice.amountPaid > 0
+                                    ? 'bg-amber-100 text-amber-800'
+                                    : 'bg-red-100 text-red-800'
                               }`}
                             >
-                              {invoice.isPaid ? 'Paid' : 'Unpaid'}
+                              {invoice.isPaid ? 'Paid' : invoice.amountPaid > 0 ? 'Partial' : 'Unpaid'}
                             </span>
                           </div>
 
@@ -559,6 +561,12 @@ const TenantView: React.FC = () => {
                                 {formatCurrency(payment.amount)}
                               </p>
                             </div>
+                            {payment.tenantFee != null && (
+                              <div>
+                                <p className="text-gray-600">Transaction Fee</p>
+                                <p className="font-semibold text-gray-900">{formatCurrency(payment.tenantFee)}</p>
+                              </div>
+                            )}
                             <div>
                               <p className="text-gray-600">Billing Month</p>
                               <p className="font-semibold text-gray-900">

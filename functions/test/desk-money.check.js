@@ -7,6 +7,7 @@ const M = lib("money");
 const { DEFAULT_DESK_CONFIG: cfg, mergeConfig } = lib("config");
 const R = lib("rent");
 
+const RF = lib("rentFees");
 let passed = 0, failed = 0;
 const ok = (name, fn) => { try { fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
 
@@ -80,6 +81,25 @@ ok("DEFAULT_DESK_CONFIG equals the kernel's defaults; mergeConfig deep-merges", 
   assert.deepStrictEqual(cfg.subShareByRank, { clerk: 25, senior: 30, lead: 30 });
   const m = mergeConfig({ platformCutPct: 3, subShareByRank: { clerk: 20 } });
   assert.strictEqual(m.platformCutPct, 3); assert.strictEqual(m.subShareByRank.clerk, 20); assert.strictEqual(m.subShareByRank.senior, 30);
+});
+
+ok("rent fees: 50000 -> tenant pays 50150, landlord deducted 700 (600 + 100), net 49300", () => {
+  const f = RF.rentFees(5000000);
+  assert.deepStrictEqual([f.tenantFeeMinor, f.chargeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor],
+    [15000, 5015000, 60000, 10000, 70000, 4930000]);
+});
+ok("rent fees: surcharge is min(150, 0.5%); small rent 10000 -> 50 / 100 / 20", () => {
+  const f = RF.rentFees(1000000);
+  assert.deepStrictEqual([f.tenantFeeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.netPayoutMinor], [5000, 10000, 2000, 988000]);
+});
+ok("rent fees: money always adds up, Paystack estimate capped at 3000", () => {
+  for (const r of [100, 101, 999, 12345, 800000, 3333333, 40000000, 99999999]) {
+    const f = RF.rentFees(r);
+    assert.strictEqual(f.chargeMinor, r + f.tenantFeeMinor); assert.strictEqual(f.netPayoutMinor, r - f.deductionsMinor);
+    assert.strictEqual(f.chargeMinor - f.netPayoutMinor, f.tenantFeeMinor + f.deductionsMinor); assert.ok(f.netPayoutMinor > 0 && f.tenantFeeMinor <= 15000);
+  }
+  assert.strictEqual(RF.rentFees(40000000).paystackEstimateMinor, 300000);
+  assert.throws(() => RF.rentFees(0)); assert.throws(() => RF.rentFees(1.5));
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

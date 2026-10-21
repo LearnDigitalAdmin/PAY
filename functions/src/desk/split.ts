@@ -59,3 +59,47 @@ export async function getOrCreateDeskSplit(subs: readonly SplitSub[], label: str
     throw err;
   }
 }
+
+/**
+ * Get or create a Paystack FLAT split (bearer "account": Samuhia's main account carries Paystack's real fee). Each
+ * subaccount receives exactly `amountMinor`; the main account keeps the rest of the charge. Used for rent, where the
+ * landlord's net payout must be exact. Cached in `desk_split_codes` under a key that cannot collide with percentage splits.
+ */
+export interface FlatSub { subaccount: string; amountMinor: number }
+export async function getOrCreateFlatSplit(subs: readonly FlatSub[], label: string, chargeMinor: number): Promise<string> {
+  if (subs.length === 0) throw new Error("Split needs at least one subaccount");
+  let total = 0;
+  for (const s of subs) {
+    if (typeof s.subaccount !== "string" || !s.subaccount.startsWith("ACCT_")) throw new Error("Invalid Paystack subaccount code");
+    if (!Number.isSafeInteger(s.amountMinor) || s.amountMinor <= 0) throw new Error("Flat split amount must be a positive integer");
+    total += s.amountMinor;
+  }
+  if (total >= chargeMinor) throw new Error("Flat split leaves nothing for the platform");
+  const canon = "flat|" + [...subs].map((s) => `${s.subaccount}:${s.amountMinor}`).sort().join("|");
+  const key = createHash("sha256").update(canon).digest("hex").slice(0, 32);
+  const ref = deskDb().collection(DESK.splitCodes).doc(key);
+  const cached = await ref.get();
+  const hit = cached.exists ? (cached.data() as { splitCode?: unknown }).splitCode : undefined;
+  if (typeof hit === "string" && hit) return hit;
+
+  const res = await axios.post(`${PAYSTACK_API_BASE}/split`, {
+    name: `Desk ${label} flat ${key.slice(0, 8)}`.slice(0, 100),
+    type: "flat",
+    currency: "KES",
+    subaccounts: subs.map((s) => ({ subaccount: s.subaccount, share: s.amountMinor })),
+    bearer_type: "account",
+  }, { timeout: 15_000, headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`, "Content-Type": "application/json" } });
+  const splitCode = res.data?.status ? res.data?.data?.split_code : undefined;
+  if (typeof splitCode !== "string" || !splitCode) throw new Error(`Could not create split: ${res.data?.message ?? "no split code returned"}`);
+
+  try {
+    await ref.create({ splitCode, subs: subs.map((s) => ({ ...s })), type: "flat", label, createdAt: Date.now() });
+    return splitCode;
+  } catch (err) {
+    if ((err as { code?: number }).code === 6) {
+      const again = (await ref.get()).data() as { splitCode?: string } | undefined;
+      if (again?.splitCode) return again.splitCode;
+    }
+    throw err;
+  }
+}

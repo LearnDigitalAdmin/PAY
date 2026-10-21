@@ -45,6 +45,7 @@ import { initiateRentCharge } from "./desk/rentCharge";
 import { runRentBatch } from "./desk/rentBatch";
 export { deskSmsCommission } from "./deskSmsEndpoint";
 import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
+import { landlordRentSms, tenantRentSms, settlementDate } from "./desk/rentSettlement";
 import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
 import { mychamaDb } from "./mychama/config";
 import { MYCHAMA_HP_SECRETS } from "./mychama/sms";
@@ -2093,6 +2094,7 @@ export const paystackCallback = onRequest({
           failedAt: admin.firestore.FieldValue.serverTimestamp(),
           failureReason: data.gateway_response,
         });
+        if (reference.startsWith("INV_")) await markRentPaymentFailed(reference, data.gateway_response);
       }
     }
 
@@ -2500,14 +2502,32 @@ async function handleAgentPayment(
 
     const transactionData = transactionDoc.data();
 
-    await transactionRef.update({
-      status: "success",
-      completedAt: admin.firestore.FieldValue.serverTimestamp(),
-      paystackResponse: data,
-    });
+    // Accounting: what Paystack really took and what Samuhia kept, against the amounts fixed when the charge was started.
+    const tx = (transactionData ?? {}) as Record<string, any>;
+    const hasFees = Number.isSafeInteger(tx.chargeMinor) && Number.isSafeInteger(tx.netPayoutMinor);
+    const paidMinor = Number(data.amount);
+    const paystackFeeMinor = Number.isFinite(Number(data.fees)) ? Number(data.fees) : 0;
+    const accounting = hasFees ? {
+      paystackFeeMinor,
+      amountMismatch: paidMinor !== tx.chargeMinor,   // the tenant paid something other than rent + surcharge
+      platformKeptMinor: tx.chargeMinor - tx.netPayoutMinor - (tx.agentMinor || 0) - paystackFeeMinor,
+    } : {};
+    if (hasFees && paidMinor !== tx.chargeMinor) console.error(`Rent charge ${reference}: paid ${paidMinor}, expected ${tx.chargeMinor}`);
 
     const userId = metadata.userId || transactionData?.userId;
     const billingMonth = metadata.billingMonth || transactionData?.billingMonth;
+
+    // Order matters: 1) credit the invoice, 2) update the tenant's payment history, 3) THEN flip the transaction to
+    // "success" — that is what every screen (and PMS's sync) reacts to, so by then the invoice is already settled.
+    const invoiceId = metadata.invoiceId || transactionData?.invoiceId;
+    let settled: { amountPaid: number; arrears: number; isPaid: boolean } | null = null;
+    if (invoiceId && tx.agentId && Number.isSafeInteger(tx.rentMinor)) {
+      try {
+        settled = await settleRentInvoice(String(tx.agentId), String(invoiceId), reference, tx.rentMinor / 100);
+      } catch (e: any) {
+        console.error(`settleRentInvoice ${reference} failed:`, e?.message || e);
+      }
+    }
 
     if (userId && billingMonth) {
       const paymentDoc = await db
@@ -2527,8 +2547,10 @@ async function handleAgentPayment(
               ...payment,
               status: "success",
               completedAt: new Date().toISOString(),
-              paidAmount: data.amount / 100,
-              fees: data.fees / 100,
+              paidAmount: hasFees ? tx.rentMinor / 100 : data.amount / 100,   // the rent collected
+              chargedAmount: data.amount / 100,                                 // what the tenant actually paid
+              fees: data.fees / 100,                                            // Paystack's real fee
+              ...(hasFees ? { netPayout: tx.netPayoutMinor / 100 } : {}),
             };
           }
           return payment;
@@ -2544,16 +2566,18 @@ async function handleAgentPayment(
             lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
           });
       }
-
-      const invoiceId = metadata.invoiceId || transactionData?.invoiceId;
-      if (invoiceId) {
-        await db.collection("invoices").doc(invoiceId).update({
-          status: "paid",
-          paidAt: admin.firestore.FieldValue.serverTimestamp(),
-          paymentReference: reference,
-        });
-      }
     }
+
+    await transactionRef.update({
+      status: "success",
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      paystackResponse: data,
+      ...accounting,
+      ...(settled ? { invoiceAmountPaid: settled.amountPaid, invoiceArrears: settled.arrears, invoiceIsPaid: settled.isPaid } : {}),
+    });
+
+    // Payment notices (never throw; each is sent once)
+    await sendRentPaymentNotices({ reference, tx, data, arrearsKes: settled?.arrears });
 
     // Desk fact for a desk-initiated rent payment (transaction carries deskCommission); never throws.
     await recordRentPaymentEvent({ reference, data, transaction: transactionData });
@@ -2563,6 +2587,141 @@ async function handleAgentPayment(
   } catch (error: any) {
     console.error(`Error processing agent payment ${reference}:`, error);
     throw error;
+  }
+}
+
+/**
+ * Credit a completed rent payment to the invoice document users/{agent}/invoices/{id} — the one PAY, PMS and the reminder
+ * jobs read — exactly once per payment (`paystackRefs` guards webhook repeats). Cumulative and capped at the invoice
+ * total: a part-payment leaves status "partial" with the balance as arrears; a full payment leaves no arrears, isPaid true.
+ * `paidNotifiedAmount` tells PMS's payment-SMS job this payment is already announced from here (no duplicate SMS).
+ * Returns null when the invoice document has not been synced up from PMS yet (PMS then derives it from the transactions).
+ */
+async function settleRentInvoice(agentId: string, invoiceId: string, reference: string, rentKes: number): Promise<{ amountPaid: number; arrears: number; isPaid: boolean } | null> {
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+  const ref = db.collection("users").doc(agentId).collection("invoices").doc(invoiceId);
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    if (!snap.exists) return null;
+    const inv = snap.data() as Record<string, any>;
+    const total = Number(inv.totalAmount) || 0;
+    const refs: string[] = Array.isArray(inv.paystackRefs) ? inv.paystackRefs : [];
+    const before = Number(inv.amountPaid) || 0;
+    if (refs.includes(reference)) return { amountPaid: before, arrears: Math.max(0, r2(total - before)), isPaid: before >= total - 0.005 };
+
+    const amountPaid = Math.min(r2(before + rentKes), total);
+    const arrears = Math.max(0, r2(total - amountPaid));
+    const isPaid = amountPaid >= total - 0.005;
+    t.update(ref, {
+      amountPaid, arrears, isPaid,
+      status: isPaid ? "paid" : "partial",
+      paidDate: isPaid ? new Date().toISOString().split("T")[0] : inv.paidDate ?? null,
+      paymentReference: reference,
+      paystackRefs: admin.firestore.FieldValue.arrayUnion(reference),
+      paidNotifiedAmount: amountPaid,
+      hasPaid: isPaid,
+      lastModified: new Date().toISOString(),
+    });
+    return { amountPaid, arrears, isPaid };
+  });
+}
+
+/** Create-once claim so a repeated webhook never sends (or charges for) the same notice twice. */
+async function claimRentNotice(reference: string, kind: "landlord" | "tenant"): Promise<admin.firestore.DocumentReference | null> {
+  const ref = db.collection("rent_sms_log").doc(`${reference}_${kind}`);
+  try {
+    await ref.create({ kind, reference, status: "sending", createdAt: admin.firestore.FieldValue.serverTimestamp() });
+    return ref;
+  } catch (e: any) {
+    if (e?.code === 6) return null;   // already claimed
+    throw e;
+  }
+}
+
+/**
+ * When a rent charge completes: SMS the landlord/agent (from Samuhia's SMS pool, no credits used) and the tenant (charged
+ * to the landlord's SMS credits; skipped when they have none). Never throws; each notice is sent at most once.
+ */
+async function sendRentPaymentNotices(p: { reference: string; tx: Record<string, any>; data: any; arrearsKes?: number }): Promise<void> {
+  try {
+    const { reference, tx, data } = p;
+    if (!Number.isSafeInteger(tx.rentMinor) || !tx.agentId) return;   // a charge from before the fee split carries no breakdown
+
+    const agentRef = db.collection("users").doc(String(tx.agentId));
+    const [agentSnap, tenantSnap, holidaySnap] = await Promise.all([
+      agentRef.get(),
+      agentRef.collection("tenants").doc(String(tx.userId)).get(),
+      db.collection("config").doc("kenya_holidays").get(),
+    ]);
+    const agent = agentSnap.data() ?? {};
+    const tenant = tenantSnap.data() ?? {};
+    const extraHolidays: string[] = Array.isArray(holidaySnap.data()?.dates) ? holidaySnap.data()!.dates : [];
+
+    const paidAt = data?.paid_at ? new Date(data.paid_at) : new Date();
+    const facts = {
+      rentMinor: tx.rentMinor, tenantFeeMinor: tx.tenantFeeMinor ?? 0, chargeMinor: tx.chargeMinor ?? tx.rentMinor,
+      deductionsMinor: tx.deductionsMinor ?? 0, netPayoutMinor: tx.netPayoutMinor ?? tx.rentMinor,
+      arrearsMinor: Math.max(0, Math.round(Number(p.arrearsKes ?? tx.arrears ?? 0) * 100)),
+      unit: String(tenant.unitNumber || tenant.unit || "N/A"), paidAt, settlesOn: settlementDate(paidAt, extraHolidays),
+      tenantName: String(tenant.name || tx.userName || ""), reference,
+    };
+
+    // 1) Landlord / agent — free to them.
+    const agentPhone = agent.phone || agent.paymentInfo?.phone;
+    if (agentPhone) {
+      const claim = await claimRentNotice(reference, "landlord");
+      if (claim) {
+        const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(String(agentPhone)), message: sanitizeSmsText(landlordRentSms(facts)) });
+        if (r.success) await claim.update({ status: "sent" }); else { console.error(`Rent notice (landlord) failed for ${reference}: ${r.error}`); await claim.delete(); }
+      }
+    }
+
+    // 2) Tenant — paid for with the landlord's SMS credits (1 per 144 characters); no credits, no SMS.
+    const tenantPhone = tenant.phone || tx.phone;
+    if (tenantPhone) {
+      const message = sanitizeSmsText(tenantRentSms(facts));
+      const needed = Math.ceil(message.length / 144);
+      const claim = await claimRentNotice(reference, "tenant");
+      if (claim) {
+        const reserved = await db.runTransaction(async (t) => {
+          const snap = await t.get(agentRef);
+          if (Number(snap.data()?.tokens ?? 0) < needed) return false;
+          t.update(agentRef, { tokens: admin.firestore.FieldValue.increment(-needed) });
+          return true;
+        });
+        if (!reserved) {
+          await claim.update({ status: "skipped_no_credits" });
+        } else {
+          const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(String(tenantPhone)), message });
+          if (r.success) {
+            await claim.update({ status: "sent", tokensCharged: needed });
+          } else {
+            await agentRef.update({ tokens: admin.firestore.FieldValue.increment(needed) });   // refund
+            console.error(`Rent notice (tenant) failed for ${reference}: ${r.error}`);
+            await claim.delete();
+          }
+        }
+      }
+    }
+  } catch (err: any) {
+    console.error(`sendRentPaymentNotices failed for ${p.reference}:`, err?.message || err);
+  }
+}
+
+/** A failed rent charge: the tenant's payment record must not stay "pending". The invoice is untouched. */
+async function markRentPaymentFailed(reference: string, reason: unknown): Promise<void> {
+  try {
+    const t = (await db.collection("transactions").doc(reference).get()).data();
+    if (!t?.userId || !t?.billingMonth) return;
+    const ref = db.collection("payments").doc(String(t.userId)).collection("billingMonths").doc(String(t.billingMonth));
+    const snap = await ref.get();
+    const payments: any[] = snap.data()?.payments || [];
+    await ref.update({
+      payments: payments.map((x) => x.reference === reference ? { ...x, status: "failed", failureReason: reason ?? null } : x),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (e: any) {
+    console.error(`markRentPaymentFailed ${reference}:`, e?.message || e);
   }
 }
 

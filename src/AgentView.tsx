@@ -397,6 +397,10 @@ const AgentView: React.FC = () => {
     .filter(p => p.status === 'success')
     .reduce((sum, p) => sum + p.amount, 0);
   
+  const successful = payments.filter(p => p.status === 'success');
+  const totalFeesDeducted = successful.reduce((sum, p) => sum + (p.totalDeductions ?? 0), 0);
+  const totalNetPayout = successful.reduce((sum, p) => sum + (p.netPayout ?? p.amount), 0);
+
   const totalOutstanding = invoices
     .filter(inv => !inv.isPaid)
     .reduce((sum, inv) => sum + (inv.totalAmount - inv.amountPaid), 0);
@@ -949,7 +953,9 @@ const AgentView: React.FC = () => {
               <DollarSign className="w-6 h-6 sm:w-8 sm:h-8 text-green-600" />
             </div>
             <p className="text-xl sm:text-2xl font-bold text-gray-900">{formatCurrency(totalRevenue)}</p>
-            <p className="text-xs text-gray-500 mt-2">From successful payments</p>
+            <p className="text-xs text-gray-500 mt-2">Collected from successful payments</p>
+            <p className="text-xs text-gray-500">Fees deducted: {formatCurrency(totalFeesDeducted)}</p>
+            <p className="text-xs font-semibold text-gray-700">Net payout: {formatCurrency(totalNetPayout)}</p>
           </div>
 
           <div className="bg-white rounded-xl shadow-lg p-4 sm:p-6">
@@ -1023,7 +1029,9 @@ const AgentView: React.FC = () => {
                     <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700">Date</th>
                     <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700">Reference</th>
                     <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700 hidden sm:table-cell">Tenant</th>
-                    <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700">Amount</th>
+                    <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700">Collected</th>
+                    <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700">Fees</th>
+                    <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700">Net payout</th>
                     <th className="text-left py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-700">Status</th>
                   </tr>
                 </thead>
@@ -1041,6 +1049,12 @@ const AgentView: React.FC = () => {
                       </td>
                       <td className="py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-900">
                         {formatCurrency(payment.amount)}
+                      </td>
+                      <td className="py-3 px-3 sm:px-4 text-xs sm:text-sm text-gray-600">
+                        {payment.totalDeductions != null ? `- ${formatCurrency(payment.totalDeductions)}` : '—'}
+                      </td>
+                      <td className="py-3 px-3 sm:px-4 text-xs sm:text-sm font-semibold text-gray-900">
+                        {payment.netPayout != null ? formatCurrency(payment.netPayout) : '—'}
                       </td>
                       <td className="py-3 px-3 sm:px-4">
                         <span

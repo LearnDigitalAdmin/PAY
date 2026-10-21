@@ -1,14 +1,16 @@
 // The ONE function that starts a rent STK push. processPayment (landlord / tenant initiated) calls it, and so will the
 // desk-initiated batch runner. Extracted from processPayment — the Paystack call, the records and the payload are the
-// same; what changed is the money: the landlord's share is 100 - take% where the take is rentTake(rent, tier rate, cap).
+// same; what changed is the money: see ./rentFees — the tenant is charged rent + a capped surcharge, the landlord's
+// subaccount receives EXACTLY rent - (its part of Paystack's fee + the 0.2% convenience fee), via a flat split.
 import * as admin from "firebase-admin";
 import axios from "axios";
 import { HttpsError } from "firebase-functions/v2/https";
 import { deskDb } from "./db";
 import { getDeskConfig } from "./config";
 import { resolveDeskOwner } from "./owner";
-import { planRentSplit } from "./rent";
-import { getOrCreateDeskSplit, type SplitSub } from "./split";
+import { rentFees, RENT_FEE_RULES } from "./rentFees";
+import { floorPct2, toBps } from "./money";
+import { getOrCreateFlatSplit, type FlatSub } from "./split";
 import { writeDeskAudit } from "./events";
 import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "./paystack";
 import type { DeskCommission } from "./types";
@@ -67,27 +69,32 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
   }
 
   const cfg = await getDeskConfig();
-  // The landlord's CURRENT tier, read now (paymentInfo.split on the user document goes stale when the tier changes).
-  const plan = planRentSplit({ rentMinor, tier: landlord.tier, ownerDesk: ownerDesk !== null }, cfg);
-  const subs: SplitSub[] = [{ subaccount: landlordSub, sharePct: plan.landlordSharePct }];
-  if (ownerDesk && plan.agentSharePct > 0) subs.push({ subaccount: ownerDesk.subaccountCode, sharePct: plan.agentSharePct });
-  const splitCode = await getOrCreateDeskSplit(subs, "rent");
+  const fees = rentFees(rentMinor);
+  // An owning desk earns rentDeskSharePct of the convenience fee (a flat amount, paid out by the split).
+  const agentMinor = ownerDesk ? Math.floor((fees.convenienceMinor * toBps(cfg.rentDeskSharePct)) / 10000) : 0;
+  const subs: FlatSub[] = [{ subaccount: landlordSub, amountMinor: fees.netPayoutMinor }];
+  if (ownerDesk && agentMinor > 0) subs.push({ subaccount: ownerDesk.subaccountCode, amountMinor: agentMinor });
+  const splitCode = await getOrCreateFlatSplit(subs, "rent", fees.chargeMinor);
 
   const formattedPhone = formatKenyaPhone(phone);
   const reference = `INV_${userId}_${Date.now()}`;
-  const deskCommission: DeskCommission | null = ownerDesk && plan.agentSharePct > 0
-    ? { agentCode: ownerDesk.agentCode, agentId: ownerDesk.agentId, sharePct: plan.agentSharePct, rule: "rent", entityKey }
+  // The desk ledger works in % of what settles (gross - real fee); express the flat agent amount that way, rounded DOWN.
+  const expectedSettled = fees.chargeMinor - Math.min(Math.round(fees.chargeMinor * RENT_FEE_RULES.paystackPct / 100), RENT_FEE_RULES.paystackCapMinor);
+  const agentSharePct = agentMinor > 0 ? floorPct2((agentMinor * 100) / expectedSettled) : 0;
+  const deskCommission: DeskCommission | null = ownerDesk && agentSharePct > 0
+    ? { agentCode: ownerDesk.agentCode, agentId: ownerDesk.agentId, sharePct: agentSharePct, rule: "rent", entityKey }
     : null;
 
   const chargePayload = {
     email,
-    amount: rentMinor,
+    amount: fees.chargeMinor,   // the tenant pays rent + surcharge; the invoice is still credited the rent
     currency,
     mobile_money: { phone: formattedPhone, provider },
     reference,
     split_code: splitCode,
     metadata: {
       userId, userName, invoiceId, billingMonth, arrears, agentId, originalAmount: amount,
+      rentMinor: fees.rentMinor, tenantFeeMinor: fees.tenantFeeMinor, chargeMinor: fees.chargeMinor, netPayoutMinor: fees.netPayoutMinor,
       ...(input.desk ? { deskBatchId: input.desk.batchId, deskAgentId: input.desk.agentId } : {}),
     },
   };
@@ -104,7 +111,10 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
   const paymentRecord = {
     userName, agentId, amount, arrears, invoiceId, billingMonth, currency, phone: formattedPhone, provider,
     reference: tx.reference, status, displayText: tx.display_text, accountReference: tx.account_reference,
-    initiatedAt: new Date().toISOString(), subaccountCode: landlordSub, commissionRate: plan.takePct, splitCode,
+    initiatedAt: new Date().toISOString(), subaccountCode: landlordSub, commissionRate: RENT_FEE_RULES.conveniencePct, splitCode,
+    // collected = `amount` (the rent); the landlord is deducted, the tenant paid the surcharge on top
+    tenantFee: fees.tenantFeeMinor / 100, chargedAmount: fees.chargeMinor / 100, landlordPaystackFee: fees.landlordPaystackMinor / 100,
+    convenienceFee: fees.convenienceMinor / 100, totalDeductions: fees.deductionsMinor / 100, netPayout: fees.netPayoutMinor / 100,
   };
   await db.collection("payments").doc(userId).collection("billingMonths").doc(billingMonth).set(
     { payments: admin.firestore.FieldValue.arrayUnion(paymentRecord), lastUpdated: admin.firestore.FieldValue.serverTimestamp() },
@@ -115,8 +125,10 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
     userName, email, phone: formattedPhone, provider, currency, userId, agentId, invoiceId, billingMonth, amount, arrears,
     status, reference: tx.reference, displayText: tx.display_text, accountReference: tx.account_reference, splitCode,
     // the money, so the books can be audited from the document alone
-    tier: String(landlord.tier ?? "").toLowerCase() || null, takeRatePct: plan.ratePct, takeMinor: plan.takeMinor, takePct: plan.takePct,
-    landlordSharePct: plan.landlordSharePct, agentSharePct: plan.agentSharePct, platformSharePct: plan.platformSharePct,
+    tier: String(landlord.tier ?? "").toLowerCase() || null,
+    rentMinor: fees.rentMinor, tenantFeeMinor: fees.tenantFeeMinor, chargeMinor: fees.chargeMinor,
+    paystackEstimateMinor: fees.paystackEstimateMinor, landlordPaystackMinor: fees.landlordPaystackMinor,
+    convenienceMinor: fees.convenienceMinor, deductionsMinor: fees.deductionsMinor, netPayoutMinor: fees.netPayoutMinor, agentMinor,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
   if (deskCommission) txnDoc.deskCommission = deskCommission;
