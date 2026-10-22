@@ -1,7 +1,7 @@
 // The ONE function that starts a rent STK push. processPayment (landlord / tenant initiated) calls it, and so will the
 // desk-initiated batch runner. Extracted from processPayment — the Paystack call, the records and the payload are the
 // same; what changed is the money: see ./rentFees — the tenant is charged rent + a capped surcharge, the landlord's
-// subaccount receives EXACTLY rent - (its part of Paystack's fee + the 0.2% convenience fee), via a flat split.
+// subaccount receives EXACTLY rent - (its part of Paystack's fee + the plan's convenience fee, 0.2%-0.95%), via a flat split.
 import * as admin from "firebase-admin";
 import axios from "axios";
 import { HttpsError } from "firebase-functions/v2/https";
@@ -9,6 +9,7 @@ import { deskDb } from "./db";
 import { getDeskConfig } from "./config";
 import { resolveDeskOwner } from "./owner";
 import { rentFees, RENT_FEE_RULES } from "./rentFees";
+import { checkSafaricomPhone } from "../phone/safaricom";
 import { floorPct2, toBps } from "./money";
 import { getOrCreateFlatSplit, type FlatSub } from "./split";
 import { writeDeskAudit } from "./events";
@@ -29,15 +30,11 @@ export interface RentChargeInput {
 
 export interface RentChargeResult { reference: string; status: string; displayText: string; accountReference?: string }
 
-/** +254XXXXXXXXX for Paystack's Kenya M-Pesa charge (same normalisation processPayment always used). */
-export function formatKenyaPhone(phone: string): string {
-  let p = String(phone).replace(/[\s-]/g, "");
-  if (p.startsWith("+254")) return p;
-  if (p.startsWith("254")) return "+" + p;
-  if (p.startsWith("0")) return "+254" + p.substring(1);
-  if (p.startsWith("7") || p.startsWith("1")) return "+254" + p;
-  if (p.startsWith("+")) return "+254" + p.substring(1);
-  return p;
+/** +254XXXXXXXXX for Paystack's Kenya M-Pesa charge. Accepts 0701234567, 701234567, 254701234567, +254..., or a number. Throws on anything else. */
+export function formatKenyaPhone(phone: unknown): string {
+  const c = checkSafaricomPhone(phone);
+  if (!c.ok) throw new HttpsError("invalid-argument", c.message);
+  return c.e164;
 }
 
 export async function initiateRentCharge(input: RentChargeInput): Promise<RentChargeResult> {
@@ -69,8 +66,8 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
   }
 
   const cfg = await getDeskConfig();
-  const fees = rentFees(rentMinor);
-  // An owning desk earns rentDeskSharePct of the convenience fee (a flat amount, paid out by the split).
+  const fees = rentFees(rentMinor, landlord.tier);   // the platform cut follows the landlord's plan
+  // An owning desk earns rentDeskSharePct of the (plan-based) convenience fee (a flat amount, paid out by the split).
   const agentMinor = ownerDesk ? Math.floor((fees.convenienceMinor * toBps(cfg.rentDeskSharePct)) / 10000) : 0;
   const subs: FlatSub[] = [{ subaccount: landlordSub, amountMinor: fees.netPayoutMinor }];
   if (ownerDesk && agentMinor > 0) subs.push({ subaccount: ownerDesk.subaccountCode, amountMinor: agentMinor });
@@ -111,7 +108,7 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
   const paymentRecord = {
     userName, agentId, amount, arrears, invoiceId, billingMonth, currency, phone: formattedPhone, provider,
     reference: tx.reference, status, displayText: tx.display_text, accountReference: tx.account_reference,
-    initiatedAt: new Date().toISOString(), subaccountCode: landlordSub, commissionRate: RENT_FEE_RULES.conveniencePct, splitCode,
+    initiatedAt: new Date().toISOString(), subaccountCode: landlordSub, commissionRate: fees.conveniencePct, splitCode,
     // collected = `amount` (the rent); the landlord is deducted, the tenant paid the surcharge on top
     tenantFee: fees.tenantFeeMinor / 100, chargedAmount: fees.chargeMinor / 100, landlordPaystackFee: fees.landlordPaystackMinor / 100,
     convenienceFee: fees.convenienceMinor / 100, totalDeductions: fees.deductionsMinor / 100, netPayout: fees.netPayoutMinor / 100,
@@ -128,7 +125,7 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
     tier: String(landlord.tier ?? "").toLowerCase() || null,
     rentMinor: fees.rentMinor, tenantFeeMinor: fees.tenantFeeMinor, chargeMinor: fees.chargeMinor,
     paystackEstimateMinor: fees.paystackEstimateMinor, landlordPaystackMinor: fees.landlordPaystackMinor,
-    convenienceMinor: fees.convenienceMinor, deductionsMinor: fees.deductionsMinor, netPayoutMinor: fees.netPayoutMinor, agentMinor,
+    conveniencePct: fees.conveniencePct, convenienceMinor: fees.convenienceMinor, deductionsMinor: fees.deductionsMinor, netPayoutMinor: fees.netPayoutMinor, agentMinor,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
   if (deskCommission) txnDoc.deskCommission = deskCommission;

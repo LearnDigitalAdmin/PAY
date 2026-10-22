@@ -169,11 +169,11 @@ const settle = { amount: 15000, fees: 225, paid_at: "2026-10-09T10:00:00.000Z" }
     const r = await rentCharge.initiateRentCharge(rentInput());
     assert.match(r.reference, /^INV_T1_\d+$/);
     const sp = splitCalls()[0].body; assert.strictEqual(sp.type, "flat"); assert.strictEqual(sp.bearer_type, "account");
-    assert.deepStrictEqual(sp.subaccounts, [{ subaccount: "ACCT_landlord", share: 790400 }]);   // 8000 - (120 est - 40 tenant) - 16 convenience
+    assert.deepStrictEqual(sp.subaccounts, [{ subaccount: "ACCT_landlord", share: 788800 }]);   // pro (0.4%): 8000 - (120 est - 40 tenant) - 32 convenience
     const charge = chargeCalls()[0].body; assert.strictEqual(charge.amount, 804000);   // rent 8000 + tenant surcharge 40 assert.ok(charge.split_code.startsWith("SPL_")); assert.strictEqual(charge.metadata.deskBatchId, undefined);
     const txn = plot.read(`transactions/${r.reference}`);
     assert.strictEqual(txn.amount, 8000);   // the invoice is credited the rent
-    assert.deepStrictEqual([txn.rentMinor, txn.tenantFeeMinor, txn.chargeMinor, txn.deductionsMinor, txn.netPayoutMinor], [800000, 4000, 804000, 9600, 790400]);
+    assert.deepStrictEqual([txn.rentMinor, txn.tenantFeeMinor, txn.chargeMinor, txn.deductionsMinor, txn.netPayoutMinor], [800000, 4000, 804000, 11200, 788800]);
     assert.strictEqual(txn.tier, "pro"); assert.strictEqual(txn.deskCommission, undefined);
     assert.ok(plot.read("payments/T1/billingMonths/2026-10"));
   });
@@ -184,25 +184,25 @@ const settle = { amount: 15000, fees: 225, paid_at: "2026-10-09T10:00:00.000Z" }
     assert.strictEqual(txn.tenantFeeMinor, 10000);   // 0.5% of 20000 = 100, under the cap
     const big = await rentCharge.initiateRentCharge(rentInput({ amount: 50000 }));
     const bt = plot.read(`transactions/${big.reference}`);
-    assert.deepStrictEqual([bt.chargeMinor, bt.tenantFeeMinor, bt.deductionsMinor, bt.netPayoutMinor], [5015000, 15000, 70000, 4930000]);
+    assert.deepStrictEqual([bt.chargeMinor, bt.tenantFeeMinor, bt.deductionsMinor, bt.netPayoutMinor], [5015000, 15000, 107500, 4892500]);
   });
   await t("desk batch charge by the OWNER desk uses the three-way split and records deskCommission; the webhook writes ONE rent event with the real fee", async () => {
     seedLandlord({ tier: "business" }); seedDesk();
     const r = await rentCharge.initiateRentCharge(rentInput({ desk: { agentId: "ag1", batchId: "rb_1" } }));
-    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 790400 }, { subaccount: "ACCT_agent1", share: 480 }]);   // agent: 30% of the 16.00 convenience fee
+    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 786800 }, { subaccount: "ACCT_agent1", share: 1560 }]);   // business (0.65% = 52.00): agent gets 30%
     const charge = chargeCalls()[0].body; assert.strictEqual(charge.metadata.deskBatchId, "rb_1"); assert.strictEqual(charge.metadata.deskAgentId, "ag1");
     const txn = plot.read(`transactions/${r.reference}`);
-    assert.deepStrictEqual(txn.deskCommission, { agentCode: "COG-0001", agentId: "ag1", sharePct: 0.06, rule: "rent", entityKey: ENTITY });
+    assert.deepStrictEqual(txn.deskCommission, { agentCode: "COG-0001", agentId: "ag1", sharePct: 0.19, rule: "rent", entityKey: ENTITY });
     const data = { amount: 800000, fees: 12000, paid_at: "2026-10-09T08:00:00Z" };
     assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data, transaction: txn }), "written");
     assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data, transaction: txn }), "duplicate");
     const [e] = eventDocs(); assert.strictEqual(eventDocs().length, 1);
-    assert.strictEqual(e.type, "rent_payment"); assert.strictEqual(e.grossMinor, 800000); assert.strictEqual(e.feeMinor, 12000); assert.strictEqual(e.agentSharePct, 0.06); assert.strictEqual(e.eventId, `rent_payment:${r.reference}`);
+    assert.strictEqual(e.type, "rent_payment"); assert.strictEqual(e.grossMinor, 800000); assert.strictEqual(e.feeMinor, 12000); assert.strictEqual(e.agentSharePct, 0.19); assert.strictEqual(e.eventId, `rent_payment:${r.reference}`);
   });
   await t("a batch from a NON-owner desk uses the normal two-way split and writes no desk commission", async () => {
     seedLandlord({ tier: "business" }); seedDesk(); plot.seed("desk_agents/ag2", { agentId: "ag2", agentCode: "COG-0002", status: "active", rank: "clerk" });
     const r = await rentCharge.initiateRentCharge(rentInput({ desk: { agentId: "ag2", batchId: "rb_2" } }));
-    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 790400 }]);
+    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 786800 }]);
     const txn = plot.read(`transactions/${r.reference}`); assert.strictEqual(txn.deskCommission, undefined); assert.strictEqual(txn.agentMinor, 0);
     assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data: { amount: 800000, fees: 12000 }, transaction: txn }), "skipped");
     assert.strictEqual(eventDocs().length, 0);

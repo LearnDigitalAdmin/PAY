@@ -102,5 +102,22 @@ ok("rent fees: money always adds up, Paystack estimate capped at 3000", () => {
   assert.throws(() => RF.rentFees(0)); assert.throws(() => RF.rentFees(1.5));
 });
 
+ok("rent fees: platform cut by plan — enterprise 0.2, pro 0.4, business 0.65, everything else 0.95", () => {
+  const cut = (tier) => RF.rentFees(1000000, tier).convenienceMinor;   // KES 10,000 rent
+  assert.deepStrictEqual(["enterprise", "pro", "business", "solo", "starter", "free", "", undefined === 1 ? 0 : "weird"].map(cut), [2000, 4000, 6500, 9500, 9500, 9500, 9500, 9500]);
+  assert.strictEqual(cut("PRO"), 4000); assert.strictEqual(cut(" Business "), 6500);
+  const f = RF.rentFees(1000000, "business");   // tenant 50, landlord Paystack 100, cut 65 -> deduction 165, net 9,835
+  assert.deepStrictEqual([f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor, f.conveniencePct], [10000, 6500, 16500, 983500, 0.65]);
+  assert.strictEqual(RF.rentFees(1000000).conveniencePct, 0.2);   // no tier = the enterprise baseline
+});
+ok("phones: Safaricom only; 701234567 (leading 0 lost) and every spelling format to 2547XXXXXXXX", () => {
+  const P = require(path.join(__dirname, "..", "lib", "phone", "safaricom"));
+  for (const raw of ["0701234567", 701234567, "701234567", "+254 701-234-567", "254701234567", "+254 (0) 701234567"]) assert.strictEqual(P.checkSafaricomPhone(raw).e164, "+254701234567", String(raw));
+  for (const raw of ["0700000000", "0709999999", "0745123456", "0757000000", "0768000000", "0799999999", "0110000000", "0115999999", "0119000000", "0143000000", "0182999999"]) assert.ok(P.checkSafaricomPhone(raw).ok, raw);
+  for (const raw of ["0730000000", "0744000000", "0747000000", "0750000000", "0756000000", "0767000000", "0116000000", "0117000000", "0144000000", "0183000000", "0100000000"]) assert.strictEqual(P.checkSafaricomPhone(raw).reason, "not_safaricom", raw);
+  assert.strictEqual(P.checkSafaricomPhone("12345").reason, "invalid");
+  assert.strictEqual(P.toMsisdn(701234567), "254701234567");
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

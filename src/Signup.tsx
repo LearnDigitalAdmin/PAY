@@ -5,6 +5,7 @@ import { Phone, Mail, User, CreditCard, Lock, AlertCircle, Loader2, CheckCircle 
 import { AuthService, TenantService } from './Firebase';
 import { useNavigate } from 'react-router-dom';
 import { setPortalPreference } from './session/session';
+import { checkSafaricomPhone } from './utils/safaricom';
 
 const Signup: React.FC = () => {
   const [step, setStep] = useState<'info' | 'phone' | 'code'>('info');
@@ -57,7 +58,9 @@ const Signup: React.FC = () => {
     setLoading(true);
 
     try {
-      const formattedPhone = formatPhoneNumber(formData.phone);
+      const phoneCheck = checkSafaricomPhone(formData.phone);
+      if (!phoneCheck.ok) throw new Error(phoneCheck.message);
+      const formattedPhone = phoneCheck.e164;
       const result = await AuthService.sendVerificationCode(formattedPhone);
       setConfirmationResult(result);
       setStep('code');
@@ -224,7 +227,7 @@ const Signup: React.FC = () => {
                   required
                 />
               </div>
-              <p className="mt-2 text-xs text-gray-500">Enter your Kenyan phone number</p>
+              <p className="mt-2 text-xs text-gray-500">Safaricom numbers only (07xx or 01xx)</p>
             </div>
 
             <button

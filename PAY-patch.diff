@@ -1,0 +1,774 @@
+diff --git a/functions/src/desk/rentCharge.ts b/functions/src/desk/rentCharge.ts
+index 258478a..cf35a2a 100644
+--- a/functions/src/desk/rentCharge.ts
++++ b/functions/src/desk/rentCharge.ts
+@@ -1,7 +1,7 @@
+ // The ONE function that starts a rent STK push. processPayment (landlord / tenant initiated) calls it, and so will the
+ // desk-initiated batch runner. Extracted from processPayment — the Paystack call, the records and the payload are the
+ // same; what changed is the money: see ./rentFees — the tenant is charged rent + a capped surcharge, the landlord's
+-// subaccount receives EXACTLY rent - (its part of Paystack's fee + the 0.2% convenience fee), via a flat split.
++// subaccount receives EXACTLY rent - (its part of Paystack's fee + the plan's convenience fee, 0.2%-0.95%), via a flat split.
+ import * as admin from "firebase-admin";
+ import axios from "axios";
+ import { HttpsError } from "firebase-functions/v2/https";
+@@ -9,6 +9,7 @@ import { deskDb } from "./db";
+ import { getDeskConfig } from "./config";
+ import { resolveDeskOwner } from "./owner";
+ import { rentFees, RENT_FEE_RULES } from "./rentFees";
++import { checkSafaricomPhone } from "../phone/safaricom";
+ import { floorPct2, toBps } from "./money";
+ import { getOrCreateFlatSplit, type FlatSub } from "./split";
+ import { writeDeskAudit } from "./events";
+@@ -29,15 +30,11 @@ export interface RentChargeInput {
+ 
+ export interface RentChargeResult { reference: string; status: string; displayText: string; accountReference?: string }
+ 
+-/** +254XXXXXXXXX for Paystack's Kenya M-Pesa charge (same normalisation processPayment always used). */
+-export function formatKenyaPhone(phone: string): string {
+-  let p = String(phone).replace(/[\s-]/g, "");
+-  if (p.startsWith("+254")) return p;
+-  if (p.startsWith("254")) return "+" + p;
+-  if (p.startsWith("0")) return "+254" + p.substring(1);
+-  if (p.startsWith("7") || p.startsWith("1")) return "+254" + p;
+-  if (p.startsWith("+")) return "+254" + p.substring(1);
+-  return p;
++/** +254XXXXXXXXX for Paystack's Kenya M-Pesa charge. Accepts 0701234567, 701234567, 254701234567, +254..., or a number. Throws on anything else. */
++export function formatKenyaPhone(phone: unknown): string {
++  const c = checkSafaricomPhone(phone);
++  if (!c.ok) throw new HttpsError("invalid-argument", c.message);
++  return c.e164;
+ }
+ 
+ export async function initiateRentCharge(input: RentChargeInput): Promise<RentChargeResult> {
+@@ -69,8 +66,8 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
+   }
+ 
+   const cfg = await getDeskConfig();
+-  const fees = rentFees(rentMinor);
+-  // An owning desk earns rentDeskSharePct of the convenience fee (a flat amount, paid out by the split).
++  const fees = rentFees(rentMinor, landlord.tier);   // the platform cut follows the landlord's plan
++  // An owning desk earns rentDeskSharePct of the (plan-based) convenience fee (a flat amount, paid out by the split).
+   const agentMinor = ownerDesk ? Math.floor((fees.convenienceMinor * toBps(cfg.rentDeskSharePct)) / 10000) : 0;
+   const subs: FlatSub[] = [{ subaccount: landlordSub, amountMinor: fees.netPayoutMinor }];
+   if (ownerDesk && agentMinor > 0) subs.push({ subaccount: ownerDesk.subaccountCode, amountMinor: agentMinor });
+@@ -111,7 +108,7 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
+   const paymentRecord = {
+     userName, agentId, amount, arrears, invoiceId, billingMonth, currency, phone: formattedPhone, provider,
+     reference: tx.reference, status, displayText: tx.display_text, accountReference: tx.account_reference,
+-    initiatedAt: new Date().toISOString(), subaccountCode: landlordSub, commissionRate: RENT_FEE_RULES.conveniencePct, splitCode,
++    initiatedAt: new Date().toISOString(), subaccountCode: landlordSub, commissionRate: fees.conveniencePct, splitCode,
+     // collected = `amount` (the rent); the landlord is deducted, the tenant paid the surcharge on top
+     tenantFee: fees.tenantFeeMinor / 100, chargedAmount: fees.chargeMinor / 100, landlordPaystackFee: fees.landlordPaystackMinor / 100,
+     convenienceFee: fees.convenienceMinor / 100, totalDeductions: fees.deductionsMinor / 100, netPayout: fees.netPayoutMinor / 100,
+@@ -128,7 +125,7 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
+     tier: String(landlord.tier ?? "").toLowerCase() || null,
+     rentMinor: fees.rentMinor, tenantFeeMinor: fees.tenantFeeMinor, chargeMinor: fees.chargeMinor,
+     paystackEstimateMinor: fees.paystackEstimateMinor, landlordPaystackMinor: fees.landlordPaystackMinor,
+-    convenienceMinor: fees.convenienceMinor, deductionsMinor: fees.deductionsMinor, netPayoutMinor: fees.netPayoutMinor, agentMinor,
++    conveniencePct: fees.conveniencePct, convenienceMinor: fees.convenienceMinor, deductionsMinor: fees.deductionsMinor, netPayoutMinor: fees.netPayoutMinor, agentMinor,
+     createdAt: admin.firestore.FieldValue.serverTimestamp(),
+   };
+   if (deskCommission) txnDoc.deskCommission = deskCommission;
+diff --git a/functions/src/desk/rentFees.ts b/functions/src/desk/rentFees.ts
+index 311d396..daf681e 100644
+--- a/functions/src/desk/rentFees.ts
++++ b/functions/src/desk/rentFees.ts
+@@ -4,11 +4,12 @@
+  *   tenant surcharge   = min(KES 150, 0.5% of the rent)            -> added on top: the tenant pays rent + surcharge
+  *   Paystack estimate  = 1.5% of the rent (capped KES 3,000)       -> what the landlord + tenant together cover
+  *   landlord Paystack  = estimate - surcharge                      -> the part of Paystack's fee the landlord covers
+- *   convenience fee    = 0.2% of the rent                          -> Samuhia's fee, paid by the landlord
++ *   convenience fee    = platform cut by the landlord's PLAN (see CONVENIENCE_PCT_BY_TIER), % of the rent
++ *                        enterprise 0.2 | pro 0.4 | business 0.65 | everyone else 0.95   -> Samuhia's fee, paid by the landlord
+  *   landlord deduction = landlord Paystack + convenience fee
+  *   net payout         = rent - landlord deduction                 -> settled EXACTLY to the landlord's subaccount
+  *
+- * Rent 50,000: tenant pays 50,150 | Paystack estimate 750 -> landlord covers 600 | convenience 100 | deduction 700 | net 49,300.
++ * Rent 50,000 (enterprise, 0.2%): tenant pays 50,150 | Paystack estimate 750 -> landlord covers 600 | convenience 100 | deduction 700 | net 49,300.
+  * The invoice is always credited the RENT (`rentMinor`), never the surcharge.
+  */
+ import { pctHalfUp } from "./money";
+@@ -16,30 +17,46 @@ import { pctHalfUp } from "./money";
+ export const RENT_FEE_RULES = {
+   tenantPct: 0.5, tenantCapMinor: 15_000,        // KES 150
+   paystackPct: 1.5, paystackCapMinor: 300_000,   // KES 3,000
+-  conveniencePct: 0.2,
++  conveniencePct: 0.2,   // the enterprise (lowest) cut; what rentFees() uses when no tier is passed
+ } as const;
+ 
++/** Platform cut on rent, % of the rent, by the landlord's plan (users/{uid}.tier, lower-case). Anything else pays the default. */
++export const CONVENIENCE_PCT_BY_TIER: Readonly<Record<string, number>> = {
++  enterprise: 0.2,
++  pro: 0.4, professional: 0.4,
++  business: 0.65,
++};
++export const DEFAULT_CONVENIENCE_PCT = 0.95;   // free, starter, solo, unknown
++
++export function conveniencePctForTier(tier: unknown): number {
++  const key = typeof tier === "string" ? tier.trim().toLowerCase() : "";
++  return Object.prototype.hasOwnProperty.call(CONVENIENCE_PCT_BY_TIER, key) ? CONVENIENCE_PCT_BY_TIER[key] : DEFAULT_CONVENIENCE_PCT;
++}
++
+ export interface RentFees {
+   rentMinor: number;
+   tenantFeeMinor: number;          // paid by the tenant, on top of the rent
+   chargeMinor: number;             // what the tenant is actually charged (STK amount) = rent + tenantFee
+   paystackEstimateMinor: number;   // estimated Paystack cost, on the rent
+   landlordPaystackMinor: number;   // estimate - tenantFee (never negative)
+-  convenienceMinor: number;        // 0.2% of the rent
++  conveniencePct: number;           // the plan's platform cut that was applied
++  convenienceMinor: number;         // conveniencePct of the rent
+   deductionsMinor: number;         // landlordPaystack + convenience
+   netPayoutMinor: number;          // rent - deductions: exactly what the landlord's subaccount receives
+ }
+ 
+-export function rentFees(rentMinor: number): RentFees {
++/** `tier` = the landlord's plan. Pass it on every real charge; omitted (tests, tools) means the enterprise 0.2%. */
++export function rentFees(rentMinor: number, tier?: unknown): RentFees {
+   if (!Number.isSafeInteger(rentMinor) || rentMinor <= 0) throw new RangeError("rent must be a positive integer minor unit");
+   const R = RENT_FEE_RULES;
+   const tenantFeeMinor = Math.min(pctHalfUp(rentMinor, R.tenantPct), R.tenantCapMinor);
+   const paystackEstimateMinor = Math.min(pctHalfUp(rentMinor, R.paystackPct), R.paystackCapMinor);
+   const landlordPaystackMinor = Math.max(0, paystackEstimateMinor - tenantFeeMinor);
+-  const convenienceMinor = pctHalfUp(rentMinor, R.conveniencePct);
++  const conveniencePct = tier === undefined ? R.conveniencePct : conveniencePctForTier(tier);
++  const convenienceMinor = pctHalfUp(rentMinor, conveniencePct);
+   const deductionsMinor = landlordPaystackMinor + convenienceMinor;
+   return {
+     rentMinor, tenantFeeMinor, chargeMinor: rentMinor + tenantFeeMinor, paystackEstimateMinor,
+-    landlordPaystackMinor, convenienceMinor, deductionsMinor, netPayoutMinor: rentMinor - deductionsMinor,
++    landlordPaystackMinor, conveniencePct, convenienceMinor, deductionsMinor, netPayoutMinor: rentMinor - deductionsMinor,
+   };
+ }
+diff --git a/functions/src/identity/trialGuard.ts b/functions/src/identity/trialGuard.ts
+new file mode 100644
+index 0000000..fba7cab
+--- /dev/null
++++ b/functions/src/identity/trialGuard.ts
+@@ -0,0 +1,180 @@
++/**
++ * Trial-abuse guard: one person (one National ID, one phone) gets ONE account and ONE free trial.
++ *
++ *  - findExistingAccount()      non-scheduled helper. Given an ID number and/or phone, finds the account that already owns
++ *                               them (spelling variants of the ID, every stored shape of the phone). Used at sign-up so a
++ *                               repeat sign-up is sent back to the existing account instead of starting a new trial.
++ *  - trialAlreadyClaimed()      / recordTrialClaims()   a ledger (trial_claims/*) that outlives the account, so deleting an
++ *                               account and signing up again does not earn a second trial.
++ *  - reconcileIdentityDuplicates  scheduled, once a day. Finds accounts that share an ID or phone (legacy data, agent-created
++ *                               accounts, anything that slipped through), keeps the oldest / paying one as the primary, links
++ *                               the others to it (duplicateOf), and ends the extra trials. It never deletes or merges data.
++ */
++import * as admin from "firebase-admin";
++import { onSchedule } from "firebase-functions/v2/scheduler";
++import { nationalDigits, phoneStorageVariants } from "../phone/safaricom";
++
++/** "12 345-678" / "0012345678" / "a1234567" -> "12345678" | "A1234567". Leading zeros are not significant in a National ID. */
++export function normalizeIdKey(raw: unknown): string {
++  const n = String(raw ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
++  return /^\d+$/.test(n) ? n.replace(/^0+/, "") : n;
++}
++/** 701234567 / +254701234567 / 0701234567 -> "701234567" (the 9 national digits), "" when not a Kenyan mobile. */
++export const normalizePhoneKey = (raw: unknown): string => nationalDigits(raw);
++
++const claimId = (kind: "id" | "phone", key: string) => `${kind}_${key}`;
++
++export interface ExistingAccount {
++  uid: string;
++  matchedBy: "id" | "phone";
++  email?: string;
++  emailHint: string;     // j***@gmail.com — enough to recognise it, not enough to harvest it
++  isTrial: boolean;
++  tier: string;
++}
++
++function maskEmail(email?: string): string {
++  if (!email || !email.includes("@")) return "";
++  const [name, domain] = email.split("@");
++  return `${name.slice(0, 1)}${"*".repeat(Math.max(2, Math.min(name.length - 1, 5)))}@${domain}`;
++}
++
++function toExisting(doc: admin.firestore.QueryDocumentSnapshot | admin.firestore.DocumentSnapshot, by: "id" | "phone"): ExistingAccount {
++  const d = (doc.data() ?? {}) as Record<string, any>;
++  return { uid: doc.id, matchedBy: by, email: d.email, emailHint: maskEmail(d.email), isTrial: d.isTrial === true, tier: String(d.tier ?? "free") };
++}
++
++/**
++ * The account that already owns this ID number or phone, or null. ID is checked first (users/{id} is the document id for
++ * accounts made with a custom UID, then the stored id fields), then every stored shape of the phone.
++ */
++export async function findExistingAccount(
++  db: admin.firestore.Firestore, p: { idNumber?: unknown; phone?: unknown },
++): Promise<ExistingAccount | null> {
++  const users = db.collection("users");
++  const idKey = normalizeIdKey(p.idNumber);
++  if (idKey) {
++    // the raw spellings people actually type: "12345678", "012345678"
++    for (const candidate of new Set([idKey, `0${idKey}`, String(p.idNumber ?? "").trim()])) {
++      if (!candidate) continue;
++      const snap = await users.doc(candidate).get();
++      if (snap.exists) return toExisting(snap, "id");
++    }
++    const byField = await users.where("localId", "in", [idKey, `0${idKey}`, ...(Number(idKey) ? [Number(idKey)] : [])]).limit(1).get();
++    if (!byField.empty) return toExisting(byField.docs[0], "id");
++  }
++  const variants = phoneStorageVariants(p.phone);
++  if (variants.length) {
++    const byPhone = await users.where("phone", "in", variants).limit(1).get();
++    if (!byPhone.empty) return toExisting(byPhone.docs[0], "phone");
++  }
++  return null;
++}
++
++/** True when this ID or phone has already been given a trial (even if that account has since been deleted). */
++export async function trialAlreadyClaimed(db: admin.firestore.Firestore, p: { idNumber?: unknown; phone?: unknown }): Promise<boolean> {
++  const refs: admin.firestore.DocumentReference[] = [];
++  const idKey = normalizeIdKey(p.idNumber), phoneKey = normalizePhoneKey(p.phone);
++  if (idKey) refs.push(db.collection("trial_claims").doc(claimId("id", idKey)));
++  if (phoneKey) refs.push(db.collection("trial_claims").doc(claimId("phone", phoneKey)));
++  if (!refs.length) return false;
++  const snaps = await db.getAll(...refs);
++  return snaps.some((s) => s.exists);
++}
++
++export async function recordTrialClaims(db: admin.firestore.Firestore, p: { idNumber?: unknown; phone?: unknown; uid: string }): Promise<void> {
++  const idKey = normalizeIdKey(p.idNumber), phoneKey = normalizePhoneKey(p.phone);
++  const batch = db.batch();
++  const base = { uid: p.uid, claimedAt: admin.firestore.FieldValue.serverTimestamp() };
++  if (idKey) batch.set(db.collection("trial_claims").doc(claimId("id", idKey)), base, { merge: true });
++  if (phoneKey) batch.set(db.collection("trial_claims").doc(claimId("phone", phoneKey)), base, { merge: true });
++  await batch.commit();
++}
++
++interface Slim { id: string; createdMs: number; paying: boolean; isTrial: boolean; tokens: number; idKey: string; phoneKey: string; duplicateOf?: string }
++
++/** The reconcile pass, separated from the schedule so it can be run from a test or a one-off call. */
++export async function reconcileDuplicates(db: admin.firestore.Firestore, signupBonusTokens: number): Promise<{ scanned: number; groups: number; trialsEnded: number; linked: number }> {
++  const PAGE = 500;
++  const slim: Slim[] = [];
++  let last: admin.firestore.QueryDocumentSnapshot | undefined;
++  for (;;) {
++    let q = db.collection("users").orderBy(admin.firestore.FieldPath.documentId()).limit(PAGE)
++      .select("localId", "id", "phone", "createdAt", "isTrial", "tier", "type", "tokens", "duplicateOf");
++    if (last) q = q.startAfter(last);
++    const snap = await q.get();
++    if (snap.empty) break;
++    for (const d of snap.docs) {
++      const x = d.data() as Record<string, any>;
++      const created = x.createdAt?.toMillis?.() ?? 0;
++      slim.push({
++        id: d.id, createdMs: created, isTrial: x.isTrial === true, tokens: Number(x.tokens) || 0,
++        paying: x.isTrial !== true && String(x.tier ?? "free").toLowerCase() !== "free" && x.type === "paid",
++        idKey: normalizeIdKey(x.localId ?? x.id ?? d.id), phoneKey: normalizePhoneKey(x.phone),
++        duplicateOf: typeof x.duplicateOf === "string" ? x.duplicateOf : undefined,
++      });
++    }
++    last = snap.docs[snap.docs.length - 1];
++    if (snap.size < PAGE) break;
++  }
++
++  // union accounts that share an ID key or a phone key
++  const parent = new Map<string, string>();
++  const find = (a: string): string => { while (parent.get(a) !== a) { parent.set(a, parent.get(parent.get(a)!)!); a = parent.get(a)!; } return a; };
++  slim.forEach((s) => parent.set(s.id, s.id));
++  const seen = new Map<string, string>();
++  for (const s of slim) {
++    for (const key of [s.idKey && `id:${s.idKey}`, s.phoneKey && `ph:${s.phoneKey}`].filter(Boolean) as string[]) {
++      const other = seen.get(key);
++      if (other) parent.set(find(s.id), find(other)); else seen.set(key, s.id);
++    }
++  }
++  const groups = new Map<string, Slim[]>();
++  for (const s of slim) { const r = find(s.id); groups.set(r, [...(groups.get(r) ?? []), s]); }
++
++  let groupCount = 0, trialsEnded = 0, linked = 0;
++  for (const members of groups.values()) {
++    if (members.length < 2) continue;
++    groupCount++;
++    // primary: a paying account first, then the oldest
++    const ordered = [...members].sort((a, b) => Number(b.paying) - Number(a.paying) || (a.createdMs || Infinity) - (b.createdMs || Infinity));
++    const primary = ordered[0];
++    await recordTrialClaims(db, { idNumber: primary.idKey, phone: primary.phoneKey, uid: primary.id });
++    for (const dup of ordered.slice(1)) {
++      if (dup.duplicateOf === primary.id && !dup.isTrial) continue;   // already handled on an earlier run
++      const ref = db.collection("users").doc(dup.id);
++      const update: Record<string, unknown> = {
++        duplicateOf: primary.id, identityFlaggedAt: admin.firestore.FieldValue.serverTimestamp(),
++      };
++      if (dup.isTrial) {
++        Object.assign(update, {
++          tier: "free", type: "free", storage: false, isPremium: false, isTrial: false,
++          trialEndedAt: admin.firestore.FieldValue.serverTimestamp(), trialRevokedReason: "duplicate_identity",
++          tokens: Math.max(0, dup.tokens - signupBonusTokens),   // take back the signup gift, never below zero
++        });
++        trialsEnded++;
++      }
++      await ref.set(update, { merge: true });
++      await db.collection("identity_flags").doc(dup.id).set({
++        uid: dup.id, primaryUid: primary.id, trialEnded: dup.isTrial,
++        sharedId: dup.idKey === primary.idKey && !!dup.idKey, sharedPhone: dup.phoneKey === primary.phoneKey && !!dup.phoneKey,
++        flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
++      }, { merge: true });
++      linked++;
++    }
++  }
++  return { scanned: slim.length, groups: groupCount, trialsEnded, linked };
++}
++
++/** Once a day, 03:30 Nairobi. */
++export const reconcileIdentityDuplicates = onSchedule({
++  schedule: "30 3 * * *",
++  timeZone: "Africa/Nairobi",
++  region: "us-central1",
++  memory: "512MiB",
++  timeoutSeconds: 540,
++}, async () => {
++  const bonus = 50;   // PMS_SIGNUP_FREE_TOKENS in index.ts
++  const r = await reconcileDuplicates(admin.firestore(), bonus);
++  console.log(`reconcileIdentityDuplicates: scanned ${r.scanned}, duplicate groups ${r.groups}, linked ${r.linked}, trials ended ${r.trialsEnded}`);
++});
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index 34c923b..687f5c3 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -46,6 +46,9 @@ import { runRentBatch } from "./desk/rentBatch";
+ export { deskSmsCommission } from "./deskSmsEndpoint";
+ import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
+ import { landlordRentSms, tenantRentSms, settlementDate } from "./desk/rentSettlement";
++import { checkSafaricomPhone, toMsisdn } from "./phone/safaricom";
++import { findExistingAccount, trialAlreadyClaimed, recordTrialClaims } from "./identity/trialGuard";
++export { reconcileIdentityDuplicates } from "./identity/trialGuard";
+ import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
+ import { mychamaDb } from "./mychama/config";
+ import { MYCHAMA_HP_SECRETS } from "./mychama/sms";
+@@ -91,13 +94,13 @@ interface ChargeSmsTopUpRequest {
+  * reads and decrements — separate from KES_RATE_PER_TOKEN, which is myregister-only.
+  *
+  * NOTE: business/pro are my interpolation between your two given endpoints
+- * (solo 0.70, enterprise 0.45) — adjust freely, it's just this one object.
++ * (solo 0.70, enterprise 0.40) — these MUST equal the published price list (samuhia.co.ke/pricing, SmsPurchaseModal.tsx).
+  */
+ const PMS_TIER_SMS_RATE: Record<string, number> = {
+   solo:       0.70,
+   business:   0.60,
+   pro:        0.50,
+-  enterprise: 0.45,
++  enterprise: 0.40,
+ };
+ 
+ /** Free SMS tokens granted to a self sign-up. They are a gift, not a purchase: they never earn commission. */
+@@ -158,17 +161,10 @@ export const chargeSmsTopUp = onCall({
+ 
+     const amountKes = expectedKes; // ignore whatever the client sent
+ 
+-    // Normalise phone to +254XXXXXXXXX
+-    let formattedPhone = phone.replace(/[\s\-]/g, '');
+-    if (formattedPhone.startsWith('+254')) {
+-      // already good
+-    } else if (formattedPhone.startsWith('254')) {
+-      formattedPhone = '+' + formattedPhone;
+-    } else if (formattedPhone.startsWith('0')) {
+-      formattedPhone = '+254' + formattedPhone.substring(1);
+-    } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
+-      formattedPhone = '+254' + formattedPhone;
+-    }
++    // Normalise phone to +254XXXXXXXXX (Safaricom only — M-Pesa)
++    const phoneCheck = checkSafaricomPhone(phone);
++    if (!phoneCheck.ok) throw new HttpsError("invalid-argument", phoneCheck.message);
++    const formattedPhone = phoneCheck.e164;
+ 
+     const amountInCents = Math.round(amountKes * 100);
+     const reference = `SMS_${userId}_${Date.now()}`;
+@@ -721,12 +717,9 @@ function sanitizeSmsText(text: string): string {
+  * Normalise a Kenyan phone number to 254XXXXXXXXX (no +, no spaces).
+  * Identical logic to what you already use for WhatsApp.
+  */
+-function normalizeSmsPhone(raw: string): string {
+-    const clean = raw.replace(/[\s\-\+]/g, "");
+-    if (clean.startsWith("254"))  return clean;
+-    if (clean.startsWith("0"))    return "254" + clean.substring(1);
+-    if (clean.startsWith("7") || clean.startsWith("1")) return "254" + clean;
+-    return clean;
++function normalizeSmsPhone(raw: string | number): string {
++    // Accepts numbers too (a stored 701234567 used to throw / fail): -> 2547XXXXXXXX
++    return toMsisdn(raw);
+ }
+ 
+ /**
+@@ -2666,14 +2659,20 @@ async function sendRentPaymentNotices(p: { reference: string; tx: Record<string,
+       tenantName: String(tenant.name || tx.userName || ""), reference,
+     };
+ 
+-    // 1) Landlord / agent — free to them.
+-    const agentPhone = agent.phone || agent.paymentInfo?.phone;
+-    if (agentPhone) {
++    // 1) Landlord / agent — free to them. The number may be stored as a string, a number (701234567 — the leading 0 is
++    //    lost) or in paymentInfo; format whichever one is usable so a stored 701234567 no longer fails the notice.
++    const landlordMobile = [agent.phone, agent.paymentInfo?.phone, agent.mpesaPhone]
++      .map((x) => checkSafaricomPhone(x))
++      .find((c) => c.ok) as { ok: true; msisdn: string } | undefined
++      ?? (agent.phone || agent.paymentInfo?.phone ? { ok: true as const, msisdn: normalizeSmsPhone(agent.phone || agent.paymentInfo?.phone) } : undefined);
++    if (landlordMobile) {
+       const claim = await claimRentNotice(reference, "landlord");
+       if (claim) {
+-        const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(String(agentPhone)), message: sanitizeSmsText(landlordRentSms(facts)) });
+-        if (r.success) await claim.update({ status: "sent" }); else { console.error(`Rent notice (landlord) failed for ${reference}: ${r.error}`); await claim.delete(); }
++        const r = await sendHostPinnacleSms({ mobile: landlordMobile.msisdn, message: sanitizeSmsText(landlordRentSms(facts)) });
++        if (r.success) await claim.update({ status: "sent" }); else { console.error(`Rent notice (landlord) failed for ${reference} -> ${landlordMobile.msisdn}: ${r.error}`); await claim.delete(); }
+       }
++    } else {
++      console.error(`Rent notice (landlord) skipped for ${reference}: landlord ${String(tx.agentId)} has no usable phone number`);
+     }
+ 
+     // 2) Tenant — paid for with the landlord's SMS credits (1 per 144 characters); no credits, no SMS.
+@@ -2692,7 +2691,7 @@ async function sendRentPaymentNotices(p: { reference: string; tx: Record<string,
+         if (!reserved) {
+           await claim.update({ status: "skipped_no_credits" });
+         } else {
+-          const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(String(tenantPhone)), message });
++          const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(tenantPhone), message });
+           if (r.success) {
+             await claim.update({ status: "sent", tokensCharged: needed });
+           } else {
+@@ -3128,20 +3127,27 @@ export const createUserWithFirebaseAuth = onCall({
+       );
+     }
+ 
+-    // Format phone number to E.164 format
+-    let formattedPhone = userData.phone.replace(/[\s-]/g, '');
+-    
+-    if (!formattedPhone.startsWith('+')) {
+-      if (formattedPhone.startsWith('254')) {
+-        formattedPhone = '+' + formattedPhone;
+-      } else if (formattedPhone.startsWith('0')) {
+-        formattedPhone = '+254' + formattedPhone.substring(1);
+-      } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
+-        formattedPhone = '+254' + formattedPhone;
+-      } else {
+-        formattedPhone = '+' + formattedPhone;
+-      }
++    // Phone: Safaricom only, formatted to E.164 (accepts 0701234567, 701234567, 254..., +254..., or a number)
++    const phoneCheck = checkSafaricomPhone(userData.phone);
++    if (!phoneCheck.ok) {
++      throw new HttpsError("invalid-argument", phoneCheck.message);
++    }
++    const formattedPhone = phoneCheck.e164;
++
++    // One person, one account, one trial. The National ID is userData.localId (it becomes the document id / UID).
++    const identityDb = admin.firestore();
++    const idForIdentity = userData.localId;
++    const existing = await findExistingAccount(identityDb, { idNumber: idForIdentity, phone: formattedPhone });
++    if (existing) {
++      const what = existing.matchedBy === "id" ? "National ID number" : "phone number";
++      throw new HttpsError(
++        "already-exists",
++        `An account already exists for this ${what}${existing.emailHint ? ` (${existing.emailHint})` : ""}. Please sign in instead of creating a new account.`,
++        { existingAccount: true, matchedBy: existing.matchedBy, emailHint: existing.emailHint },
++      );
+     }
++    // A trial is given once per ID / phone, even when the earlier account has since been deleted.
++    const trialEligible = creationType === "self" && !(await trialAlreadyClaimed(identityDb, { idNumber: idForIdentity, phone: formattedPhone }));
+ 
+     console.log(`Creating user - Type: ${creationType}, Email: ${email}, Phone: ${formattedPhone}`);
+ 
+@@ -3193,8 +3199,8 @@ export const createUserWithFirebaseAuth = onCall({
+     };
+ 
+     // Set user properties based on creationType
+-    if (creationType === 'self') {
+-      // Self sign-ups get a free 3-month Business tier trial + signup bonus tokens
++    if (creationType === 'self' && trialEligible) {
++      // Self sign-ups get a free 3-month Business tier trial + signup bonus tokens (once per ID / phone — see trialGuard)
+       const trialEnd = new Date();
+       trialEnd.setMonth(trialEnd.getMonth() + 3);
+ 
+@@ -3206,6 +3212,15 @@ export const createUserWithFirebaseAuth = onCall({
+       firestoreUserData.subscriptionExpiry = admin.firestore.Timestamp.fromDate(trialEnd);
+       firestoreUserData.trialStartedAt = admin.firestore.FieldValue.serverTimestamp();
+       firestoreUserData.tokens = PMS_SIGNUP_FREE_TOKENS; // signup bonus (free tokens never earn desk commission)
++    } else if (creationType === 'self') {
++      // This ID or phone has had its trial already: a plain free account, no trial, no bonus tokens
++      firestoreUserData.tier = 'free';
++      firestoreUserData.type = 'free';
++      firestoreUserData.storage = false;
++      firestoreUserData.isPremium = false;
++      firestoreUserData.isTrial = false;
++      firestoreUserData.tokens = 0;
++      firestoreUserData.trialDeniedReason = 'trial_already_used';
+     } else {
+       // Agent-created accounts use provided values or defaults
+       firestoreUserData.tier = userData.tier || 'free';
+@@ -3234,6 +3249,10 @@ export const createUserWithFirebaseAuth = onCall({
+     // Write to Firestore
+     await userDocRef.set(firestoreUserData, { merge: true });
+     console.log(`✅ Firestore user document created: ${documentId}`);
++    if (firestoreUserData.isTrial === true) {
++      try { await recordTrialClaims(identityDb, { idNumber: idForIdentity, phone: formattedPhone, uid: documentId }); }
++      catch (e: any) { console.error("recordTrialClaims failed (the daily reconcile will backfill it):", e?.message || e); }
++    }
+ 
+     // Return appropriate response
+     return {
+diff --git a/functions/src/phone/safaricom.ts b/functions/src/phone/safaricom.ts
+new file mode 100644
+index 0000000..13baff6
+--- /dev/null
++++ b/functions/src/phone/safaricom.ts
+@@ -0,0 +1,58 @@
++/**
++ * Kenyan phone handling — ONE place. Pure, no imports. Identical copy lives in PMS/whatsapp/src/phone/safaricom.ts.
++ *
++ * Accepts a string OR a number (an app that stores the phone as a number turns 0701234567 into 701234567, which used to
++ * fail every formatter that expected a string). Understands 0701234567, 701234567, 254701234567, +254701234567,
++ * "+254 701-234-567" and the same with a stray "(0)".
++ */
++
++/** Every current Safaricom prefix, as the 4-digit national prefix (0xxx). Inclusive ranges. */
++export const SAFARICOM_PREFIX_RANGES: ReadonlyArray<readonly [number, number]> = [
++  [700, 729], [740, 743], [745, 746], [757, 759], [768, 769], [790, 799],
++  [110, 115], [118, 119], [140, 143], [180, 182],
++];
++
++export const SAFARICOM_ONLY_MESSAGE =
++  "Only Safaricom numbers are supported (for example 0712 345 678 or 0110 123 456). Please use a Safaricom number.";
++export const INVALID_PHONE_MESSAGE = "Enter a valid Kenyan phone number, for example 0712345678.";
++
++/** The 9 national digits (7XXXXXXXX / 1XXXXXXXX), or "" when the input is not a Kenyan mobile number. */
++export function nationalDigits(raw: unknown): string {
++  if (raw === null || raw === undefined) return "";
++  let d = String(raw).replace(/\D/g, "");
++  if (d.startsWith("254")) d = d.slice(3);
++  else if (d.startsWith("0")) d = d.slice(1);
++  if (d.startsWith("0")) d = d.slice(1);           // "+254 (0)701..." style
++  return /^[17]\d{8}$/.test(d) ? d : "";
++}
++
++export function isSafaricomNational(national: string): boolean {
++  if (!/^[17]\d{8}$/.test(national)) return false;
++  const prefix = Number(national.slice(0, 3));      // 701 -> 0701, 110 -> 0110
++  return SAFARICOM_PREFIX_RANGES.some(([lo, hi]) => prefix >= lo && prefix <= hi);
++}
++
++export type PhoneCheck =
++  | { ok: true; national: string; e164: string; msisdn: string; local: string }
++  | { ok: false; reason: "invalid" | "not_safaricom"; message: string };
++
++/** Format + Safaricom check. e164 = +2547XXXXXXXX, msisdn = 2547XXXXXXXX (HostPinnacle), local = 07XXXXXXXX. */
++export function checkSafaricomPhone(raw: unknown): PhoneCheck {
++  const national = nationalDigits(raw);
++  if (!national) return { ok: false, reason: "invalid", message: INVALID_PHONE_MESSAGE };
++  if (!isSafaricomNational(national)) return { ok: false, reason: "not_safaricom", message: SAFARICOM_ONLY_MESSAGE };
++  return { ok: true, national, e164: `+254${national}`, msisdn: `254${national}`, local: `0${national}` };
++}
++
++/** Format only (no Safaricom rule) — for notifying accounts that already exist. Falls back to the digits when unrecognised. */
++export function toMsisdn(raw: unknown): string {
++  const n = nationalDigits(raw);
++  return n ? `254${n}` : String(raw ?? "").replace(/\D/g, "");
++}
++
++/** Every way an existing document might have stored this number (string and numeric), for a Firestore `in` query. */
++export function phoneStorageVariants(raw: unknown): Array<string | number> {
++  const n = nationalDigits(raw);
++  if (!n) return [];
++  return [`+254${n}`, `254${n}`, `0${n}`, n, Number(n), Number(`254${n}`)];
++}
+diff --git a/functions/test/desk-money.check.js b/functions/test/desk-money.check.js
+index e07ecf3..a5f007e 100644
+--- a/functions/test/desk-money.check.js
++++ b/functions/test/desk-money.check.js
+@@ -102,5 +102,22 @@ ok("rent fees: money always adds up, Paystack estimate capped at 3000", () => {
+   assert.throws(() => RF.rentFees(0)); assert.throws(() => RF.rentFees(1.5));
+ });
+ 
++ok("rent fees: platform cut by plan — enterprise 0.2, pro 0.4, business 0.65, everything else 0.95", () => {
++  const cut = (tier) => RF.rentFees(1000000, tier).convenienceMinor;   // KES 10,000 rent
++  assert.deepStrictEqual(["enterprise", "pro", "business", "solo", "starter", "free", "", undefined === 1 ? 0 : "weird"].map(cut), [2000, 4000, 6500, 9500, 9500, 9500, 9500, 9500]);
++  assert.strictEqual(cut("PRO"), 4000); assert.strictEqual(cut(" Business "), 6500);
++  const f = RF.rentFees(1000000, "business");   // tenant 50, landlord Paystack 100, cut 65 -> deduction 165, net 9,835
++  assert.deepStrictEqual([f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor, f.conveniencePct], [10000, 6500, 16500, 983500, 0.65]);
++  assert.strictEqual(RF.rentFees(1000000).conveniencePct, 0.2);   // no tier = the enterprise baseline
++});
++ok("phones: Safaricom only; 701234567 (leading 0 lost) and every spelling format to 2547XXXXXXXX", () => {
++  const P = require(path.join(__dirname, "..", "lib", "phone", "safaricom"));
++  for (const raw of ["0701234567", 701234567, "701234567", "+254 701-234-567", "254701234567", "+254 (0) 701234567"]) assert.strictEqual(P.checkSafaricomPhone(raw).e164, "+254701234567", String(raw));
++  for (const raw of ["0700000000", "0709999999", "0745123456", "0757000000", "0768000000", "0799999999", "0110000000", "0115999999", "0119000000", "0143000000", "0182999999"]) assert.ok(P.checkSafaricomPhone(raw).ok, raw);
++  for (const raw of ["0730000000", "0744000000", "0747000000", "0750000000", "0756000000", "0767000000", "0116000000", "0117000000", "0144000000", "0183000000", "0100000000"]) assert.strictEqual(P.checkSafaricomPhone(raw).reason, "not_safaricom", raw);
++  assert.strictEqual(P.checkSafaricomPhone("12345").reason, "invalid");
++  assert.strictEqual(P.toMsisdn(701234567), "254701234567");
++});
++
+ console.log(`\n${passed} passed, ${failed} failed`);
+ process.exit(failed ? 1 : 0);
+diff --git a/functions/test/desk-webhooks.check.js b/functions/test/desk-webhooks.check.js
+index 118a85e..4af835a 100644
+--- a/functions/test/desk-webhooks.check.js
++++ b/functions/test/desk-webhooks.check.js
+@@ -169,11 +169,11 @@ const settle = { amount: 15000, fees: 225, paid_at: "2026-10-09T10:00:00.000Z" }
+     const r = await rentCharge.initiateRentCharge(rentInput());
+     assert.match(r.reference, /^INV_T1_\d+$/);
+     const sp = splitCalls()[0].body; assert.strictEqual(sp.type, "flat"); assert.strictEqual(sp.bearer_type, "account");
+-    assert.deepStrictEqual(sp.subaccounts, [{ subaccount: "ACCT_landlord", share: 790400 }]);   // 8000 - (120 est - 40 tenant) - 16 convenience
++    assert.deepStrictEqual(sp.subaccounts, [{ subaccount: "ACCT_landlord", share: 788800 }]);   // pro (0.4%): 8000 - (120 est - 40 tenant) - 32 convenience
+     const charge = chargeCalls()[0].body; assert.strictEqual(charge.amount, 804000);   // rent 8000 + tenant surcharge 40 assert.ok(charge.split_code.startsWith("SPL_")); assert.strictEqual(charge.metadata.deskBatchId, undefined);
+     const txn = plot.read(`transactions/${r.reference}`);
+     assert.strictEqual(txn.amount, 8000);   // the invoice is credited the rent
+-    assert.deepStrictEqual([txn.rentMinor, txn.tenantFeeMinor, txn.chargeMinor, txn.deductionsMinor, txn.netPayoutMinor], [800000, 4000, 804000, 9600, 790400]);
++    assert.deepStrictEqual([txn.rentMinor, txn.tenantFeeMinor, txn.chargeMinor, txn.deductionsMinor, txn.netPayoutMinor], [800000, 4000, 804000, 11200, 788800]);
+     assert.strictEqual(txn.tier, "pro"); assert.strictEqual(txn.deskCommission, undefined);
+     assert.ok(plot.read("payments/T1/billingMonths/2026-10"));
+   });
+@@ -184,25 +184,25 @@ const settle = { amount: 15000, fees: 225, paid_at: "2026-10-09T10:00:00.000Z" }
+     assert.strictEqual(txn.tenantFeeMinor, 10000);   // 0.5% of 20000 = 100, under the cap
+     const big = await rentCharge.initiateRentCharge(rentInput({ amount: 50000 }));
+     const bt = plot.read(`transactions/${big.reference}`);
+-    assert.deepStrictEqual([bt.chargeMinor, bt.tenantFeeMinor, bt.deductionsMinor, bt.netPayoutMinor], [5015000, 15000, 70000, 4930000]);
++    assert.deepStrictEqual([bt.chargeMinor, bt.tenantFeeMinor, bt.deductionsMinor, bt.netPayoutMinor], [5015000, 15000, 107500, 4892500]);
+   });
+   await t("desk batch charge by the OWNER desk uses the three-way split and records deskCommission; the webhook writes ONE rent event with the real fee", async () => {
+     seedLandlord({ tier: "business" }); seedDesk();
+     const r = await rentCharge.initiateRentCharge(rentInput({ desk: { agentId: "ag1", batchId: "rb_1" } }));
+-    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 790400 }, { subaccount: "ACCT_agent1", share: 480 }]);   // agent: 30% of the 16.00 convenience fee
++    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 786800 }, { subaccount: "ACCT_agent1", share: 1560 }]);   // business (0.65% = 52.00): agent gets 30%
+     const charge = chargeCalls()[0].body; assert.strictEqual(charge.metadata.deskBatchId, "rb_1"); assert.strictEqual(charge.metadata.deskAgentId, "ag1");
+     const txn = plot.read(`transactions/${r.reference}`);
+-    assert.deepStrictEqual(txn.deskCommission, { agentCode: "COG-0001", agentId: "ag1", sharePct: 0.06, rule: "rent", entityKey: ENTITY });
++    assert.deepStrictEqual(txn.deskCommission, { agentCode: "COG-0001", agentId: "ag1", sharePct: 0.19, rule: "rent", entityKey: ENTITY });
+     const data = { amount: 800000, fees: 12000, paid_at: "2026-10-09T08:00:00Z" };
+     assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data, transaction: txn }), "written");
+     assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data, transaction: txn }), "duplicate");
+     const [e] = eventDocs(); assert.strictEqual(eventDocs().length, 1);
+-    assert.strictEqual(e.type, "rent_payment"); assert.strictEqual(e.grossMinor, 800000); assert.strictEqual(e.feeMinor, 12000); assert.strictEqual(e.agentSharePct, 0.06); assert.strictEqual(e.eventId, `rent_payment:${r.reference}`);
++    assert.strictEqual(e.type, "rent_payment"); assert.strictEqual(e.grossMinor, 800000); assert.strictEqual(e.feeMinor, 12000); assert.strictEqual(e.agentSharePct, 0.19); assert.strictEqual(e.eventId, `rent_payment:${r.reference}`);
+   });
+   await t("a batch from a NON-owner desk uses the normal two-way split and writes no desk commission", async () => {
+     seedLandlord({ tier: "business" }); seedDesk(); plot.seed("desk_agents/ag2", { agentId: "ag2", agentCode: "COG-0002", status: "active", rank: "clerk" });
+     const r = await rentCharge.initiateRentCharge(rentInput({ desk: { agentId: "ag2", batchId: "rb_2" } }));
+-    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 790400 }]);
++    assert.deepStrictEqual(splitCalls()[0].body.subaccounts, [{ subaccount: "ACCT_landlord", share: 786800 }]);
+     const txn = plot.read(`transactions/${r.reference}`); assert.strictEqual(txn.deskCommission, undefined); assert.strictEqual(txn.agentMinor, 0);
+     assert.strictEqual(await hooks.recordRentPaymentEvent({ reference: r.reference, data: { amount: 800000, fees: 12000 }, transaction: txn }), "skipped");
+     assert.strictEqual(eventDocs().length, 0);
+diff --git a/src/Firebase.tsx b/src/Firebase.tsx
+index 803df86..fcda99b 100644
+--- a/src/Firebase.tsx
++++ b/src/Firebase.tsx
+@@ -643,7 +643,13 @@ export class AgentService {
+ export class PaymentService {
+   // Rent fee split (mirrors functions/src/desk/rentFees.ts — the server is authoritative). Integer minor units.
+   //   tenant pays rent + min(KES 150, 0.5%); landlord covers the rest of Paystack's ~1.5% plus a 0.2% convenience fee.
+-  static calculateFees(amount: number, invoiceBalance: number): {
++    // Platform cut by the landlord's plan (mirrors functions/src/desk/rentFees.ts): enterprise 0.2, pro 0.4, business 0.65, else 0.95
++  static conveniencePctForTier(tier?: string): number {
++    const t = String(tier ?? '').trim().toLowerCase();
++    return t === 'enterprise' ? 0.2 : (t === 'pro' || t === 'professional') ? 0.4 : t === 'business' ? 0.65 : 0.95;
++  }
++
++  static calculateFees(amount: number, invoiceBalance: number, tier?: string): {
+     tenantFee: number;
+     total: number;
+     netAmount: number;
+@@ -658,7 +664,7 @@ export class PaymentService {
+     const tenantFee = Math.min(pct(rent, 0.5), 15000);
+     const paystackEstimate = Math.min(pct(rent, 1.5), 300000);
+     const landlordPaystackFee = Math.max(0, paystackEstimate - tenantFee);
+-    const convenienceFee = pct(rent, 0.2);
++    const convenienceFee = pct(rent, PaymentService.conveniencePctForTier(tier));
+     const deductions = landlordPaystackFee + convenienceFee;
+     const arrears = amount < invoiceBalance ? invoiceBalance - amount : 0;
+ 
+diff --git a/src/Signup.tsx b/src/Signup.tsx
+index e87fd30..2a254db 100644
+--- a/src/Signup.tsx
++++ b/src/Signup.tsx
+@@ -5,6 +5,7 @@ import { Phone, Mail, User, CreditCard, Lock, AlertCircle, Loader2, CheckCircle
+ import { AuthService, TenantService } from './Firebase';
+ import { useNavigate } from 'react-router-dom';
+ import { setPortalPreference } from './session/session';
++import { checkSafaricomPhone } from './utils/safaricom';
+ 
+ const Signup: React.FC = () => {
+   const [step, setStep] = useState<'info' | 'phone' | 'code'>('info');
+@@ -57,7 +58,9 @@ const Signup: React.FC = () => {
+     setLoading(true);
+ 
+     try {
+-      const formattedPhone = formatPhoneNumber(formData.phone);
++      const phoneCheck = checkSafaricomPhone(formData.phone);
++      if (!phoneCheck.ok) throw new Error(phoneCheck.message);
++      const formattedPhone = phoneCheck.e164;
+       const result = await AuthService.sendVerificationCode(formattedPhone);
+       setConfirmationResult(result);
+       setStep('code');
+@@ -224,7 +227,7 @@ const Signup: React.FC = () => {
+                   required
+                 />
+               </div>
+-              <p className="mt-2 text-xs text-gray-500">Enter your Kenyan phone number</p>
++              <p className="mt-2 text-xs text-gray-500">Safaricom numbers only (07xx or 01xx)</p>
+             </div>
+ 
+             <button
+diff --git a/src/utils/safaricom.ts b/src/utils/safaricom.ts
+new file mode 100644
+index 0000000..13baff6
+--- /dev/null
++++ b/src/utils/safaricom.ts
+@@ -0,0 +1,58 @@
++/**
++ * Kenyan phone handling — ONE place. Pure, no imports. Identical copy lives in PMS/whatsapp/src/phone/safaricom.ts.
++ *
++ * Accepts a string OR a number (an app that stores the phone as a number turns 0701234567 into 701234567, which used to
++ * fail every formatter that expected a string). Understands 0701234567, 701234567, 254701234567, +254701234567,
++ * "+254 701-234-567" and the same with a stray "(0)".
++ */
++
++/** Every current Safaricom prefix, as the 4-digit national prefix (0xxx). Inclusive ranges. */
++export const SAFARICOM_PREFIX_RANGES: ReadonlyArray<readonly [number, number]> = [
++  [700, 729], [740, 743], [745, 746], [757, 759], [768, 769], [790, 799],
++  [110, 115], [118, 119], [140, 143], [180, 182],
++];
++
++export const SAFARICOM_ONLY_MESSAGE =
++  "Only Safaricom numbers are supported (for example 0712 345 678 or 0110 123 456). Please use a Safaricom number.";
++export const INVALID_PHONE_MESSAGE = "Enter a valid Kenyan phone number, for example 0712345678.";
++
++/** The 9 national digits (7XXXXXXXX / 1XXXXXXXX), or "" when the input is not a Kenyan mobile number. */
++export function nationalDigits(raw: unknown): string {
++  if (raw === null || raw === undefined) return "";
++  let d = String(raw).replace(/\D/g, "");
++  if (d.startsWith("254")) d = d.slice(3);
++  else if (d.startsWith("0")) d = d.slice(1);
++  if (d.startsWith("0")) d = d.slice(1);           // "+254 (0)701..." style
++  return /^[17]\d{8}$/.test(d) ? d : "";
++}
++
++export function isSafaricomNational(national: string): boolean {
++  if (!/^[17]\d{8}$/.test(national)) return false;
++  const prefix = Number(national.slice(0, 3));      // 701 -> 0701, 110 -> 0110
++  return SAFARICOM_PREFIX_RANGES.some(([lo, hi]) => prefix >= lo && prefix <= hi);
++}
++
++export type PhoneCheck =
++  | { ok: true; national: string; e164: string; msisdn: string; local: string }
++  | { ok: false; reason: "invalid" | "not_safaricom"; message: string };
++
++/** Format + Safaricom check. e164 = +2547XXXXXXXX, msisdn = 2547XXXXXXXX (HostPinnacle), local = 07XXXXXXXX. */
++export function checkSafaricomPhone(raw: unknown): PhoneCheck {
++  const national = nationalDigits(raw);
++  if (!national) return { ok: false, reason: "invalid", message: INVALID_PHONE_MESSAGE };
++  if (!isSafaricomNational(national)) return { ok: false, reason: "not_safaricom", message: SAFARICOM_ONLY_MESSAGE };
++  return { ok: true, national, e164: `+254${national}`, msisdn: `254${national}`, local: `0${national}` };
++}
++
++/** Format only (no Safaricom rule) — for notifying accounts that already exist. Falls back to the digits when unrecognised. */
++export function toMsisdn(raw: unknown): string {
++  const n = nationalDigits(raw);
++  return n ? `254${n}` : String(raw ?? "").replace(/\D/g, "");
++}
++
++/** Every way an existing document might have stored this number (string and numeric), for a Firestore `in` query. */
++export function phoneStorageVariants(raw: unknown): Array<string | number> {
++  const n = nationalDigits(raw);
++  if (!n) return [];
++  return [`+254${n}`, `254${n}`, `0${n}`, n, Number(n), Number(`254${n}`)];
++}

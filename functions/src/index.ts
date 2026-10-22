@@ -46,6 +46,9 @@ import { runRentBatch } from "./desk/rentBatch";
 export { deskSmsCommission } from "./deskSmsEndpoint";
 import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
 import { landlordRentSms, tenantRentSms, settlementDate } from "./desk/rentSettlement";
+import { checkSafaricomPhone, toMsisdn } from "./phone/safaricom";
+import { findExistingAccount, trialAlreadyClaimed, recordTrialClaims } from "./identity/trialGuard";
+export { reconcileIdentityDuplicates } from "./identity/trialGuard";
 import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
 import { mychamaDb } from "./mychama/config";
 import { MYCHAMA_HP_SECRETS } from "./mychama/sms";
@@ -91,13 +94,13 @@ interface ChargeSmsTopUpRequest {
  * reads and decrements — separate from KES_RATE_PER_TOKEN, which is myregister-only.
  *
  * NOTE: business/pro are my interpolation between your two given endpoints
- * (solo 0.70, enterprise 0.45) — adjust freely, it's just this one object.
+ * (solo 0.70, enterprise 0.40) — these MUST equal the published price list (samuhia.co.ke/pricing, SmsPurchaseModal.tsx).
  */
 const PMS_TIER_SMS_RATE: Record<string, number> = {
   solo:       0.70,
   business:   0.60,
   pro:        0.50,
-  enterprise: 0.45,
+  enterprise: 0.40,
 };
 
 /** Free SMS tokens granted to a self sign-up. They are a gift, not a purchase: they never earn commission. */
@@ -158,17 +161,10 @@ export const chargeSmsTopUp = onCall({
 
     const amountKes = expectedKes; // ignore whatever the client sent
 
-    // Normalise phone to +254XXXXXXXXX
-    let formattedPhone = phone.replace(/[\s\-]/g, '');
-    if (formattedPhone.startsWith('+254')) {
-      // already good
-    } else if (formattedPhone.startsWith('254')) {
-      formattedPhone = '+' + formattedPhone;
-    } else if (formattedPhone.startsWith('0')) {
-      formattedPhone = '+254' + formattedPhone.substring(1);
-    } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
-      formattedPhone = '+254' + formattedPhone;
-    }
+    // Normalise phone to +254XXXXXXXXX (Safaricom only — M-Pesa)
+    const phoneCheck = checkSafaricomPhone(phone);
+    if (!phoneCheck.ok) throw new HttpsError("invalid-argument", phoneCheck.message);
+    const formattedPhone = phoneCheck.e164;
 
     const amountInCents = Math.round(amountKes * 100);
     const reference = `SMS_${userId}_${Date.now()}`;
@@ -721,12 +717,9 @@ function sanitizeSmsText(text: string): string {
  * Normalise a Kenyan phone number to 254XXXXXXXXX (no +, no spaces).
  * Identical logic to what you already use for WhatsApp.
  */
-function normalizeSmsPhone(raw: string): string {
-    const clean = raw.replace(/[\s\-\+]/g, "");
-    if (clean.startsWith("254"))  return clean;
-    if (clean.startsWith("0"))    return "254" + clean.substring(1);
-    if (clean.startsWith("7") || clean.startsWith("1")) return "254" + clean;
-    return clean;
+function normalizeSmsPhone(raw: string | number): string {
+    // Accepts numbers too (a stored 701234567 used to throw / fail): -> 2547XXXXXXXX
+    return toMsisdn(raw);
 }
 
 /**
@@ -2666,14 +2659,20 @@ async function sendRentPaymentNotices(p: { reference: string; tx: Record<string,
       tenantName: String(tenant.name || tx.userName || ""), reference,
     };
 
-    // 1) Landlord / agent — free to them.
-    const agentPhone = agent.phone || agent.paymentInfo?.phone;
-    if (agentPhone) {
+    // 1) Landlord / agent — free to them. The number may be stored as a string, a number (701234567 — the leading 0 is
+    //    lost) or in paymentInfo; format whichever one is usable so a stored 701234567 no longer fails the notice.
+    const landlordMobile = [agent.phone, agent.paymentInfo?.phone, agent.mpesaPhone]
+      .map((x) => checkSafaricomPhone(x))
+      .find((c) => c.ok) as { ok: true; msisdn: string } | undefined
+      ?? (agent.phone || agent.paymentInfo?.phone ? { ok: true as const, msisdn: normalizeSmsPhone(agent.phone || agent.paymentInfo?.phone) } : undefined);
+    if (landlordMobile) {
       const claim = await claimRentNotice(reference, "landlord");
       if (claim) {
-        const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(String(agentPhone)), message: sanitizeSmsText(landlordRentSms(facts)) });
-        if (r.success) await claim.update({ status: "sent" }); else { console.error(`Rent notice (landlord) failed for ${reference}: ${r.error}`); await claim.delete(); }
+        const r = await sendHostPinnacleSms({ mobile: landlordMobile.msisdn, message: sanitizeSmsText(landlordRentSms(facts)) });
+        if (r.success) await claim.update({ status: "sent" }); else { console.error(`Rent notice (landlord) failed for ${reference} -> ${landlordMobile.msisdn}: ${r.error}`); await claim.delete(); }
       }
+    } else {
+      console.error(`Rent notice (landlord) skipped for ${reference}: landlord ${String(tx.agentId)} has no usable phone number`);
     }
 
     // 2) Tenant — paid for with the landlord's SMS credits (1 per 144 characters); no credits, no SMS.
@@ -2692,7 +2691,7 @@ async function sendRentPaymentNotices(p: { reference: string; tx: Record<string,
         if (!reserved) {
           await claim.update({ status: "skipped_no_credits" });
         } else {
-          const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(String(tenantPhone)), message });
+          const r = await sendHostPinnacleSms({ mobile: normalizeSmsPhone(tenantPhone), message });
           if (r.success) {
             await claim.update({ status: "sent", tokensCharged: needed });
           } else {
@@ -3128,20 +3127,27 @@ export const createUserWithFirebaseAuth = onCall({
       );
     }
 
-    // Format phone number to E.164 format
-    let formattedPhone = userData.phone.replace(/[\s-]/g, '');
-    
-    if (!formattedPhone.startsWith('+')) {
-      if (formattedPhone.startsWith('254')) {
-        formattedPhone = '+' + formattedPhone;
-      } else if (formattedPhone.startsWith('0')) {
-        formattedPhone = '+254' + formattedPhone.substring(1);
-      } else if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) {
-        formattedPhone = '+254' + formattedPhone;
-      } else {
-        formattedPhone = '+' + formattedPhone;
-      }
+    // Phone: Safaricom only, formatted to E.164 (accepts 0701234567, 701234567, 254..., +254..., or a number)
+    const phoneCheck = checkSafaricomPhone(userData.phone);
+    if (!phoneCheck.ok) {
+      throw new HttpsError("invalid-argument", phoneCheck.message);
     }
+    const formattedPhone = phoneCheck.e164;
+
+    // One person, one account, one trial. The National ID is userData.localId (it becomes the document id / UID).
+    const identityDb = admin.firestore();
+    const idForIdentity = userData.localId;
+    const existing = await findExistingAccount(identityDb, { idNumber: idForIdentity, phone: formattedPhone });
+    if (existing) {
+      const what = existing.matchedBy === "id" ? "National ID number" : "phone number";
+      throw new HttpsError(
+        "already-exists",
+        `An account already exists for this ${what}${existing.emailHint ? ` (${existing.emailHint})` : ""}. Please sign in instead of creating a new account.`,
+        { existingAccount: true, matchedBy: existing.matchedBy, emailHint: existing.emailHint },
+      );
+    }
+    // A trial is given once per ID / phone, even when the earlier account has since been deleted.
+    const trialEligible = creationType === "self" && !(await trialAlreadyClaimed(identityDb, { idNumber: idForIdentity, phone: formattedPhone }));
 
     console.log(`Creating user - Type: ${creationType}, Email: ${email}, Phone: ${formattedPhone}`);
 
@@ -3193,8 +3199,8 @@ export const createUserWithFirebaseAuth = onCall({
     };
 
     // Set user properties based on creationType
-    if (creationType === 'self') {
-      // Self sign-ups get a free 3-month Business tier trial + signup bonus tokens
+    if (creationType === 'self' && trialEligible) {
+      // Self sign-ups get a free 3-month Business tier trial + signup bonus tokens (once per ID / phone — see trialGuard)
       const trialEnd = new Date();
       trialEnd.setMonth(trialEnd.getMonth() + 3);
 
@@ -3206,6 +3212,15 @@ export const createUserWithFirebaseAuth = onCall({
       firestoreUserData.subscriptionExpiry = admin.firestore.Timestamp.fromDate(trialEnd);
       firestoreUserData.trialStartedAt = admin.firestore.FieldValue.serverTimestamp();
       firestoreUserData.tokens = PMS_SIGNUP_FREE_TOKENS; // signup bonus (free tokens never earn desk commission)
+    } else if (creationType === 'self') {
+      // This ID or phone has had its trial already: a plain free account, no trial, no bonus tokens
+      firestoreUserData.tier = 'free';
+      firestoreUserData.type = 'free';
+      firestoreUserData.storage = false;
+      firestoreUserData.isPremium = false;
+      firestoreUserData.isTrial = false;
+      firestoreUserData.tokens = 0;
+      firestoreUserData.trialDeniedReason = 'trial_already_used';
     } else {
       // Agent-created accounts use provided values or defaults
       firestoreUserData.tier = userData.tier || 'free';
@@ -3234,6 +3249,10 @@ export const createUserWithFirebaseAuth = onCall({
     // Write to Firestore
     await userDocRef.set(firestoreUserData, { merge: true });
     console.log(`✅ Firestore user document created: ${documentId}`);
+    if (firestoreUserData.isTrial === true) {
+      try { await recordTrialClaims(identityDb, { idNumber: idForIdentity, phone: formattedPhone, uid: documentId }); }
+      catch (e: any) { console.error("recordTrialClaims failed (the daily reconcile will backfill it):", e?.message || e); }
+    }
 
     // Return appropriate response
     return {
