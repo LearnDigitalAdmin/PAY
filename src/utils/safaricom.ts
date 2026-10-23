@@ -14,7 +14,9 @@ export const SAFARICOM_PREFIX_RANGES: ReadonlyArray<readonly [number, number]> =
 
 export const SAFARICOM_ONLY_MESSAGE =
   "Only Safaricom numbers are supported (for example 0712 345 678 or 0110 123 456). Please use a Safaricom number.";
-export const INVALID_PHONE_MESSAGE = "Enter a valid Kenyan phone number, for example 0712345678.";
+export const INVALID_PHONE_MESSAGE = "Enter a valid Safaricom number: 10 digits, for example 0712 345 678.";
+/** Longest text a phone field accepts ("+254 712 345 678" is 16). */
+export const PHONE_MAX_INPUT_LENGTH = 20;
 
 /** The 9 national digits (7XXXXXXXX / 1XXXXXXXX), or "" when the input is not a Kenyan mobile number. */
 export function nationalDigits(raw: unknown): string {
@@ -38,6 +40,11 @@ export type PhoneCheck =
 
 /** Format + Safaricom check. e164 = +2547XXXXXXXX, msisdn = 2547XXXXXXXX (HostPinnacle), local = 07XXXXXXXX. */
 export function checkSafaricomPhone(raw: unknown): PhoneCheck {
+  // A string may only contain what a phone number can: digits, spaces, "+", "-" and brackets, at most 20 characters.
+  // (nationalDigits alone strips every non-digit, which would let "abc0712345678" through.)
+  if (typeof raw === "string" && (raw.trim().length > PHONE_MAX_INPUT_LENGTH || /[^\d\s+\-()]/.test(raw))) {
+    return { ok: false, reason: "invalid", message: INVALID_PHONE_MESSAGE };
+  }
   const national = nationalDigits(raw);
   if (!national) return { ok: false, reason: "invalid", message: INVALID_PHONE_MESSAGE };
   if (!isSafaricomNational(national)) return { ok: false, reason: "not_safaricom", message: SAFARICOM_ONLY_MESSAGE };
@@ -55,4 +62,21 @@ export function phoneStorageVariants(raw: unknown): Array<string | number> {
   const n = nationalDigits(raw);
   if (!n) return [];
   return [`+254${n}`, `254${n}`, `0${n}`, n, Number(n), Number(`254${n}`)];
+}
+
+/** Drops anything a phone number cannot contain, so pasted junk never reaches state. */
+export function sanitizePhoneInput(raw: string): string {
+  return raw.replace(/[^\d\s+\-()]/g, "").slice(0, PHONE_MAX_INPUT_LENGTH);
+}
+
+/** null when `raw` is a valid Safaricom number, else what to fix. Empty input => null (the form's own required check handles it). */
+export function phoneHint(raw: string): string | null {
+  if (!raw.trim()) return null;
+  const c = checkSafaricomPhone(raw);
+  if (c.ok) return null;
+  const digits = raw.replace(/\D/g, "");
+  const expected = digits.startsWith("254") ? 12 : digits.startsWith("0") ? 10 : 9;
+  if (c.reason === "invalid" && digits.length < expected) return "Too short — a Safaricom number has 10 digits, e.g. 0712 345 678.";
+  if (c.reason === "invalid" && digits.length > expected) return "Too long — a Safaricom number has 10 digits, e.g. 0712 345 678.";
+  return c.message;
 }

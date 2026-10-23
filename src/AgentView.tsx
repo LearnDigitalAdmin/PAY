@@ -1,4 +1,5 @@
 // AgentView.tsx - Agent Dashboard (Updated with Multiple Payment Modes)
+import { checkSafaricomPhone, phoneHint, sanitizePhoneInput, PHONE_MAX_INPUT_LENGTH } from './utils/safaricom';
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
@@ -298,6 +299,19 @@ const AgentView: React.FC = () => {
     e.preventDefault();
     
     if (!agentData) return;
+
+    const contactCheck = checkSafaricomPhone(phone);
+    if (!contactCheck.ok) {
+      alert(`Contact phone: ${contactCheck.message}`);
+      return;
+    }
+    if (settlementBank === 'mpesa') {
+      const payoutCheck = checkSafaricomPhone(accountNumber);
+      if (!payoutCheck.ok) {
+        alert(`M-Pesa number: ${payoutCheck.message}`);
+        return;
+      }
+    }
 
     try {
       setSavingPaymentInfo(true);
@@ -727,12 +741,17 @@ const AgentView: React.FC = () => {
                   </label>
                   <input
                     type="tel"
+                    inputMode="tel"
+                    autoComplete="tel"
+                    maxLength={PHONE_MAX_INPUT_LENGTH}
                     value={phone}
-                    onChange={(e) => setPhone(e.target.value)}
+                    onChange={(e) => setPhone(sanitizePhoneInput(e.target.value))}
                     required
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
-                    placeholder="254712345678"
+                    placeholder="0712 345 678"
                   />
+                  <p className="text-xs text-gray-500 mt-1">Safaricom numbers only (07xx or 01xx)</p>
+                  {phoneHint(phone) && <p role="alert" className="mt-2 text-xs text-red-600 font-medium">{phoneHint(phone)}</p>}
                 </div>
 
                 <button

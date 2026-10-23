@@ -6,7 +6,7 @@ import * as fees from "../../functions/src/mychama/pay/fees.ts";
 const v = JSON.parse(readFileSync(new URL("./fee-vectors.json", import.meta.url), "utf8"));
 const fn = {
   contribution: (r) => fees.contributionFees(r.net),
-  mgr: (r) => fees.mgrContributionFees(r.net),
+  mgr: (r) => fees.mgrContributionFees(r.net, r.plan),
   loan: (r) => fees.loanRepaymentFees(r.net, r.plan),
 };
 let bad = 0;
@@ -18,6 +18,17 @@ for (const r of v.rows) {
       if (bad <= 10) console.error(`MISMATCH ${r.fn} plan=${r.plan ?? "-"} net=${r.net} ${k}: ts=${got[k]} py=${r.out[k]}`);
     }
   }
+}
+// Chama must receive EXACTLY `net` to the cent: gross - (flat charge kept by the main account) === net. Any extra is ours.
+for (const r of v.rows) {
+  const o = fn[r.fn](r);
+  const cents = (x) => Math.round(x * 100);
+  const kept = fees.mainAccountChargeSubunits(o.gross, o.net);
+  if (cents(o.gross) - kept !== cents(r.net) && Math.abs(cents(r.net) - r.net * 100) < 1e-6) { bad++; console.error(`NOT EXACT ${r.fn} ${r.plan ?? "-"} net=${r.net}`); }
+  if (kept < 0) { bad++; console.error(`NEGATIVE main-account share ${r.fn} net=${r.net}`); }
+}
+for (const s of v.sms) {
+  if (fees.smsCreditsForAmount(s.amountKes, s.plan) !== s.credits) { bad++; console.error(`SMS MISMATCH ${s.plan} ${s.amountKes}: ts=${fees.smsCreditsForAmount(s.amountKes, s.plan)} py=${s.credits}`); }
 }
 for (const [plan, allowed] of Object.entries(v.plans_online)) {
   if (fees.onlineCollectionAllowed(plan) !== allowed) { bad++; console.error(`MISMATCH onlineCollection ${plan}`); }

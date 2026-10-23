@@ -5,6 +5,7 @@
 import * as admin from "firebase-admin";
 import { mychamaDb } from "../config";
 import { sendMyChamaSms } from "../sms";
+import { smsCreditsForAmount } from "../pay/fees";
 import { recordMyChamaDeskEvent, type MyChamaChargeFacts, type MyChamaDeskKind } from "../../desk/hooks";
 
 // ============================================================================
@@ -429,9 +430,13 @@ function blockApply(tx: MyChamaTx, ref: admin.firestore.DocumentReference, note:
 }
 
 /**
- * SMS credit top-up (MCS-). Track B: runs in ONE transaction (the old read-then-update could double-credit
- * if two deliveries raced), uses the same crediting rule as before (+amountKes), and checks Paystack's
- * amount/currency against the stored `amountKes`.
+ * SMS credit top-up (MCS-). Runs in ONE transaction (the old read-then-update could double-credit if two deliveries
+ * raced) and checks Paystack's amount/currency against the stored `amountKes`.
+ *
+ * TIERED PRICING: credits are NOT 1 per KES. Chama's purchaseSmsCredits fixes the credits at purchase time from the
+ * chama's plan (KES per credit: 0.90 Free/Starter/Basic, 0.70 Growth, 0.50 Max) and stores them on the pending doc as
+ * `credits`; that exact figure is credited, so the chama gets what was quoted even if its plan changed meanwhile.
+ * Pending docs created before that change have no `credits`; they are priced from the chama's current plan.
  */
 export async function handleMyChamaSmsTopup(
   reference: string,
@@ -459,8 +464,15 @@ export async function handleMyChamaSmsTopup(
     }
     const chama = (await tx.get(chamaRef)).data() || {};
     const now = Date.now();
-    tx.update(chamaRef, { smsCredits: (chama.smsCredits || 0) + topup.amountKes, updatedAt: now });
-    tx.update(topupRef, { status: "success", updatedAt: now });
+    const stored = Number(topup.credits);
+    const credits = Number.isInteger(stored) && stored > 0 ? stored : smsCreditsForAmount(topup.amountKes, String(chama.plan || "free"));
+    if (credits < 1) {
+      const note = `amount KES ${topup.amountKes} buys no SMS credit on plan "${chama.plan || "free"}" — nothing applied`;
+      blockApply(tx, topupRef, note);
+      return note;
+    }
+    tx.update(chamaRef, { smsCredits: (chama.smsCredits || 0) + credits, updatedAt: now });
+    tx.update(topupRef, { status: "success", creditsGranted: credits, updatedAt: now });
     return "applied" as const;
   });
   logOutcome("MyChama SMS top-up", reference, out);

@@ -21,6 +21,7 @@ import * as admin from "firebase-admin";
 import * as crypto from "crypto";
 import { REGION, normalizeKePhone, plotDb, MYCHAMA_ID_PEPPER } from "../mychama/config";
 import { MYCHAMA_HP_SECRETS, sendHpSmsChecked } from "../mychama/sms";
+import { checkSafaricomPhone } from "../phone/safaricom";
 
 const OTP_SECRETS = [MYCHAMA_ID_PEPPER, ...MYCHAMA_HP_SECRETS];
 
@@ -42,8 +43,10 @@ function hmac(label: string, value: string): string {
 }
 
 function cleanPhone(raw: unknown): string {
-  const phone = normalizeKePhone(String(raw ?? ""));
-  if (!KE_MOBILE.test(phone)) throw new HttpsError("invalid-argument", "Enter a valid Kenyan mobile number (e.g. 0712345678).");
+  const check = checkSafaricomPhone(raw);
+  if (!check.ok) throw new HttpsError("invalid-argument", check.message);
+  const phone = normalizeKePhone(check.e164);
+  if (!KE_MOBILE.test(phone)) throw new HttpsError("invalid-argument", "Enter a valid Safaricom number, for example 0712 345 678.");
   return phone;
 }
 

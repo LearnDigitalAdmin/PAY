@@ -14,7 +14,9 @@ export const SAFARICOM_PREFIX_RANGES: ReadonlyArray<readonly [number, number]> =
 
 export const SAFARICOM_ONLY_MESSAGE =
   "Only Safaricom numbers are supported (for example 0712 345 678 or 0110 123 456). Please use a Safaricom number.";
-export const INVALID_PHONE_MESSAGE = "Enter a valid Kenyan phone number, for example 0712345678.";
+export const INVALID_PHONE_MESSAGE = "Enter a valid Safaricom number: 10 digits, for example 0712 345 678.";
+/** Longest text a phone field accepts ("+254 712 345 678" is 16). */
+export const PHONE_MAX_INPUT_LENGTH = 20;
 
 /** The 9 national digits (7XXXXXXXX / 1XXXXXXXX), or "" when the input is not a Kenyan mobile number. */
 export function nationalDigits(raw: unknown): string {
@@ -38,6 +40,11 @@ export type PhoneCheck =
 
 /** Format + Safaricom check. e164 = +2547XXXXXXXX, msisdn = 2547XXXXXXXX (HostPinnacle), local = 07XXXXXXXX. */
 export function checkSafaricomPhone(raw: unknown): PhoneCheck {
+  // A string may only contain what a phone number can: digits, spaces, "+", "-" and brackets, at most 20 characters.
+  // (nationalDigits alone strips every non-digit, which would let "abc0712345678" through.)
+  if (typeof raw === "string" && (raw.trim().length > PHONE_MAX_INPUT_LENGTH || /[^\d\s+\-()]/.test(raw))) {
+    return { ok: false, reason: "invalid", message: INVALID_PHONE_MESSAGE };
+  }
   const national = nationalDigits(raw);
   if (!national) return { ok: false, reason: "invalid", message: INVALID_PHONE_MESSAGE };
   if (!isSafaricomNational(national)) return { ok: false, reason: "not_safaricom", message: SAFARICOM_ONLY_MESSAGE };

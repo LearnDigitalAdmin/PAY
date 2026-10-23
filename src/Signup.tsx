@@ -5,7 +5,7 @@ import { Phone, Mail, User, CreditCard, Lock, AlertCircle, Loader2, CheckCircle 
 import { AuthService, TenantService } from './Firebase';
 import { useNavigate } from 'react-router-dom';
 import { setPortalPreference } from './session/session';
-import { checkSafaricomPhone } from './utils/safaricom';
+import { checkSafaricomPhone, phoneHint, sanitizePhoneInput, PHONE_MAX_INPUT_LENGTH } from './utils/safaricom';
 
 const Signup: React.FC = () => {
   const [step, setStep] = useState<'info' | 'phone' | 'code'>('info');
@@ -220,19 +220,23 @@ const Signup: React.FC = () => {
                 <Phone className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
                 <input
                   type="tel"
+                  inputMode="tel"
+                  autoComplete="tel"
+                  maxLength={PHONE_MAX_INPUT_LENGTH}
                   value={formData.phone}
-                  onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                  onChange={(e) => setFormData({ ...formData, phone: sanitizePhoneInput(e.target.value) })}
                   placeholder="0712345678 or 254712345678"
                   className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   required
                 />
               </div>
               <p className="mt-2 text-xs text-gray-500">Safaricom numbers only (07xx or 01xx)</p>
+              {phoneHint(formData.phone) && <p role="alert" className="mt-2 text-xs text-red-600 font-medium">{phoneHint(formData.phone)}</p>}
             </div>
 
             <button
               type="submit"
-              disabled={loading || !formData.phone}
+              disabled={loading || !formData.phone || !checkSafaricomPhone(formData.phone).ok}
               className="w-full bg-blue-600 text-white py-3 rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 transition-colors"
             >
               {loading ? (

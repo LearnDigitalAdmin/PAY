@@ -1,4 +1,5 @@
 // Auth.tsx - Sign In Component with Role-Based Authentication
+import { checkSafaricomPhone, phoneHint, sanitizePhoneInput, PHONE_MAX_INPUT_LENGTH } from './utils/safaricom';
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { AuthService } from './Firebase';
@@ -66,22 +67,6 @@ const Auth: React.FC = () => {
     }
   }, [userType, usesPhone]);
 
-  const formatPhoneNumber = (input: string): string => {
-    // Remove all non-digit characters
-    const digits = input.replace(/\D/g, '');
-    
-    // Handle Kenyan numbers
-    if (digits.startsWith('254')) {
-      return `+${digits}`;
-    } else if (digits.startsWith('0')) {
-      return `+254${digits.substring(1)}`;
-    } else if (digits.startsWith('7') || digits.startsWith('1')) {
-      return `+254${digits}`;
-    }
-    
-    return `+${digits}`;
-  };
-
   // Landlord sign-in is complete once Firebase Auth succeeded AND the server confirms (and claims) a
   // landlord account for this identity — the session layer asks the server, not localStorage.
   const finishAgentLogin = async () => {
@@ -101,11 +86,10 @@ const Auth: React.FC = () => {
     setLoading(true);
 
     try {
-      if (!phone || phone.length < 9) {
-        throw new Error('Please enter a valid phone number');
-      }
+      const phoneCheck = checkSafaricomPhone(phone);
+      if (!phoneCheck.ok) throw new Error(phoneCheck.message);
 
-      const formattedPhone = formatPhoneNumber(phone);
+      const formattedPhone = phoneCheck.e164;
       console.log('Sending verification code to:', formattedPhone);
 
       const result = await AuthService.sendVerificationCode(formattedPhone);
@@ -413,22 +397,26 @@ const Auth: React.FC = () => {
                       <input
                         id="phone"
                         type="tel"
+                        inputMode="tel"
+                        autoComplete="tel"
+                        maxLength={PHONE_MAX_INPUT_LENGTH}
                         value={phone}
-                        onChange={(e) => setPhone(e.target.value)}
-                        placeholder="0712345678 or 254712345678"
+                        onChange={(e) => setPhone(sanitizePhoneInput(e.target.value))}
+                        placeholder="0712 345 678"
                         className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                         disabled={loading}
                         required
                       />
                     </div>
                     <p className="mt-2 text-xs text-gray-500">
-                      Enter your phone number in any format (07XX, 254, or +254)
+                      Safaricom numbers only — 07XX, 01XX, 254… or +254…
                     </p>
+                    {phoneHint(phone) && <p role="alert" className="mt-2 text-xs text-red-600 font-medium">{phoneHint(phone)}</p>}
                   </div>
 
                   <button
                     type="submit"
-                    disabled={loading || !phone}
+                    disabled={loading || !checkSafaricomPhone(phone).ok}
                     className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors flex items-center justify-center"
                   >
                     {loading ? (

@@ -14,16 +14,53 @@
 
 export const PAYSTACK_FEE_RATE = 0.015;
 export const PAYSTACK_FEE_CAP = 3000;
-export const CONTRIBUTION_MARKUP_RATE = 0.005;
 
-/** Loan-repayment markup per plan. null/absent = no markup (free plan). */
+// Rates are FRACTIONS (0.0025 === 0.25%). A "markup" is MyChama's cut, charged TOGETHER with Paystack's own fee
+// (e.g. 0.5% markup + 1.5% Paystack = 2.0%); the UIs present the two as ONE "Transaction cost" plus a total.
+
+/** Plain contributions carry NO markup … */
+export const CONTRIBUTION_MARKUP_RATE = 0;
+/** … and their all-in transaction cost is a flat 1.7% (Paystack's 1.5% + 0.2% the main account keeps), capped. */
+export const CONTRIBUTION_TRANSACTION_RATE = 0.017;
+
+/** Loan-repayment markup per plan (on top of Paystack's 1.5%). null/absent = no markup (free plan). */
 export const LOAN_MARKUP_RATE: Readonly<Record<string, number | null>> = {
   free: null,
-  starter: 0.015,
-  basic: 0.011,
-  growth: 0.007,
-  max: 0.007,
+  starter: 0.008,
+  basic: 0.008,
+  growth: 0.0045,
+  max: 0.0025,
 };
+
+/** MGR collections: dynamic markup per plan, falling as the plan rises (on top of Paystack's 1.5%). */
+export const MGR_MARKUP_RATE: Readonly<Record<string, number | null>> = {
+  free: null,
+  starter: 0.007,
+  basic: 0.006,
+  growth: 0.004,
+  max: 0.002,
+};
+
+/** PLANS[plan].smsRate from Chama constants — KES paid PER SMS CREDIT at top-up (cheaper tiers buy more per KES). */
+export const PLAN_SMS_RATE: Readonly<Record<string, number>> = {
+  free: 0.9,
+  starter: 0.9,
+  basic: 0.9,
+  growth: 0.7,
+  max: 0.5,
+};
+
+/**
+ * Credits an SMS top-up buys: whole KES paid / the plan's per-credit price, rounded DOWN, in integer hundredths so
+ * float noise can never grant or withhold a credit. Unknown plan => priced as free. Mirrors Chama
+ * functions/shared/money.py::sms_credits_for_amount.
+ */
+export function smsCreditsForAmount(amountKes: number, plan: string): number {
+  const rate = has(PLAN_SMS_RATE, plan) ? PLAN_SMS_RATE[plan] : PLAN_SMS_RATE.free;
+  const kesCents = Math.round(Number(amountKes) * 100);
+  if (!Number.isFinite(kesCents) || kesCents <= 0) return 0;
+  return Math.floor(kesCents / Math.round(rate * 100));
+}
 
 /** PLANS[plan].onlineCollection from Chama constants. Unknown plan => treated as "free". */
 export const PLAN_ONLINE_COLLECTION: Readonly<Record<string, boolean>> = {
@@ -71,9 +108,9 @@ export function round2(n: number): number {
  * exactly `net` in the chama account after Paystack's fee AND the MyChama markup are both
  * taken from the charge. `net` is returned exactly as given (like the Python engine).
  */
-export function grossUpForFees(net: number, ourRate: number): FeeBreakdown {
-  let gross = net / (1 - PAYSTACK_FEE_RATE - ourRate);
-  let pFee = gross * PAYSTACK_FEE_RATE;
+export function grossUpForFees(net: number, ourRate: number, baseRate: number = PAYSTACK_FEE_RATE): FeeBreakdown {
+  let gross = net / (1 - baseRate - ourRate);
+  let pFee = gross * baseRate;
 
   if (pFee > PAYSTACK_FEE_CAP) {
     gross = (net + PAYSTACK_FEE_CAP) / (1 - ourRate);
@@ -94,15 +131,19 @@ export function grossUpForFees(net: number, ourRate: number): FeeBreakdown {
 export const mainAccountChargeSubunits = (gross: number, net: number): number =>
   pyRound(gross * 100) - pyRound(net * 100);
 
-export const contributionFees = (net: number): FeeBreakdown => grossUpForFees(net, CONTRIBUTION_MARKUP_RATE);
+export const contributionFees = (net: number): FeeBreakdown =>
+  grossUpForFees(net, CONTRIBUTION_MARKUP_RATE, CONTRIBUTION_TRANSACTION_RATE);
 
 export function loanRepaymentFees(net: number, plan: string): FeeBreakdown {
   const rate = has(LOAN_MARKUP_RATE, plan) ? LOAN_MARKUP_RATE[plan] : null;
   return grossUpForFees(net, rate || 0);
 }
 
-/** MGR collections use the same markup as contributions. */
-export const mgrContributionFees = (net: number): FeeBreakdown => grossUpForFees(net, CONTRIBUTION_MARKUP_RATE);
+/** MGR collections: Paystack's 1.5% plus the plan's dynamic MGR markup. */
+export function mgrContributionFees(net: number, plan: string = "free"): FeeBreakdown {
+  const rate = has(MGR_MARKUP_RATE, plan) ? MGR_MARKUP_RATE[plan] : null;
+  return grossUpForFees(net, rate || 0);
+}
 
 export function onlineCollectionAllowed(plan: string): boolean {
   return has(PLAN_ONLINE_COLLECTION, plan) ? PLAN_ONLINE_COLLECTION[plan] : PLAN_ONLINE_COLLECTION.free;

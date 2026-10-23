@@ -13,7 +13,7 @@ import {
 import { chargeMobileMoney } from "./paystack";
 import { recordResult, releaseKey, reserveKey } from "./idempotency";
 import {
-  SPLIT_KEY_VERSION, assertGrossWithinLimit, cleanRequest, detectProvider, isSafeId, isValidKenyanPhone, validateTarget,
+  SPLIT_KEY_VERSION, assertGrossWithinLimit, cleanRequest, detectProvider, isSafeId, isValidKenyanPhone, phoneRejectionMessage, validateTarget,
   type CleanRequest, type Target,
 } from "./validate";
 
@@ -91,7 +91,7 @@ export const mychamaPayInitiate = onCall(
       // 6. fees (server-side only) + sane gross
       fee = r.purpose === "contribution" ? contributionFees(r.amount)
         : r.purpose === "loan_repayment" ? loanRepaymentFees(r.amount, plan)
-        : mgrContributionFees(r.amount);
+        : mgrContributionFees(r.amount, plan);
       assertGrossWithinLimit(fee.gross);
 
       // 7. rate limit — same rule as Chama (per member, rolling hour, over paymentIntents)
@@ -109,7 +109,7 @@ export const mychamaPayInitiate = onCall(
 
     // 8. phone: default = member's phone on file; an explicit valid KE number is allowed and recorded
     const phone = r.phone ? normalizeKePhone(r.phone) : phoneOnFile;
-    if (!isValidKenyanPhone(phone)) throw myChamaError("invalid_phone", "A valid Kenyan phone number is required.", "invalid-argument");
+    if (!isValidKenyanPhone(phone)) throw myChamaError("invalid_phone", phoneRejectionMessage(r.phone ?? phone), "invalid-argument");
     const phoneOverridden = phone !== phoneOnFile;
     const provider = detectProvider(phone);
 

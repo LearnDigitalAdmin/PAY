@@ -5,6 +5,7 @@ import type * as admin from "firebase-admin";
 import type { MyChamaPurpose, PayInitiateRequest } from "../contract";
 import { myChamaError } from "../errors";
 import { normalizeKePhone } from "../config";
+import { checkSafaricomPhone } from "../../phone/safaricom";
 import { MAX_GROSS_KES, MIN_NET_KES, round2 } from "./fees";
 
 type Db = admin.firestore.Firestore;
@@ -30,7 +31,10 @@ export function localPhone(e164: string): string {
 export function detectProvider(raw: string): "mpesa" | "airtel" {
   return ["073", "075", "078"].includes(localPhone(normalizeKePhone(raw)).slice(0, 3)) ? "airtel" : "mpesa";
 }
-export const isValidKenyanPhone = (raw: string): boolean => /^\+254[17]\d{8}$/.test(normalizeKePhone(raw));
+/** Valid = Kenyan mobile format AND a Safaricom prefix (shared rule: ../../phone/safaricom.ts). */
+export const isValidKenyanPhone = (raw: string): boolean => /^\+254[17]\d{8}$/.test(normalizeKePhone(raw)) && checkSafaricomPhone(raw).ok;
+/** The message to show for a rejected number (never empty). */
+export const phoneRejectionMessage = (raw: string): string => { const c = checkSafaricomPhone(raw); return c.ok ? "A valid Safaricom phone number is required." : c.message; };
 
 // ───────────────────────── request shape ─────────────────────────
 export interface CleanRequest {
