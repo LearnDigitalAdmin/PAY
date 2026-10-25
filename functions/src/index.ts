@@ -44,6 +44,13 @@ import { rentRateForTier } from "./desk/rent";
 import { initiateRentCharge } from "./desk/rentCharge";
 import { runRentBatch } from "./desk/rentBatch";
 export { deskSmsCommission } from "./deskSmsEndpoint";
+// Landlord Watch: owner-ID lookup, masked snapshots, OTP unlock, monthly transcripts (1 free, KES 99 extra), WhatsApp endpoint.
+export {
+  lwLookupProperty, lwConnect, lwDisconnect, lwListConnections, lwUnlockSendOtp, lwUnlockVerifyOtp, lwGetSnapshot,
+  lwTranscriptQuota, lwTranscriptStart, lwTranscriptResendOtp, lwTranscriptVerifyOtp, lwTranscriptPay, lwTranscriptStatus,
+  lwTranscriptList, lwBotApi,
+} from "./landlordWatch";
+import { settleTranscriptPayment, failTranscriptPayment } from "./landlordWatch/payments";
 import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
 import { landlordRentSms, tenantRentSms, settlementDate } from "./desk/rentSettlement";
 import { checkSafaricomPhone, toMsisdn } from "./phone/safaricom";
@@ -1882,8 +1889,13 @@ export const paystackCallback = onRequest({
 
       console.log(`Identified charge type: ${chargeType}`);
 
+      // ── Landlord Watch extra transcript (KES 99, company revenue) ─────────
+      if (reference.startsWith("LWT_")) {
+        await settleTranscriptPayment(db, reference, data, metadata);
+      }
+
       // ── NEW: SMS top-up → settle in project 2 ────────────────────────────
-      if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
+      else if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
         if (metadata.targetProject === "pms") {
           await handlePmsSmsTopUp(reference, data, metadata);
         } else {
@@ -1982,7 +1994,9 @@ export const paystackCallback = onRequest({
       console.warn(`Payment failed: ${reference} (type: ${chargeType})`);
 
       // Update appropriate collection based on charge type
-      if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
+      if (reference.startsWith("LWT_")) {
+        await failTranscriptPayment(db, reference, data.gateway_response);
+      } else if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
         const targetDb = data.metadata?.targetProject === "pms" ? db : db2;
         const pendingRef = targetDb.collection("sms-topup-transactions").doc(reference);
         const failedPending = await pendingRef.get().catch(() => null);
