@@ -3,18 +3,19 @@
 // Runtime-editable in `desk_config/global` (admin dash only). Money in minor units, rates in percent.
 import { DESK, deskDb } from "./db";
 
-export type Rank = "clerk" | "senior" | "lead";
+// "internal" is Samuhia staff: never an owner of customers for payouts (their share is 0 and owner.ts ignores them).
+export type Rank = "clerk" | "senior" | "lead" | "admin" | "internal";
 export type Product = "chama" | "school" | "pms";
 
 export interface DeskConfig {
   creditCostMinor: number;               // what Samuhia pays per SMS credit: KES 0.20 = 20
   platformCutPct: number;                // CYBER_ charge cut, taken after Paystack fees
   expectedPaystackFeePct: number;        // only used to derive SMS margin shares (1.5)
-  smsShareOfMarginPct: number;           // 40
+  smsShareOfMarginPct: number;           // 45
   firstPurchaseThresholdMinor: number;   // 20000 = KES 200
   subShareByRank: Record<Rank, number>;  // % of net after fees
   reportShareByRank: Record<Rank, number>;
-  rentDeskSharePct: number;              // 30 (% of Plot Yangu's take)
+  rentDeskSharePct: number;              // 40 (% of Plot Yangu's take)
   rentTakeCapMinor: number;              // 25000 = KES 250 per transaction
   milestone: { blockSize: number; bonusMinor: number; lifetimeCapMinor: number; minPaidMonths: number };
   paystackAccounts: Record<Product, "main" | "separate">;
@@ -35,11 +36,11 @@ export const DEFAULT_DESK_CONFIG: DeskConfig = {
   creditCostMinor: 20,
   platformCutPct: 2.5,
   expectedPaystackFeePct: 1.5,
-  smsShareOfMarginPct: 40,
+  smsShareOfMarginPct: 45,
   firstPurchaseThresholdMinor: 20000,
-  subShareByRank: { clerk: 25, senior: 30, lead: 30 },
-  reportShareByRank: { clerk: 25, senior: 30, lead: 30 },
-  rentDeskSharePct: 30,
+  subShareByRank: { clerk: 25, senior: 30, lead: 30, admin: 30, internal: 0 },
+  reportShareByRank: { clerk: 25, senior: 30, lead: 30, admin: 30, internal: 0 },
+  rentDeskSharePct: 40,
   rentTakeCapMinor: 25000,
   milestone: { blockSize: 10, bonusMinor: 200000, lifetimeCapMinor: 1000000, minPaidMonths: 2 },
   paystackAccounts: { chama: "main", school: "main", pms: "main" },

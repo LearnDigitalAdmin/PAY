@@ -2,7 +2,8 @@
 import { customerDocId, DESK, deskDb } from "./db";
 import type { DeskAgentDoc, DeskCustomerDoc, DeskOwner } from "./types";
 
-const VALID_RANKS = ["clerk", "senior", "lead"];
+// Admin agents earn as servicing agents. Internal staff are ops: a customer they hold carries no desk part (Samuhia keeps it all).
+const VALID_RANKS = ["clerk", "senior", "lead", "admin"];
 
 /**
  * desk_customers/{entityKey} must name an `ownerAgentId`, must not be `selfOwned`, and the owner must be an `active`
