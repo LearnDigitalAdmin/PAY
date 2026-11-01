@@ -10,3 +10,8 @@ node_modules/
 *.local
 
 project2keys.json
+# env files must never carry credentials: SMS and payment keys live in Firebase secrets only
+.env
+.env.*
+functions/.env
+functions/.env.*

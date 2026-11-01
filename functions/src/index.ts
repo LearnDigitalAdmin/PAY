@@ -44,6 +44,7 @@ import { alertOps as lmmAlert } from "./lmm/alert";
 import { firstName } from "./lmm/dear";
 import { createSealedRecipient } from "./lmm/recipient";
 import { LMM_SEAL_KEY } from "./lmm/seal";
+import { HP_SECRETS, sendHpSms } from "./hpSms";
 export { lmm_getPlan, lmm_start, lmm_pay, lmm_setupRecipient, lmm_recipientStatus, lmm_dailySweep } from "./lmm";
 import { getDeskConfig } from "./desk/config";
 import { rentRateForTier } from "./desk/rent";
@@ -688,10 +689,6 @@ export const reconcileMyChamaIntents = onSchedule({
 
 const SMS_CONFIG = {
     API_URL:   "https://smsportal.hostpinnacle.co.ke/SMSApi/send",
-    USERID:    process.env.HP_SMS_USERID    || "",   // set in .env / functions config
-    PASSWORD:  process.env.HP_SMS_PASSWORD  || "",
-    APIKEY:    process.env.HP_SMS_APIKEY    || "",
-    SENDER_ID: process.env.HP_SMS_SENDERID  || "",   // your approved sender ID
     MAX_LENGTH: 400,
 };
 
@@ -833,58 +830,7 @@ interface SmsSendResult {
  * Never throws — callers decide what to do on failure.
  */
 async function sendHostPinnacleSms(opts: SmsSendOptions): Promise<SmsSendResult> {
-    try {
-        if (!SMS_CONFIG.USERID || !SMS_CONFIG.APIKEY) {
-            console.warn("HostPinnacle SMS credentials not configured — skipping SMS.");
-            return { success: false, error: "SMS credentials not configured" };
-        }
-
-        const params = new URLSearchParams({
-            userid:         SMS_CONFIG.USERID,
-            password:       SMS_CONFIG.PASSWORD,
-            sendMethod:     "quick",
-            mobile:         opts.mobile,
-            msg:            opts.message,
-            senderid:       opts.senderId || SMS_CONFIG.SENDER_ID,
-            msgType:        "text",
-            duplicatecheck: opts.duplicateCheck === false ? "false" : "true",
-            output:         "json",
-        });
-
-        const response = await axios.post(
-            SMS_CONFIG.API_URL,
-            params.toString(),
-            {
-                headers: {
-                    "apikey":       SMS_CONFIG.APIKEY,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                timeout: 10_000,
-            }
-        );
-
-        const data = response.data;
-        console.log(`HostPinnacle SMS response for ${opts.mobile}:`, JSON.stringify(data));
-
-        // HostPinnacle returns a top-level status field.
-        // Treat anything other than explicit error codes as success.
-        const isError =
-            data?.status === "error" ||
-            data?.ErrorCode !== undefined ||
-            (typeof data?.status === "string" && data.status.toLowerCase().includes("fail"));
-
-        if (isError) {
-            return { success: false, raw: data, error: data?.message || "API error" };
-        }
-
-        return { success: true, raw: data };
-    } catch (err: any) {
-        const msg = err?.response?.data
-            ? JSON.stringify(err.response.data)
-            : err.message;
-        console.error(`HostPinnacle SMS send error for ${opts.mobile}:`, msg);
-        return { success: false, error: msg };
-    }
+    return sendHpSms(opts);   // credentials come from the HP_SMS_* secrets only (see ./hpSms.ts)
 }
 
 /**
@@ -1298,7 +1244,7 @@ export const setupAccount = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY],
+  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY, ...HP_SECRETS],
 }, async (request: CallableRequest<SetupAccountRequest>) => {
   try {
     //const paystackHeaders = getPaystackHeaders(PAYSTACK_SECRET_KEY.value());
@@ -1882,7 +1828,7 @@ export const paystackCallback = onRequest({
   cors: false,
   maxInstances: 10,
   region: "africa-south1",
-  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY],
+  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY, ...HP_SECRETS],
 }, async (req, res) => {
   console.log(`Webhook request received: ${req.method}`);
 

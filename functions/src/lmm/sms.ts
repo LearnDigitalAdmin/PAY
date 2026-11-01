@@ -1,7 +1,7 @@
 // Lipa Mos Mos SMS: sender, message texts (each under 144 characters, each starting "Dear {first name},") and send-once logging.
 import * as admin from "firebase-admin";
-import axios from "axios";
 import { dearLine } from "./dear";
+import { sendHpSms } from "../hpSms";
 
 const MAX = 144;
 
@@ -31,24 +31,9 @@ export const lmmText = {
       : fit144(`${dearLine(p.name)} your landlord has been paid ${kes(p.paidMinor)} for rent. Thank you for using Lipa Mos Mos.`),
 };
 
-/** Low-level HostPinnacle send (same account and variables as the rest of PAY). Never throws. */
+/** Low-level HostPinnacle send via the shared secret-based sender (functions/src/hpSms.ts). Never throws. */
 export async function sendSms(mobile: string, message: string): Promise<boolean> {
-  try {
-    const { HP_SMS_USERID, HP_SMS_PASSWORD, HP_SMS_APIKEY, HP_SMS_SENDERID } = process.env;
-    if (!HP_SMS_USERID || !HP_SMS_APIKEY) { console.warn("LMM SMS skipped: HostPinnacle credentials not configured"); return false; }
-    const params = new URLSearchParams({
-      userid: HP_SMS_USERID, password: HP_SMS_PASSWORD || "", sendMethod: "quick", mobile, msg: message,
-      senderid: HP_SMS_SENDERID || "", msgType: "text", duplicatecheck: "true", output: "json",
-    });
-    const res = await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", params.toString(), {
-      headers: { apikey: HP_SMS_APIKEY, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10_000,
-    });
-    const d = res.data;
-    return !(d?.status === "error" || d?.ErrorCode !== undefined || (typeof d?.status === "string" && d.status.toLowerCase().includes("fail")));
-  } catch (err) {
-    console.error("LMM SMS failed:", (err as Error)?.message);
-    return false;
-  }
+  return (await sendHpSms({ mobile, message })).success;
 }
 
 /** Sends at most once per `key` (a webhook repeat or a re-run of the sweep never texts the tenant twice). */

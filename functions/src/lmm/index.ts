@@ -3,6 +3,7 @@ import * as admin from "firebase-admin";
 import { onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { PAYSTACK_SECRET_KEY } from "../desk/paystack";
+import { HP_SECRETS } from "../hpSms";
 import { toMsisdn } from "../phone/safaricom";
 import { alertOps } from "./alert";
 import { LMM } from "./config";
@@ -26,7 +27,7 @@ export const handleLmmTransfer = (event: string, data: unknown) => onTransferEve
  * match the account on their profile, so neither a tampered profile nor a stray request can create a recipient on its own.
  */
 export const lmm_setupRecipient = onCall(
-  { region: "africa-south1", cors: true, timeoutSeconds: 60, memory: "256MiB", maxInstances: 5, secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY] },
+  { region: "africa-south1", cors: true, timeoutSeconds: 60, memory: "256MiB", maxInstances: 5, secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY, ...HP_SECRETS] },
   async (request: CallableRequest<{ settlementType?: string; bankCode?: string; accountNumber?: string; name?: string }>) => {
     if (!request.auth) throw new HttpsError("unauthenticated", "Sign in first");
     const landlordId = request.auth.uid;
@@ -53,7 +54,7 @@ const eat = (now: number) => new Date(now + 3 * 3_600_000);
 
 /** 10:00 Nairobi daily: resume anything half-done, settle on the 5th, send reminders, expire dead charges. */
 export const lmm_dailySweep = onSchedule(
-  { schedule: "0 10 * * *", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 540, memory: "512MiB", secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY] },
+  { schedule: "0 10 * * *", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 540, memory: "512MiB", secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY, ...HP_SECRETS] },
   async () => {
     const s = lmmSecrets(); const now = Date.now();
     try {
