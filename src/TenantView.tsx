@@ -22,6 +22,7 @@ import { AuthService, db, TenantService, type Invoice, type Payment } from './Fi
 import PaymentModal from './PaymentModal';
 import BrandLogo from './theme/BrandLogo';
 import ChamaSection from './mychama/ChamaSection';
+import LipaMosMos from './LipaMosMos';
 import { splitInvoiceOutstanding } from './mychama/calc';
 import { doc, getDoc } from 'firebase/firestore';
 
@@ -358,6 +359,12 @@ const TenantView: React.FC = () => {
           rentDue={splitInvoiceOutstanding(invoices).rentDue}
           billsDue={splitInvoiceOutstanding(invoices).billsDue}
         />
+
+        {/* Lipa Mos Mos: pay rent a little at a time (shown while something is owed) */}
+        {(() => {
+          const open = invoices.find((inv) => !inv.isPaid);
+          return open ? <LipaMosMos agentId={open.agentUserId} tenantId={open.tenantId} phone={tenantData?.phone || ''} onPaid={handlePaymentSuccess} /> : null;
+        })()}
 
         {/* Tabs */}
         <div className="bg-white rounded-xl shadow-md overflow-hidden">

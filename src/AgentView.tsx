@@ -24,7 +24,8 @@ import {
   Banknote,
   MessageCircle,
 } from 'lucide-react';
-import { AgentService, type Invoice, type Payment, type AgentAccount, AuthService } from './Firebase';
+import { AgentService, type Invoice, type Payment, type AgentAccount, AuthService, functions } from './Firebase';
+import { httpsCallable } from 'firebase/functions';
 import PaymentModal from './PaymentModal';
 import BrandLogo from './theme/BrandLogo';
 import ChamaSection from './mychama/ChamaSection';
@@ -42,6 +43,10 @@ const AgentView: React.FC = () => {
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [showTerminal, setShowTerminal] = useState(false);
   const [showPaymentSettings, setShowPaymentSettings] = useState(false);
+  // Lipa Mos Mos (tenants pay rent a little at a time; the landlord is paid by transfer to this same account)
+  const [lmm, setLmm] = useState<{ status: string; reason?: string | null; last4?: string } | null>(null);
+  const [lmmBusy, setLmmBusy] = useState(false);
+  const [lmmMsg, setLmmMsg] = useState('');
   const [tenantIdSearch, setTenantIdSearch] = useState('');
   const [searchError, setSearchError] = useState('');
   const [error, setError] = useState('');
@@ -161,6 +166,22 @@ const AgentView: React.FC = () => {
       window.removeEventListener('storage', handleStorageChange);
     };
   }, [navigate]);
+
+  const enableLmm = async () => {
+    const info: any = agentData?.paymentInfo;
+    if (!info) return;
+    setLmmBusy(true); setLmmMsg('');
+    try {
+      await httpsCallable(functions, 'lmm_setupRecipient')({ settlementType: info.settlementType || '', bankCode: info.settlementBankCode || '', accountNumber: info.accountNumber || '', name: info.businessName || '' });
+      const r: any = await httpsCallable(functions, 'lmm_recipientStatus')({});
+      setLmm(r.data); setLmmMsg('Lipa Mos Mos is on for your payout account.');
+    } catch (e: any) { setLmmMsg(e?.message || 'Could not turn on Lipa Mos Mos'); } finally { setLmmBusy(false); }
+  };
+
+  useEffect(() => {
+    if (!agentData?.paymentInfo?.accountId) return;
+    httpsCallable(functions, 'lmm_recipientStatus')({}).then((r: any) => setLmm(r.data)).catch(() => undefined);
+  }, [agentData?.paymentInfo?.accountId]);
 
   const handleSignOut = async () => {
     try {
@@ -605,6 +626,20 @@ const AgentView: React.FC = () => {
                     <p className="text-green-700 text-sm">
                       Settlement Bank: {agentData.paymentInfo.settlementBank.toUpperCase()}
                     </p>
+                    <div className="mt-3 pt-3 border-t border-green-200">
+                      <p className="text-green-900 font-semibold text-sm">Lipa Mos Mos</p>
+                      {lmm?.status === 'active' ? (
+                        <p className="text-green-700 text-sm">On. Tenants can pay rent a little at a time and you are paid by transfer to the account ending {lmm.last4}.</p>
+                      ) : lmm?.status === 'unsupported' ? (
+                        <p className="text-yellow-800 text-sm">Not available for this payout account{lmm.reason ? ` (${lmm.reason})` : ''}.</p>
+                      ) : (
+                        <p className="text-green-700 text-sm">Let tenants pay rent a little at a time. You are paid by transfer when it is covered, or on the 5th.</p>
+                      )}
+                      {lmm?.status !== 'active' && lmm?.status !== 'unsupported' && (
+                        <button type="button" onClick={enableLmm} disabled={lmmBusy} className="mt-2 px-3 py-1.5 rounded-lg bg-green-600 text-white text-sm font-semibold disabled:opacity-50">{lmmBusy ? 'Please wait...' : 'Turn on Lipa Mos Mos'}</button>
+                      )}
+                      {lmmMsg && <p className="text-sm mt-1 text-green-800 break-words">{lmmMsg}</p>}
+                    </div>
                   </div>
                 </div>
               </div>

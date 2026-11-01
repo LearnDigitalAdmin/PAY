@@ -39,6 +39,12 @@ function myregisterDb(): admin.firestore.Firestore {
 }
 
 import { PAYSTACK_SECRET_KEY, PAYSTACK_API_BASE } from "./desk/paystack";
+import { handleLmmCharge, handleLmmTransfer } from "./lmm";
+import { alertOps as lmmAlert } from "./lmm/alert";
+import { firstName } from "./lmm/dear";
+import { createSealedRecipient } from "./lmm/recipient";
+import { LMM_SEAL_KEY } from "./lmm/seal";
+export { lmm_getPlan, lmm_start, lmm_pay, lmm_setupRecipient, lmm_recipientStatus, lmm_dailySweep } from "./lmm";
 import { getDeskConfig } from "./desk/config";
 import { rentRateForTier } from "./desk/rent";
 import { initiateRentCharge } from "./desk/rentCharge";
@@ -768,21 +774,21 @@ function buildSmsMessage(
     switch (type) {
         case SMS_TEMPLATES.NEW_INVOICE:
             // params: tenantName, billingMonth, propertyName, agentName, agentPhone, agentEmail
-            msg = `Dear ${params.tenantName}, your invoice for ${params.billingMonth} at ${params.propertyName} is ready. TOTAL AMOUNT: ${params.totalAmount}` +
+            msg = `Dear ${firstName(params.tenantName) || "Tenant"}, your invoice for ${params.billingMonth} at ${params.propertyName} is ready. TOTAL AMOUNT: ${params.totalAmount}` +
                   ` Contact ${params.agentName} on ${params.agentPhone} for queries.` +
                   ` PLOT YANGU`;
             break;
 
         case SMS_TEMPLATES.OVERDUE:
             // params: tenantName, outstandingAmount, daysOverdue, propertyName
-            msg = `Dear ${params.tenantName}, your rent at ${params.propertyName} is overdue by ${params.daysOverdue} day(s). ` + 
+            msg = `Dear ${firstName(params.tenantName) || "Tenant"}, your rent at ${params.propertyName} is overdue by ${params.daysOverdue} day(s). ` + 
                   ` Outstanding: ${params.outstandingAmount}. Please pay to avoid late fees.` + 
                   ` PLOT YANGU`;
             break;
 
         case SMS_TEMPLATES.PAYMENT_SUCCESS:
             // params: tenantName, amountPaid, propertyUnit
-            msg = `Dear ${params.tenantName}, ${params.agentName} has received your payment of ${params.amountPaid} for ${params.propertyUnit}. Thank you!` + 
+            msg = `Dear ${firstName(params.tenantName) || "Tenant"}, ${params.agentName} has received your payment of ${params.amountPaid} for ${params.propertyUnit}. Thank you!` + 
                    ` PLOT YANGU`;
             break;
 
@@ -1292,7 +1298,7 @@ export const setupAccount = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY],
 }, async (request: CallableRequest<SetupAccountRequest>) => {
   try {
     //const paystackHeaders = getPaystackHeaders(PAYSTACK_SECRET_KEY.value());
@@ -1499,6 +1505,16 @@ export const setupAccount = onCall({
     });
 
     console.log(`Successfully created subaccount for user ${userId}: ${subaccountData.subaccount_code}`);
+
+    // Lipa Mos Mos: the same account also becomes a sealed TRANSFER recipient. Only for the signed-in landlord themself, only from this
+    // request, and never allowed to fail the setup (a landlord without a recipient simply does not get Lipa Mos Mos).
+    if (!pId && request.auth.uid === userId) {
+      try {
+        const rr = await createSealedRecipient({ paystack: PAYSTACK_SECRET_KEY.value(), seal: LMM_SEAL_KEY.value() },
+          { landlordId: userId, settlementType, bankCode: validBankCode, accountNumber: formattedAccountNumber, name: businessName });
+        if (!rr.ok) console.warn(`Lipa Mos Mos recipient not created for ${userId}: ${rr.reason}`);
+      } catch (e: any) { console.warn("Lipa Mos Mos recipient step failed:", e?.message || e); }
+    }
 
     return {
       success: true,
@@ -1863,7 +1879,7 @@ export const paystackCallback = onRequest({
   cors: false,
   maxInstances: 10,
   region: "africa-south1",
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY],
 }, async (req, res) => {
   console.log(`Webhook request received: ${req.method}`);
 
@@ -1885,6 +1901,7 @@ export const paystackCallback = onRequest({
 
     if (hash !== expectedHash) {
       console.error("Invalid signature");
+      if (/LMM_|lmm-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mos Mos webhook arrived with a bad signature");
       res.status(400).json({ error: "Invalid signature" });
       return;
     }
@@ -1908,8 +1925,13 @@ export const paystackCallback = onRequest({
 
       console.log(`Identified charge type: ${chargeType}`);
 
+      // ── Lipa Mos Mos instalment: credited to the tenant's plan after Paystack verification ──────────
+      if (reference.startsWith("LMM_")) {
+        await handleLmmCharge(reference, data);
+      }
+
       // ── Landlord Watch extra transcript (KES 99, company revenue) ─────────
-      if (reference.startsWith("LWT_")) {
+      else if (reference.startsWith("LWT_")) {
         await settleTranscriptPayment(db, reference, data, metadata);
       }
 
@@ -2013,7 +2035,9 @@ export const paystackCallback = onRequest({
       console.warn(`Payment failed: ${reference} (type: ${chargeType})`);
 
       // Update appropriate collection based on charge type
-      if (reference.startsWith("LWT_")) {
+      if (reference.startsWith("LMM_")) {
+        await admin.firestore().collection("lmm_payments").doc(reference).update({ status: "failed", error: String(data.gateway_response ?? "").slice(0, 200) }).catch(() => undefined);
+      } else if (reference.startsWith("LWT_")) {
         await failTranscriptPayment(db, reference, data.gateway_response);
       } else if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
         const targetDb = data.metadata?.targetProject === "pms" ? db : db2;
@@ -2122,6 +2146,11 @@ export const paystackCallback = onRequest({
         });
         if (reference.startsWith("INV_")) await markRentPaymentFailed(reference, data.gateway_response);
       }
+    }
+
+    // Lipa Mos Mos transfers to landlords: confirmation, failure or reversal
+    if (typeof event.event === "string" && event.event.startsWith("transfer.")) {
+      await handleLmmTransfer(event.event, (event as any).data);
     }
 
     res.status(200).json({

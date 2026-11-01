@@ -1,0 +1,1736 @@
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index 3219d4d..adad7f2 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -39,6 +39,12 @@ function myregisterDb(): admin.firestore.Firestore {
+ }
+ 
+ import { PAYSTACK_SECRET_KEY, PAYSTACK_API_BASE } from "./desk/paystack";
++import { handleLmmCharge, handleLmmTransfer } from "./lmm";
++import { alertOps as lmmAlert } from "./lmm/alert";
++import { firstName } from "./lmm/dear";
++import { createSealedRecipient } from "./lmm/recipient";
++import { LMM_SEAL_KEY } from "./lmm/seal";
++export { lmm_getPlan, lmm_start, lmm_pay, lmm_setupRecipient, lmm_recipientStatus, lmm_dailySweep } from "./lmm";
+ import { getDeskConfig } from "./desk/config";
+ import { rentRateForTier } from "./desk/rent";
+ import { initiateRentCharge } from "./desk/rentCharge";
+@@ -768,21 +774,21 @@ function buildSmsMessage(
+     switch (type) {
+         case SMS_TEMPLATES.NEW_INVOICE:
+             // params: tenantName, billingMonth, propertyName, agentName, agentPhone, agentEmail
+-            msg = `Dear ${params.tenantName}, your invoice for ${params.billingMonth} at ${params.propertyName} is ready. TOTAL AMOUNT: ${params.totalAmount}` +
++            msg = `Dear ${firstName(params.tenantName) || "Tenant"}, your invoice for ${params.billingMonth} at ${params.propertyName} is ready. TOTAL AMOUNT: ${params.totalAmount}` +
+                   ` Contact ${params.agentName} on ${params.agentPhone} for queries.` +
+                   ` PLOT YANGU`;
+             break;
+ 
+         case SMS_TEMPLATES.OVERDUE:
+             // params: tenantName, outstandingAmount, daysOverdue, propertyName
+-            msg = `Dear ${params.tenantName}, your rent at ${params.propertyName} is overdue by ${params.daysOverdue} day(s). ` + 
++            msg = `Dear ${firstName(params.tenantName) || "Tenant"}, your rent at ${params.propertyName} is overdue by ${params.daysOverdue} day(s). ` + 
+                   ` Outstanding: ${params.outstandingAmount}. Please pay to avoid late fees.` + 
+                   ` PLOT YANGU`;
+             break;
+ 
+         case SMS_TEMPLATES.PAYMENT_SUCCESS:
+             // params: tenantName, amountPaid, propertyUnit
+-            msg = `Dear ${params.tenantName}, ${params.agentName} has received your payment of ${params.amountPaid} for ${params.propertyUnit}. Thank you!` + 
++            msg = `Dear ${firstName(params.tenantName) || "Tenant"}, ${params.agentName} has received your payment of ${params.amountPaid} for ${params.propertyUnit}. Thank you!` + 
+                    ` PLOT YANGU`;
+             break;
+ 
+@@ -1292,7 +1298,7 @@ export const setupAccount = onCall({
+   maxInstances: 10,
+   region: "africa-south1",
+   cors: true,
+-  secrets: [PAYSTACK_SECRET_KEY],
++  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY],
+ }, async (request: CallableRequest<SetupAccountRequest>) => {
+   try {
+     //const paystackHeaders = getPaystackHeaders(PAYSTACK_SECRET_KEY.value());
+@@ -1500,6 +1506,16 @@ export const setupAccount = onCall({
+ 
+     console.log(`Successfully created subaccount for user ${userId}: ${subaccountData.subaccount_code}`);
+ 
++    // Lipa Mos Mos: the same account also becomes a sealed TRANSFER recipient. Only for the signed-in landlord themself, only from this
++    // request, and never allowed to fail the setup (a landlord without a recipient simply does not get Lipa Mos Mos).
++    if (!pId && request.auth.uid === userId) {
++      try {
++        const rr = await createSealedRecipient({ paystack: PAYSTACK_SECRET_KEY.value(), seal: LMM_SEAL_KEY.value() },
++          { landlordId: userId, settlementType, bankCode: validBankCode, accountNumber: formattedAccountNumber, name: businessName });
++        if (!rr.ok) console.warn(`Lipa Mos Mos recipient not created for ${userId}: ${rr.reason}`);
++      } catch (e: any) { console.warn("Lipa Mos Mos recipient step failed:", e?.message || e); }
++    }
++
+     return {
+       success: true,
+       message: "Subaccount created successfully",
+@@ -1863,7 +1879,7 @@ export const paystackCallback = onRequest({
+   cors: false,
+   maxInstances: 10,
+   region: "africa-south1",
+-  secrets: [PAYSTACK_SECRET_KEY],
++  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY],
+ }, async (req, res) => {
+   console.log(`Webhook request received: ${req.method}`);
+ 
+@@ -1885,6 +1901,7 @@ export const paystackCallback = onRequest({
+ 
+     if (hash !== expectedHash) {
+       console.error("Invalid signature");
++      if (/LMM_|lmm-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mos Mos webhook arrived with a bad signature");
+       res.status(400).json({ error: "Invalid signature" });
+       return;
+     }
+@@ -1908,8 +1925,13 @@ export const paystackCallback = onRequest({
+ 
+       console.log(`Identified charge type: ${chargeType}`);
+ 
++      // ── Lipa Mos Mos instalment: credited to the tenant's plan after Paystack verification ──────────
++      if (reference.startsWith("LMM_")) {
++        await handleLmmCharge(reference, data);
++      }
++
+       // ── Landlord Watch extra transcript (KES 99, company revenue) ─────────
+-      if (reference.startsWith("LWT_")) {
++      else if (reference.startsWith("LWT_")) {
+         await settleTranscriptPayment(db, reference, data, metadata);
+       }
+ 
+@@ -2013,7 +2035,9 @@ export const paystackCallback = onRequest({
+       console.warn(`Payment failed: ${reference} (type: ${chargeType})`);
+ 
+       // Update appropriate collection based on charge type
+-      if (reference.startsWith("LWT_")) {
++      if (reference.startsWith("LMM_")) {
++        await admin.firestore().collection("lmm_payments").doc(reference).update({ status: "failed", error: String(data.gateway_response ?? "").slice(0, 200) }).catch(() => undefined);
++      } else if (reference.startsWith("LWT_")) {
+         await failTranscriptPayment(db, reference, data.gateway_response);
+       } else if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
+         const targetDb = data.metadata?.targetProject === "pms" ? db : db2;
+@@ -2124,6 +2148,11 @@ export const paystackCallback = onRequest({
+       }
+     }
+ 
++    // Lipa Mos Mos transfers to landlords: confirmation, failure or reversal
++    if (typeof event.event === "string" && event.event.startsWith("transfer.")) {
++      await handleLmmTransfer(event.event, (event as any).data);
++    }
++
+     res.status(200).json({
+       received: true,
+       processed: true,
+diff --git a/functions/src/lmm/alert.ts b/functions/src/lmm/alert.ts
+new file mode 100644
+index 0000000..b03d13c
+--- /dev/null
++++ b/functions/src/lmm/alert.ts
+@@ -0,0 +1,21 @@
++// Anything odd goes to ONE fixed number (LMM.ALERT_MOBILE, in code). Alerts are de-duplicated per kind per hour so a loop cannot flood it.
++import * as admin from "firebase-admin";
++import { LMM } from "./config";
++import { sendSms } from "./sms";
++
++export type AlertKind =
++  | "SEAL_MISMATCH" | "RECIPIENT_MISMATCH" | "RECIPIENT_MISSING" | "AMOUNT_MISMATCH" | "PAYMENT_UNVERIFIED" | "OVER_CAP" | "TRANSFER_FAILED"
++  | "TRANSFER_REVERSED" | "OTP_REQUIRED" | "BAD_SIGNATURE" | "LOW_BALANCE" | "PLAN_MISMATCH" | "SETTLEMENT_STUCK" | "INVOICE_APPLY_FAILED" | "UNEXPECTED";
++
++/** Never throws, never blocks the payment path. Returns whether an SMS went out. */
++export async function alertOps(kind: AlertKind, detail: string): Promise<boolean> {
++  const line = `LMM ALERT ${kind}: ${detail}`.replace(/[^\x20-\x7E]/g, "").slice(0, 150);
++  console.error(line);
++  try {
++    const hour = new Date().toISOString().slice(0, 13).replace(/\D/g, "");
++    await admin.firestore().collection("lmm_alerts").doc(`${kind}_${hour}`).create({ detail: detail.slice(0, 500), createdAt: admin.firestore.FieldValue.serverTimestamp() });
++  } catch (e) {
++    if ((e as { code?: number }).code === 6) return false;   // already alerted this hour
++  }
++  return sendSms(LMM.ALERT_MOBILE, line);
++}
+diff --git a/functions/src/lmm/config.ts b/functions/src/lmm/config.ts
+new file mode 100644
+index 0000000..067228a
+--- /dev/null
++++ b/functions/src/lmm/config.ts
+@@ -0,0 +1,36 @@
++// Lipa Mos Mos (pay rent a little at a time). EVERY number that decides where money goes or how much lives here, in code.
++// Nothing in this file is read from Firestore: someone editing the database must not be able to loosen a limit or redirect an alert.
++export const LMM = {
++  /** Who is told when anything looks wrong (HostPinnacle MSISDN for 0791286165). */
++  ALERT_MOBILE: "254791286165",
++  /** Tenant surcharge on top of what is credited to their rent: 2.5% (Paystack 1.5% + 1% service), 5% for payments under KES 100. */
++  SURCHARGE_BPS: 250,
++  SMALL_SURCHARGE_BPS: 500,
++  SMALL_BELOW_MINOR: 10_000,            // KES 100
++  MIN_CREDIT_MINOR: 1_000,              // KES 10 (whole shillings only)
++  MAX_CREDIT_MINOR: 15_000_000,         // KES 150,000 per instalment
++  /** The landlord is paid when the plan reaches its target, or on this day of the month with whatever is in. */
++  SETTLE_DAY: 5,
++  MIN_SETTLEMENT_MINOR: 30_000,         // KES 300: below this the KES 95 transfer fee would eat the payout; it waits for the next run
++  MAX_SETTLEMENT_MINOR: 90_000_000,     // KES 900,000: the top of the transfer-fee table; nothing larger is ever sent automatically
++  WALLET_MAX_TRANSFER_MINOR: 15_000_000, // Paystack's M-PESA wallet limit per transfer
++  /** Hard ceiling on what this feature may send out in one Nairobi day, across all landlords. */
++  DAILY_OUTFLOW_CAP_MINOR: 200_000_000, // KES 2,000,000
++  /** Landlord/agency transfer fee, by the amount being transferred (minor units). Up to 10,000 -> 95 | below 40,000 -> 183 | up to 900,000 -> 257. */
++  FEE_TIERS: [
++    { upToMinor: 1_000_000, feeMinor: 9_500 },
++    { upToMinor: 3_999_999, feeMinor: 18_300 },
++    { upToMinor: 90_000_000, feeMinor: 25_700 },
++  ],
++  /** Reminder rhythm per plan frequency: days without a payment before a "missed" SMS, and the days between reminders. */
++  MISSED_AFTER_DAYS: { daily: 2, weekly: 8, biweekly: 15 },
++  MIN_DAYS_BETWEEN_SMS: 3,
++  MILESTONES: [25, 50, 75, 100],
++  /** A charge that was never confirmed is dead after this long. */
++  PENDING_PAYMENT_TTL_MS: 24 * 3_600_000,
++} as const;
++
++export type Frequency = "daily" | "weekly" | "biweekly";
++export const FREQUENCIES: readonly Frequency[] = ["daily", "weekly", "biweekly"];
++export const FREQUENCY_DAYS: Record<Frequency, number> = { daily: 1, weekly: 7, biweekly: 14 };
++export const isFrequency = (v: unknown): v is Frequency => typeof v === "string" && (FREQUENCIES as readonly string[]).includes(v);
+diff --git a/functions/src/lmm/dear.ts b/functions/src/lmm/dear.ts
+new file mode 100644
+index 0000000..d299c72
+--- /dev/null
++++ b/functions/src/lmm/dear.ts
+@@ -0,0 +1,10 @@
++// One greeting for every SMS: "Dear John" from "John Doe" (cut at the first space). Shared so no template builds its own.
++export function firstName(full: unknown): string {
++  const s = typeof full === "string" ? full.trim() : "";
++  const first = s.split(/\s+/)[0] ?? "";
++  // keep letters (any script), apostrophes and hyphens; drop anything that could break an SMS
++  const clean = first.replace(/[^\p{L}'’-]/gu, "");
++  return clean.length > 0 ? clean.charAt(0).toUpperCase() + clean.slice(1) : "";
++}
++/** "Dear John," or "Dear Tenant," when there is no usable name. */
++export const dearLine = (full: unknown): string => `Dear ${firstName(full) || "Tenant"},`;
+diff --git a/functions/src/lmm/fees.ts b/functions/src/lmm/fees.ts
+new file mode 100644
+index 0000000..0452e50
+--- /dev/null
++++ b/functions/src/lmm/fees.ts
+@@ -0,0 +1,56 @@
++// Lipa Mos Mos money maths. Pure, integer minor units (KES x 100). No imports but config.
++import { LMM } from "./config";
++
++/** Tenant surcharge in basis points: 5% for an instalment under KES 100, otherwise 2.5%. */
++export function surchargeBps(creditMinor: number): number {
++  return creditMinor < LMM.SMALL_BELOW_MINOR ? LMM.SMALL_SURCHARGE_BPS : LMM.SURCHARGE_BPS;
++}
++
++export function isValidCredit(creditMinor: unknown): creditMinor is number {
++  return typeof creditMinor === "number" && Number.isSafeInteger(creditMinor) && creditMinor % 100 === 0
++    && creditMinor >= LMM.MIN_CREDIT_MINOR && creditMinor <= LMM.MAX_CREDIT_MINOR;
++}
++
++export interface Charge { creditMinor: number; chargeMinor: number; surchargeMinor: number; surchargeBps: number }
++/**
++ * The tenant picks what should reach their rent (`creditMinor`, whole shillings). They are charged that plus the surcharge, rounded UP
++ * to a whole shilling (an M-PESA prompt is whole shillings). The rent is credited EXACTLY `creditMinor`, never the surcharge.
++ * Paystack takes 1.5% of the larger charge, so Samuhia keeps a little under 1% of the credited rent (never below 0.9%).
++ */
++export function chargeFor(creditMinor: number): Charge {
++  if (!isValidCredit(creditMinor)) throw new RangeError("credit must be whole shillings between the minimum and maximum instalment");
++  const bps = surchargeBps(creditMinor);
++  const raw = Math.ceil((creditMinor * (10_000 + bps)) / 10_000);
++  const chargeMinor = Math.ceil(raw / 100) * 100;
++  return { creditMinor, chargeMinor, surchargeMinor: chargeMinor - creditMinor, surchargeBps: bps };
++}
++
++/** What Samuhia keeps from one instalment, given the fee Paystack really took. Can be negative only if Paystack's fee exceeds the surcharge. */
++export const keptMinor = (c: Pick<Charge, "chargeMinor" | "creditMinor">, paystackFeeMinor: number): number => c.chargeMinor - c.creditMinor - paystackFeeMinor;
++
++/** Transfer fee charged to the landlord/agency for sending `amountMinor`. Throws above the top of the table: nothing that large goes out automatically. */
++export function transferFeeMinor(amountMinor: number): number {
++  if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) throw new RangeError("amount must be a positive integer");
++  const tier = LMM.FEE_TIERS.find((t) => amountMinor <= t.upToMinor);
++  if (!tier) throw new RangeError("amount is above the automatic transfer limit");
++  return tier.feeMinor;
++}
++
++export interface TransferChunk { grossMinor: number; feeMinor: number; sendMinor: number }
++/**
++ * Splits one settlement into the transfers to make. An M-PESA wallet takes at most KES 150,000 per transfer, so a larger settlement is
++ * split, each part carrying its own fee. Banks and tills take the whole amount in one transfer. Every part must clear its own fee.
++ */
++export function planTransfers(grossMinor: number, recipientType: "mobile_money" | "mobile_money_business" | "kepss"): TransferChunk[] {
++  if (!Number.isSafeInteger(grossMinor) || grossMinor < LMM.MIN_SETTLEMENT_MINOR) throw new RangeError("settlement is below the minimum");
++  if (grossMinor > LMM.MAX_SETTLEMENT_MINOR) throw new RangeError("settlement is above the automatic transfer limit");
++  // Wallet: as few transfers as the KES 150,000 limit allows, shared evenly so no part is a crumb. Bank / till: one transfer.
++  const n = recipientType === "mobile_money" ? Math.ceil(grossMinor / LMM.WALLET_MAX_TRANSFER_MINOR) : 1;
++  const base = Math.floor(grossMinor / n), extra = grossMinor - base * n;
++  const parts = Array.from({ length: n }, (_, i) => base + (i < extra ? 1 : 0));
++  return parts.map((g) => {
++    const feeMinor = transferFeeMinor(g);
++    if (g <= feeMinor) throw new RangeError("settlement does not cover its transfer fee");
++    return { grossMinor: g, feeMinor, sendMinor: g - feeMinor };
++  });
++}
+diff --git a/functions/src/lmm/index.ts b/functions/src/lmm/index.ts
+new file mode 100644
+index 0000000..53603a4
+--- /dev/null
++++ b/functions/src/lmm/index.ts
+@@ -0,0 +1,93 @@
++// Lipa Mos Mos: pay rent a little at a time. Money waits in Samuhia's Paystack balance, then the landlord is paid by transfer.
++import * as admin from "firebase-admin";
++import { onCall, HttpsError, CallableRequest } from "firebase-functions/v2/https";
++import { onSchedule } from "firebase-functions/v2/scheduler";
++import { PAYSTACK_SECRET_KEY } from "../desk/paystack";
++import { toMsisdn } from "../phone/safaricom";
++import { alertOps } from "./alert";
++import { LMM } from "./config";
++import { createSealedRecipient } from "./recipient";
++import { missedReminder } from "./reminders";
++import { LMM_SEAL_KEY } from "./seal";
++import { applySettlement, creditPayment, onTransferEvent, reconcileSent, sendSettlement, settlePlan, settlementsCol, type Secrets } from "./settle";
++import { plansCol, paymentsCol, resolveTarget, type PlanDoc } from "./plan";
++import { lmmText, sendOnce } from "./sms";
++
++export { lmm_getPlan, lmm_start, lmm_pay } from "./plan";
++
++export const lmmSecrets = (): Secrets => ({ paystack: PAYSTACK_SECRET_KEY.value(), seal: LMM_SEAL_KEY.value() });
++/** Called by the Paystack webhook (after it has verified the signature) for a charge.success whose reference starts with LMM_. */
++export const handleLmmCharge = (reference: string, data: { amount?: unknown }) => creditPayment(lmmSecrets(), reference, Number(data?.amount));
++/** Called by the webhook for transfer.success / transfer.failed / transfer.reversed. */
++export const handleLmmTransfer = (event: string, data: unknown) => onTransferEvent(lmmSecrets(), event, data);
++
++/**
++ * A signed-in landlord turns Lipa Mos Mos on for their registered payout account. The account is taken from THIS request, and it must
++ * match the account on their profile, so neither a tampered profile nor a stray request can create a recipient on its own.
++ */
++export const lmm_setupRecipient = onCall(
++  { region: "africa-south1", cors: true, timeoutSeconds: 60, memory: "256MiB", maxInstances: 5, secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY] },
++  async (request: CallableRequest<{ settlementType?: string; bankCode?: string; accountNumber?: string; name?: string }>) => {
++    if (!request.auth) throw new HttpsError("unauthenticated", "Sign in first");
++    const landlordId = request.auth.uid;
++    const d = request.data ?? {};
++    const prof = (await admin.firestore().collection("users").doc(landlordId).get()).data()?.paymentInfo;
++    if (!prof?.accountId) throw new HttpsError("failed-precondition", "Set up your payout account first");
++    const norm = (x: unknown) => String(x ?? "").replace(/\s+/g, "");
++    if (norm(prof.accountNumber) !== norm(d.accountNumber) || String(prof.settlementType ?? "") !== String(d.settlementType ?? "")) {
++      throw new HttpsError("invalid-argument", "These details do not match your registered payout account");
++    }
++    const r = await createSealedRecipient(lmmSecrets(), { landlordId, settlementType: String(d.settlementType ?? ""), bankCode: String(d.bankCode ?? prof.settlementBankCode ?? ""), accountNumber: String(d.accountNumber ?? ""), name: String(d.name ?? prof.businessName ?? prof.name ?? "Landlord") });
++    if (!r.ok) throw new HttpsError("failed-precondition", `Lipa Mos Mos is not available for this payout account: ${r.reason ?? "unsupported"}`);
++    return { ok: true };
++  });
++
++/** The signed-in landlord's own Lipa Mos Mos status (the recipient document itself is never readable by the app). */
++export const lmm_recipientStatus = onCall({ region: "africa-south1", cors: true, maxInstances: 5 }, async (request: CallableRequest<unknown>) => {
++  if (!request.auth) throw new HttpsError("unauthenticated", "Sign in first");
++  const r = (await admin.firestore().collection("lmm_recipients").doc(request.auth.uid).get()).data();
++  return r ? { status: r.status === "active" ? "active" : "unsupported", reason: r.status === "active" ? null : r.reason ?? null, last4: r.last4 ?? "" } : { status: "none", reason: null, last4: "" };
++});
++
++const eat = (now: number) => new Date(now + 3 * 3_600_000);
++
++/** 10:00 Nairobi daily: resume anything half-done, settle on the 5th, send reminders, expire dead charges. */
++export const lmm_dailySweep = onSchedule(
++  { schedule: "0 10 * * *", timeZone: "Africa/Nairobi", region: "africa-south1", timeoutSeconds: 540, memory: "512MiB", secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY] },
++  async () => {
++    const s = lmmSecrets(); const now = Date.now();
++    try {
++      // 1) finish what was left half-done
++      for (const d of (await settlementsCol().where("status", "in", ["locked", "paid_unapplied"]).get()).docs) {
++        const st = d.data();
++        try {
++          if (st.status === "locked") { await sendSettlement(s, d.id); await reconcileSent(s, d.id); if (now - Number(st.createdAt) > 24 * 3_600_000) await alertOps("SETTLEMENT_STUCK", `${d.id} is still not paid after 24h`); }
++          else await applySettlement(d.id);
++        } catch (e) { await alertOps("UNEXPECTED", `resume ${d.id}: ${(e as Error).message}`); }
++      }
++      // 2) the 5th: pay out whatever has been collected, even if the target was not reached (invoices become "partial")
++      if (eat(now).getUTCDate() === LMM.SETTLE_DAY) {
++        for (const d of (await plansCol().where("creditedMinor", ">", 0).get()).docs) {
++          try { await settlePlan(s, d.id, "fifth"); } catch (e) { await alertOps("UNEXPECTED", `settle ${d.id}: ${(e as Error).message}`); }
++        }
++      }
++      // 3) gentle reminders
++      for (const d of (await plansCol().where("status", "==", "active").get()).docs) {
++        const p = d.data() as PlanDoc;
++        try {
++          const { targetMinor, basis } = await resolveTarget(p.agentId, p.tenantId, p);
++          if (basis !== "invoices") continue;          // nothing is due yet (no open invoice): never nag
++          const remaining = targetMinor - p.creditedMinor;
++          const m = missedReminder({ frequency: p.frequency, status: p.status, remainingMinor: remaining, createdAt: p.createdAt, lastPaymentAt: p.lastPaymentAt, lastSmsAt: p.lastSmsAt, missedCount: p.missedCount }, now);
++          if (m.send && p.tenantPhone) {
++            const sent = await sendOnce(`miss_${d.id}_${eat(now).toISOString().slice(0, 10)}`, toMsisdn(p.tenantPhone), lmmText.missed({ name: p.tenantName, days: m.days, balanceMinor: remaining }));
++            if (sent) await d.ref.update({ lastSmsAt: now, missedCount: admin.firestore.FieldValue.increment(1) });
++          }
++        } catch (e) { console.error("LMM reminder failed", d.id, (e as Error).message); }
++      }
++      // 4) charges nobody confirmed
++      for (const st of ["initiating", "pending"]) {
++        for (const d of (await paymentsCol().where("status", "==", st).where("createdAt", "<", now - LMM.PENDING_PAYMENT_TTL_MS).get()).docs) await d.ref.update({ status: "expired" });
++      }
++    } catch (e) { await alertOps("UNEXPECTED", `sweep: ${(e as Error).message}`); }
++  });
+diff --git a/functions/src/lmm/invoices.ts b/functions/src/lmm/invoices.ts
+new file mode 100644
+index 0000000..a482268
+--- /dev/null
++++ b/functions/src/lmm/invoices.ts
+@@ -0,0 +1,71 @@
++// Reading a tenant's open invoices and crediting a settled amount to them, oldest first. Same fields and the same exactly-once guard
++// (`paystackRefs`) as the rest of PAY, so PMS and the reminder jobs keep working unchanged: a part-payment leaves status "partial".
++import * as admin from "firebase-admin";
++
++const db = () => admin.firestore();
++const r2 = (n: number) => Math.round(n * 100) / 100;
++
++export interface OpenInvoice { id: string; billingMonth: string; dueDate: string; outstandingMinor: number }
++
++/** The tenant's unpaid invoices, oldest due date first. */
++export async function openInvoices(agentId: string, tenantId: string): Promise<OpenInvoice[]> {
++  const base = db().collection("users").doc(agentId).collection("invoices");
++  let snap = await base.where("tenantId", "==", Number(tenantId)).get();
++  if (snap.empty) snap = await base.where("tenantId", "==", tenantId).get();
++  return snap.docs
++    .map((d) => { const x = d.data(); return { id: d.id, billingMonth: String(x.billingMonth ?? ""), dueDate: String(x.dueDate ?? ""), isPaid: x.isPaid === true, total: Number(x.totalAmount) || 0, paid: Number(x.amountPaid) || 0 }; })
++    .filter((x) => !x.isPaid && x.total - x.paid > 0.004)
++    .map((x) => ({ id: x.id, billingMonth: x.billingMonth, dueDate: x.dueDate, outstandingMinor: Math.round((x.total - x.paid) * 100) }))
++    .sort((a, b) => (a.dueDate || a.billingMonth).localeCompare(b.dueDate || b.billingMonth) || a.id.localeCompare(b.id));
++}
++
++/** Credits `amountMinor` to one invoice exactly once per `reference`. Returns what was applied (never more than the invoice still owed). */
++export async function creditInvoice(agentId: string, invoiceId: string, reference: string, amountMinor: number): Promise<{ appliedMinor: number; isPaid: boolean } | null> {
++  const ref = db().collection("users").doc(agentId).collection("invoices").doc(invoiceId);
++  return db().runTransaction(async (t) => {
++    const snap = await t.get(ref);
++    if (!snap.exists) return null;
++    const inv = snap.data() as Record<string, any>;
++    const total = Number(inv.totalAmount) || 0;
++    const before = Number(inv.amountPaid) || 0;
++    const refs: string[] = Array.isArray(inv.paystackRefs) ? inv.paystackRefs : [];
++    if (refs.includes(reference)) return { appliedMinor: 0, isPaid: before >= total - 0.005 };
++    const amountPaid = Math.min(r2(before + amountMinor / 100), total);
++    const appliedMinor = Math.round((amountPaid - before) * 100);
++    const isPaid = amountPaid >= total - 0.005;
++    t.update(ref, {
++      amountPaid, arrears: Math.max(0, r2(total - amountPaid)), isPaid, status: isPaid ? "paid" : "partial",
++      paidDate: isPaid ? new Date().toISOString().split("T")[0] : inv.paidDate ?? null,
++      paymentReference: reference, paystackRefs: admin.firestore.FieldValue.arrayUnion(reference), paidNotifiedAmount: amountPaid, hasPaid: isPaid,
++      lastModified: new Date().toISOString(),
++    });
++    return { appliedMinor, isPaid };
++  });
++}
++
++export interface Allocation { lines: { invoiceId: string; billingMonth: string; minor: number }[]; leftMinor: number }
++/** Decides, once, which invoices a settled amount goes to (oldest first). Pure given the open invoices. */
++export function allocate(open: OpenInvoice[], amountMinor: number): Allocation {
++  let left = amountMinor; const lines: Allocation["lines"] = [];
++  for (const inv of open) {
++    if (left <= 0) break;
++    const give = Math.min(left, inv.outstandingMinor);
++    if (give > 0) { lines.push({ invoiceId: inv.id, billingMonth: inv.billingMonth, minor: give }); left -= give; }
++  }
++  return { lines, leftMinor: left };
++}
++
++/** Applies a stored allocation. Safe to run again: each invoice is credited once per `settlementId:invoiceId`. */
++export async function applyAllocation(agentId: string, tenantId: string, tenantName: string, settlementId: string, a: Allocation): Promise<void> {
++  for (const line of a.lines) {
++    const res = await creditInvoice(agentId, line.invoiceId, `${settlementId}:${line.invoiceId}`, line.minor);
++    if (!res || res.appliedMinor <= 0) continue;
++    // the tenant's payment history (same place the normal rent flow writes it)
++    await db().collection("payments").doc(String(tenantId)).collection("billingMonths").doc(line.billingMonth || "unknown").set({
++      payments: admin.firestore.FieldValue.arrayUnion({
++        userName: tenantName, agentId, amount: res.appliedMinor / 100, invoiceId: line.invoiceId, billingMonth: line.billingMonth, currency: "KES",
++        reference: `${settlementId}:${line.invoiceId}`, status: "success", provider: "lipa-mos-mos", initiatedAt: new Date().toISOString(),
++      }), lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
++    }, { merge: true });
++  }
++}
+diff --git a/functions/src/lmm/plan.ts b/functions/src/lmm/plan.ts
+new file mode 100644
+index 0000000..8a2f668
+--- /dev/null
++++ b/functions/src/lmm/plan.ts
+@@ -0,0 +1,180 @@
++// Lipa Mos Mos plans and the tenant-facing callables. Public callables like processPayment: nothing in a request can choose WHERE
++// money goes (that is the landlord's sealed recipient) or HOW MUCH is credited (recomputed here and verified with Paystack later).
++import * as admin from "firebase-admin";
++import axios from "axios";
++import * as crypto from "crypto";
++import { HttpsError, onCall, CallableRequest } from "firebase-functions/v2/https";
++import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "../desk/paystack";
++import { checkSafaricomPhone, toMsisdn } from "../phone/safaricom";
++import { FREQUENCY_DAYS, LMM, isFrequency, type Frequency } from "./config";
++import { chargeFor, isValidCredit } from "./fees";
++import { openInvoices } from "./invoices";
++import { sendOnce, lmmText } from "./sms";
++
++const db = () => admin.firestore();
++export const plansCol = () => db().collection("lmm_plans");
++export const paymentsCol = () => db().collection("lmm_payments");
++
++export interface PlanDoc {
++  agentId: string; tenantId: string; tenantName: string; tenantPhone: string; frequency: Frequency; status: "active" | "paused";
++  creditedMinor: number;     // confirmed by Paystack, waiting in Samuhia's account for the next settlement
++  inFlightMinor: number;     // being transferred to the landlord right now
++  settledTotalMinor: number; unappliedMinor: number;   // paid out to the landlord but not yet matched to an invoice
++  settleSeq: number; lastPaymentAt: number; lastSmsAt: number; missedCount: number; milestonesSent: number[];
++  createdAt: number;
++}
++export const planIdOf = (agentId: string, tenantId: string): string => `${agentId}_${tenantId}`;
++const asId = (v: unknown, label: string): string => {
++  const s = String(v ?? "").trim();
++  if (!/^[A-Za-z0-9_-]{1,80}$/.test(s)) throw new HttpsError("invalid-argument", `${label} is not valid`);
++  return s;
++};
++
++/** Lipa Mos Mos is offered only when the landlord has a sealed, active recipient and the feature has not been paused. (Firestore can only pause it.) */
++export async function lmmAvailable(agentId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
++  const [cfg, rec] = await Promise.all([db().collection("lmm_config").doc("global").get(), db().collection("lmm_recipients").doc(agentId).get()]);
++  if (cfg.exists && cfg.data()?.enabled === false) return { ok: false, reason: "Lipa Mos Mos is paused right now. Please try again later." };
++  const r = rec.data();
++  if (!r || r.status !== "active") return { ok: false, reason: "This landlord has not enabled Lipa Mos Mos yet." };
++  return { ok: true };
++}
++
++async function loadTenant(agentId: string, tenantId: string) {
++  const snap = await db().collection("users").doc(agentId).collection("tenants").doc(tenantId).get();
++  if (!snap.exists) throw new HttpsError("not-found", "Tenant not found");
++  const t = snap.data() as Record<string, any>;
++  return { name: String(t.name ?? ""), phone: String(t.phone ?? ""), rentMinor: Math.max(0, Math.round((Number(t.rentAmount) || 0) * 100)), active: t.isActive !== false };
++}
++
++/** What the tenant owes right now: every open invoice (less money already paid to the landlord but not yet matched), else one month's rent. */
++export async function resolveTarget(agentId: string, tenantId: string, plan?: Pick<PlanDoc, "unappliedMinor">): Promise<{ targetMinor: number; basis: "invoices" | "rent" }> {
++  const open = await openInvoices(agentId, tenantId);
++  const unapplied = plan?.unappliedMinor ?? 0;
++  if (open.length > 0) return { targetMinor: Math.max(0, open.reduce((s, i) => s + i.outstandingMinor, 0) - unapplied), basis: "invoices" };
++  const t = await loadTenant(agentId, tenantId);
++  return { targetMinor: Math.max(0, t.rentMinor - unapplied), basis: "rent" };
++}
++
++/** Settlement day: the next 5th (Nairobi time), as YYYY-MM-DD. */
++export function nextSettleOn(now: number): string {
++  const d = new Date(now + 3 * 3_600_000);
++  let y = d.getUTCFullYear(), m = d.getUTCMonth();
++  if (d.getUTCDate() > LMM.SETTLE_DAY) { m += 1; if (m > 11) { m = 0; y += 1; } }
++  return `${y}-${String(m + 1).padStart(2, "0")}-${String(LMM.SETTLE_DAY).padStart(2, "0")}`;
++}
++
++/** A sensible instalment: what is left, spread over the payments between now and the 5th (never below the minimum, never above what is owed). */
++export function suggestInstalment(remainingMinor: number, frequency: Frequency, now: number): number {
++  if (remainingMinor <= 0) return 0;
++  const days = Math.max(1, Math.round((Date.parse(`${nextSettleOn(now)}T00:00:00+03:00`) - now) / 86_400_000));
++  const periods = Math.max(1, Math.floor(days / FREQUENCY_DAYS[frequency]));
++  const each = Math.ceil(remainingMinor / periods / 100) * 100;
++  return Math.min(remainingMinor, Math.max(LMM.MIN_CREDIT_MINOR, Math.min(each, LMM.MAX_CREDIT_MINOR)));
++}
++
++async function ensurePlan(agentId: string, tenantId: string, frequency: Frequency, now: number): Promise<{ id: string; plan: PlanDoc; created: boolean }> {
++  const id = planIdOf(agentId, tenantId);
++  const ref = plansCol().doc(id);
++  const snap = await ref.get();
++  if (snap.exists) {
++    const p = snap.data() as PlanDoc;
++    if (p.frequency !== frequency) await ref.update({ frequency });
++    return { id, plan: { ...p, frequency }, created: false };
++  }
++  const t = await loadTenant(agentId, tenantId);
++  if (!t.active) throw new HttpsError("failed-precondition", "This tenancy is not active");
++  const plan: PlanDoc = {
++    agentId, tenantId, tenantName: t.name, tenantPhone: t.phone, frequency, status: "active", creditedMinor: 0, inFlightMinor: 0, settledTotalMinor: 0,
++    unappliedMinor: 0, settleSeq: 0, lastPaymentAt: 0, lastSmsAt: 0, missedCount: 0, milestonesSent: [], createdAt: now,
++  };
++  try { await ref.create(plan); } catch (e) { if ((e as { code?: number }).code !== 6) throw e; }
++  return { id, plan, created: true };
++}
++
++const view = async (id: string, plan: PlanDoc, now: number) => {
++  const { targetMinor, basis } = await resolveTarget(plan.agentId, plan.tenantId, plan);
++  const remaining = Math.max(0, targetMinor - plan.creditedMinor);
++  return {
++    planId: id, frequency: plan.frequency, status: plan.status, basis, targetMinor, creditedMinor: plan.creditedMinor, remainingMinor: remaining,
++    pct: targetMinor > 0 ? Math.min(100, Math.floor((plan.creditedMinor * 100) / targetMinor)) : 100,
++    settlesOn: nextSettleOn(now), suggestedMinor: suggestInstalment(remaining, plan.frequency, now),
++  };
++};
++
++type Req = { agentId?: unknown; tenantId?: unknown; frequency?: unknown; amount?: unknown; phone?: unknown };
++const opts = { region: "africa-south1", cors: true, timeoutSeconds: 60, memory: "256MiB" as const, maxInstances: 10 };
++
++export const lmm_getPlan = onCall(opts, async (request: CallableRequest<Req>) => {
++  const agentId = asId(request.data?.agentId, "agentId"), tenantId = asId(request.data?.tenantId, "tenantId");
++  const avail = await lmmAvailable(agentId);
++  if (!avail.ok) return { available: false, reason: avail.reason };
++  const snap = await plansCol().doc(planIdOf(agentId, tenantId)).get();
++  const now = Date.now();
++  if (!snap.exists) {
++    const { targetMinor, basis } = await resolveTarget(agentId, tenantId);
++    return { available: true, plan: null, targetMinor, basis, settlesOn: nextSettleOn(now), suggestedMinor: suggestInstalment(targetMinor, "weekly", now) };
++  }
++  return { available: true, plan: await view(snap.id, snap.data() as PlanDoc, now) };
++});
++
++export const lmm_start = onCall(opts, async (request: CallableRequest<Req>) => {
++  const agentId = asId(request.data?.agentId, "agentId"), tenantId = asId(request.data?.tenantId, "tenantId");
++  if (!isFrequency(request.data?.frequency)) throw new HttpsError("invalid-argument", "Choose daily, weekly or biweekly");
++  const avail = await lmmAvailable(agentId);
++  if (!avail.ok) throw new HttpsError("failed-precondition", avail.reason);
++  const now = Date.now();
++  const { id, plan, created } = await ensurePlan(agentId, tenantId, request.data.frequency, now);
++  const v = await view(id, plan, now);
++  if (created && plan.tenantPhone && v.targetMinor > 0) {
++    await sendOnce(`start_${id}`, toMsisdn(plan.tenantPhone), lmmText.started({ name: plan.tenantName, targetMinor: v.targetMinor }));
++  }
++  return { available: true, plan: v };
++});
++
++export const lmm_pay = onCall({ ...opts, secrets: [PAYSTACK_SECRET_KEY] }, async (request: CallableRequest<Req>) => {
++  const agentId = asId(request.data?.agentId, "agentId"), tenantId = asId(request.data?.tenantId, "tenantId");
++  const phone = checkSafaricomPhone(request.data?.phone);
++  if (!phone.ok) throw new HttpsError("invalid-argument", phone.message);
++  const credit = Math.round(Number(request.data?.amount) * 100);
++  if (!isValidCredit(credit)) throw new HttpsError("invalid-argument", `Enter a whole-shilling amount from KES ${LMM.MIN_CREDIT_MINOR / 100} to KES ${(LMM.MAX_CREDIT_MINOR / 100).toLocaleString("en-KE")}`);
++  const avail = await lmmAvailable(agentId);
++  if (!avail.ok) throw new HttpsError("failed-precondition", avail.reason);
++
++  const now = Date.now();
++  const freq: Frequency = isFrequency(request.data?.frequency) ? request.data.frequency : "weekly";
++  const { id, plan } = await ensurePlan(agentId, tenantId, freq, now);
++  if (plan.status !== "active") throw new HttpsError("failed-precondition", "This plan is paused");
++  const { targetMinor } = await resolveTarget(agentId, tenantId, plan);
++  const remaining = targetMinor - plan.creditedMinor;
++  if (remaining <= 0) throw new HttpsError("failed-precondition", "Your rent is already fully covered. Your landlord will be paid shortly.");
++  if (credit > remaining) throw new HttpsError("invalid-argument", `That is more than you owe. The balance is KES ${(remaining / 100).toLocaleString("en-KE")}.`);
++
++  // no double prompts, no runaway attempts
++  const recent = await paymentsCol().where("planId", "==", id).where("createdAt", ">", now - 24 * 3_600_000).get();
++  if (recent.docs.some((d) => d.data().status === "initiating" || (d.data().status === "pending" && now - Number(d.data().createdAt) < 3 * 60_000))) {
++    throw new HttpsError("failed-precondition", "A payment prompt is already waiting on your phone. Please finish it, or wait a few minutes.");
++  }
++  if (recent.size >= 20) throw new HttpsError("resource-exhausted", "Too many attempts today. Please try again tomorrow.");
++
++  const c = chargeFor(credit);
++  const reference = `LMM_${tenantId}_${now.toString(36)}${crypto.randomBytes(3).toString("hex")}`.slice(0, 60);
++  const email = `tenant${tenantId}@samuhia.co.ke`;
++  await paymentsCol().doc(reference).set({
++    reference, planId: id, agentId, tenantId, phone: phone.e164, creditMinor: c.creditMinor, chargeMinor: c.chargeMinor, surchargeMinor: c.surchargeMinor,
++    surchargeBps: c.surchargeBps, status: "initiating", settled: false, createdAt: now,
++  });
++  try {
++    // NO split_code and NO subaccount: the money lands in Samuhia's own Paystack balance and waits for settlement.
++    const res = await axios.post(`${PAYSTACK_API_BASE}/charge`, {
++      email, amount: c.chargeMinor, currency: "KES", mobile_money: { phone: phone.e164, provider: "mpesa" }, reference,
++      metadata: { lmm: true, planId: id, creditMinor: c.creditMinor, chargeMinor: c.chargeMinor },
++    }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY.value()}`, "Content-Type": "application/json" }, timeout: 30_000 });
++    if (!res.data?.status) throw new Error(res.data?.message || "Paystack refused the charge");
++    await paymentsCol().doc(reference).update({ status: "pending" });
++    return { reference, status: res.data.data?.status ?? "pending", displayText: res.data.data?.display_text || "Check your phone for the M-PESA prompt", creditMinor: c.creditMinor, chargeMinor: c.chargeMinor, surchargeMinor: c.surchargeMinor };
++  } catch (err) {
++    await paymentsCol().doc(reference).update({ status: "failed", error: String((err as Error)?.message ?? err).slice(0, 200) });
++    const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || (err as Error)?.message || "Could not start the payment";
++    throw new HttpsError("internal", `Payment could not be started: ${msg}`);
++  }
++});
+diff --git a/functions/src/lmm/recipient.ts b/functions/src/lmm/recipient.ts
+new file mode 100644
+index 0000000..f668aab
+--- /dev/null
++++ b/functions/src/lmm/recipient.ts
+@@ -0,0 +1,87 @@
++// The landlord's TRANSFER recipient. Created only from a request the landlord themself signed in to make (never from whatever is in
++// Firestore later), sealed with a secret, and re-checked against Paystack immediately before every transfer.
++import * as admin from "firebase-admin";
++import axios from "axios";
++import { PAYSTACK_API_BASE } from "../desk/paystack";
++import { alertOps } from "./alert";
++import { fingerprint, sameSeal, sealRecipient } from "./seal";
++
++export type RecipientType = "mobile_money" | "mobile_money_business" | "kepss";
++export interface RecipientDoc {
++  landlordId: string; recipientCode: string; type: RecipientType; bankCode: string; fp: string; last4: string; name: string;
++  status: "active" | "unsupported"; reason?: string; seal: string; createdAt: admin.firestore.FieldValue | number;
++}
++const col = () => admin.firestore().collection("lmm_recipients");
++const auth = (secret: string) => ({ Authorization: `Bearer ${secret}`, "Content-Type": "application/json" });
++
++/** Which Paystack recipient type a landlord's settlement choice maps to. Airtel and Paybill cannot be sent to, so they get no plan. */
++export function recipientSpec(i: { settlementType: string; bankCode: string; accountNumber: string }):
++  { ok: true; type: RecipientType; bankCode: string; accountNumber: string } | { ok: false; reason: string } {
++  const t = String(i.settlementType || "").toLowerCase();
++  const code = String(i.bankCode || "").trim();
++  const acct = String(i.accountNumber || "").replace(/\s+/g, "");
++  if (!acct) return { ok: false, reason: "no account number" };
++  if (t === "airtel-ke" || /airtel/i.test(code)) return { ok: false, reason: "Airtel Money cannot receive transfers" };
++  if (t === "paybill" || /paybill/i.test(code)) return { ok: false, reason: "Paybill needs an account reference and is not supported" };
++  if (t === "till") return { ok: true, type: "mobile_money_business", bankCode: "MPTILL", accountNumber: acct };
++  if (t === "mpesa" || code.toUpperCase() === "MPESA") return { ok: true, type: "mobile_money", bankCode: "MPESA", accountNumber: acct };
++  if (code) return { ok: true, type: "kepss", bankCode: code, accountNumber: acct };
++  return { ok: false, reason: "unknown settlement type" };
++}
++
++/** Creates (or replaces) the landlord's sealed recipient. Safe to call again with the same details. Never throws: no recipient just means no Lipa Mos Mos. */
++export async function createSealedRecipient(
++  secrets: { paystack: string; seal: string },
++  i: { landlordId: string; settlementType: string; bankCode: string; accountNumber: string; name: string },
++): Promise<{ ok: boolean; reason?: string }> {
++  const spec = recipientSpec(i);
++  const fpOf = (bank: string, acct: string) => fingerprint(secrets.seal, bank, acct);
++  if (!spec.ok) {
++    const doc: RecipientDoc = { landlordId: i.landlordId, recipientCode: "", type: "mobile_money", bankCode: "", fp: "", last4: "", name: i.name, status: "unsupported", reason: spec.reason, seal: "", createdAt: Date.now() };
++    await col().doc(i.landlordId).set(doc);
++    return { ok: false, reason: spec.reason };
++  }
++  try {
++    const res = await axios.post(`${PAYSTACK_API_BASE}/transferrecipient`, {
++      type: spec.type, name: i.name.slice(0, 100), account_number: spec.accountNumber, bank_code: spec.bankCode, currency: "KES",
++    }, { headers: auth(secrets.paystack), timeout: 20_000 });
++    const code = String(res.data?.data?.recipient_code ?? "");
++    if (!res.data?.status || !/^RCP_[A-Za-z0-9]+$/.test(code)) return { ok: false, reason: "Paystack did not create the recipient" };
++    const fp = fpOf(spec.bankCode, spec.accountNumber);
++    const doc: RecipientDoc = {
++      landlordId: i.landlordId, recipientCode: code, type: spec.type, bankCode: spec.bankCode, fp, last4: spec.accountNumber.slice(-4), name: i.name, status: "active",
++      seal: sealRecipient(secrets.seal, { landlordId: i.landlordId, recipientCode: code, type: spec.type, bankCode: spec.bankCode, fp }), createdAt: Date.now(),
++    };
++    await col().doc(i.landlordId).set(doc);
++    return { ok: true };
++  } catch (err) {
++    const msg = (err as { response?: { data?: { message?: string } }; message?: string })?.response?.data?.message || (err as Error)?.message || "error";
++    console.error("LMM recipient creation failed:", msg);
++    return { ok: false, reason: String(msg).slice(0, 120) };
++  }
++}
++
++/**
++ * The recipient to pay, verified two ways: (1) the stored seal still matches (nobody edited the document), and (2) Paystack itself says
++ * this recipient code is active and still points at the account whose fingerprint we sealed. Any doubt -> alert + null.
++ */
++export async function getVerifiedRecipient(secrets: { paystack: string; seal: string }, landlordId: string): Promise<RecipientDoc | null> {
++  const snap = await col().doc(landlordId).get();
++  const r = snap.data() as RecipientDoc | undefined;
++  if (!r || r.status !== "active") { await alertOps("RECIPIENT_MISSING", `landlord ${landlordId} has no active recipient`); return null; }
++  const want = sealRecipient(secrets.seal, { landlordId, recipientCode: r.recipientCode, type: r.type, bankCode: r.bankCode, fp: r.fp });
++  if (r.landlordId !== landlordId || !sameSeal(r.seal, want)) { await alertOps("SEAL_MISMATCH", `recipient record for ${landlordId} was altered`); return null; }
++  try {
++    const res = await axios.get(`${PAYSTACK_API_BASE}/transferrecipient/${encodeURIComponent(r.recipientCode)}`, { headers: auth(secrets.paystack), timeout: 20_000 });
++    const d = res.data?.data;
++    const acct = String(d?.details?.account_number ?? "");
++    const bank = String(d?.details?.bank_code ?? "");
++    const ok = res.data?.status === true && d?.recipient_code === r.recipientCode && d?.active !== false && d?.is_deleted !== true && d?.isDeleted !== true
++      && d?.type === r.type && bank.toUpperCase() === r.bankCode.toUpperCase() && fingerprint(secrets.seal, bank, acct) === r.fp;
++    if (!ok) { await alertOps("RECIPIENT_MISMATCH", `Paystack recipient ${r.recipientCode} does not match what was sealed for ${landlordId}`); return null; }
++  } catch (err) {
++    await alertOps("RECIPIENT_MISMATCH", `could not verify recipient for ${landlordId}: ${(err as Error)?.message}`);
++    return null;
++  }
++  return r;
++}
+diff --git a/functions/src/lmm/reminders.ts b/functions/src/lmm/reminders.ts
+new file mode 100644
+index 0000000..5fcda41
+--- /dev/null
++++ b/functions/src/lmm/reminders.ts
+@@ -0,0 +1,23 @@
++// When to text a tenant about a missed payment. Pure. Not spammy: a reminder only after the plan's own quiet period, never closer
++// than MIN_DAYS_BETWEEN_SMS to any earlier SMS, and at most 3 per stretch of silence (a payment resets the count).
++import { FREQUENCY_DAYS, LMM, type Frequency } from "./config";
++
++export interface ReminderInput {
++  frequency: Frequency; status: string; remainingMinor: number; createdAt: number; lastPaymentAt: number; lastSmsAt: number; missedCount: number;
++}
++const DAY = 86_400_000;
++export function missedReminder(p: ReminderInput, now: number): { send: true; days: number } | { send: false } {
++  if (p.status !== "active" || p.remainingMinor <= 0 || p.missedCount >= 3) return { send: false };
++  const since = Math.max(p.lastPaymentAt, p.createdAt);
++  const days = Math.floor((now - since) / DAY);
++  const after = LMM.MISSED_AFTER_DAYS[p.frequency];
++  if (days < after) return { send: false };
++  const gap = Math.max(LMM.MIN_DAYS_BETWEEN_SMS, FREQUENCY_DAYS[p.frequency]);
++  if (p.lastSmsAt > 0 && now - p.lastSmsAt < gap * DAY) return { send: false };
++  return { send: true, days };
++}
++/** The highest milestone newly reached (25/50/75/100 %), or null. Everything at or below it counts as sent. */
++export function newMilestone(pct: number, sent: readonly number[]): number | null {
++  const crossed = LMM.MILESTONES.filter((m) => pct >= m && !sent.includes(m));
++  return crossed.length ? crossed[crossed.length - 1] : null;
++}
+diff --git a/functions/src/lmm/seal.ts b/functions/src/lmm/seal.ts
+new file mode 100644
+index 0000000..6b0e88f
+--- /dev/null
++++ b/functions/src/lmm/seal.ts
+@@ -0,0 +1,24 @@
++// Tamper-evidence for money destinations and amounts. The key lives in Secret Manager (never in Firestore, never in the client).
++// A value stored in Firestore is only trusted when its HMAC seal still matches; a mismatch blocks the transfer and raises an alert.
++import { defineSecret } from "firebase-functions/params";
++import * as crypto from "crypto";
++
++export const LMM_SEAL_KEY = defineSecret("LMM_SEAL_KEY");
++
++const hmac = (key: string, label: string, parts: ReadonlyArray<string | number>): string =>
++  crypto.createHmac("sha256", key).update([label, ...parts.map(String)].join("\u241f")).digest("hex");
++
++/** Peppered fingerprint of an account number, so the database never holds a bare copy that could be matched or edited in place. */
++export const fingerprint = (key: string, bankCode: string, accountNumber: string): string => hmac(key, "acct", [bankCode.toUpperCase(), accountNumber.replace(/\s+/g, "")]);
++
++export const sealRecipient = (key: string, r: { landlordId: string; recipientCode: string; type: string; bankCode: string; fp: string }): string =>
++  hmac(key, "recipient", [r.landlordId, r.recipientCode, r.type, r.bankCode.toUpperCase(), r.fp]);
++
++/** Everything that decides one settlement: the plan, the recipient, how much and in how many parts. Re-checked right before sending. */
++export const sealSettlement = (key: string, s: { id: string; planId: string; landlordId: string; recipientCode: string; grossMinor: number; sendMinors: number[]; paymentRefs: string[] }): string =>
++  hmac(key, "settlement", [s.id, s.planId, s.landlordId, s.recipientCode, s.grossMinor, s.sendMinors.join(","), [...s.paymentRefs].sort().join(",")]);
++
++export function sameSeal(a: unknown, b: string): boolean {
++  if (typeof a !== "string" || a.length !== b.length) return false;
++  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
++}
+diff --git a/functions/src/lmm/settle.ts b/functions/src/lmm/settle.ts
+new file mode 100644
+index 0000000..e918009
+--- /dev/null
++++ b/functions/src/lmm/settle.ts
+@@ -0,0 +1,257 @@
++// Crediting verified payments and settling to the landlord. Every step re-derives the money from Paystack's own records and the
++// sealed recipient; nothing that can be edited in Firestore decides where money goes or how much.
++import * as admin from "firebase-admin";
++import axios from "axios";
++import * as crypto from "crypto";
++import { PAYSTACK_API_BASE } from "../desk/paystack";
++import { alertOps } from "./alert";
++import { LMM } from "./config";
++import { chargeFor, keptMinor, planTransfers } from "./fees";
++import { allocate, applyAllocation, openInvoices, type Allocation } from "./invoices";
++import { paymentsCol, plansCol, resolveTarget, type PlanDoc } from "./plan";
++import { getVerifiedRecipient } from "./recipient";
++import { sameSeal, sealSettlement } from "./seal";
++import { lmmText, sendOnce } from "./sms";
++import { newMilestone } from "./reminders";
++import { toMsisdn } from "../phone/safaricom";
++
++export interface Secrets { paystack: string; seal: string }
++const db = () => admin.firestore();
++export const settlementsCol = () => db().collection("lmm_settlements");
++const hdr = (s: Secrets) => ({ Authorization: `Bearer ${s.paystack}`, "Content-Type": "application/json" });
++const FieldValue = admin.firestore.FieldValue;
++class Hold extends Error {}
++
++const eatDay = (now: number): string => new Date(now + 3 * 3_600_000).toISOString().slice(0, 10).replace(/-/g, "");
++
++// ---------------------------------------------------------------------------------------------------- Paystack reads
++export async function verifyCharge(s: Secrets, reference: string): Promise<{ ok: boolean; amount: number; fees: number }> {
++  try {
++    const res = await axios.get(`${PAYSTACK_API_BASE}/transaction/verify/${encodeURIComponent(reference)}`, { headers: hdr(s), timeout: 20_000 });
++    const d = res.data?.data;
++    const ok = res.data?.status === true && d?.status === "success" && d?.reference === reference && d?.currency === "KES";
++    return { ok, amount: Number(d?.amount), fees: Number.isFinite(Number(d?.fees)) ? Number(d.fees) : 0 };
++  } catch { return { ok: false, amount: NaN, fees: 0 }; }
++}
++
++// ---------------------------------------------------------------------------------------------------- 1. a payment arrives
++export async function creditPayment(s: Secrets, reference: string, webhookAmount: number): Promise<"credited" | "ignored" | "rejected"> {
++  const pref = paymentsCol().doc(reference);
++  const snap = await pref.get();
++  const p = snap.data();
++  if (!p) { await alertOps("PLAN_MISMATCH", `charge ${reference} has no LMM record`); return "rejected"; }
++  if (p.status === "credited") return "ignored";
++  const v = await verifyCharge(s, reference);
++  if (!v.ok) { await alertOps("PAYMENT_UNVERIFIED", `Paystack does not confirm ${reference}`); return "rejected"; }
++  let expected = -1;
++  try { expected = chargeFor(p.creditMinor).chargeMinor; } catch { /* tampered credit: falls through to the mismatch */ }
++  if (v.amount !== p.chargeMinor || v.amount !== expected || (Number.isFinite(webhookAmount) && webhookAmount !== v.amount)) {
++    await pref.update({ status: "rejected_amount", paidMinor: v.amount });
++    await alertOps("AMOUNT_MISMATCH", `${reference} paid ${v.amount}, expected ${expected}/${p.chargeMinor}. Needs a manual refund.`);
++    return "rejected";
++  }
++  const planRef = plansCol().doc(String(p.planId));
++  const credited = await db().runTransaction(async (tx) => {
++    const [ps, pl] = await Promise.all([tx.get(pref), tx.get(planRef)]);
++    if (ps.data()?.status === "credited") return false;
++    if (!pl.exists) throw new Hold("plan missing");
++    tx.update(pref, { status: "credited", creditedAt: Date.now(), paystackFeeMinor: v.fees, keptMinor: keptMinor({ chargeMinor: v.amount, creditMinor: p.creditMinor }, v.fees), settled: false });
++    tx.update(planRef, { creditedMinor: FieldValue.increment(p.creditMinor), lastPaymentAt: Date.now(), missedCount: 0 });
++    return true;
++  }).catch(async (e) => { if (e instanceof Hold) { await alertOps("PLAN_MISMATCH", `${reference}: ${e.message}`); return false; } throw e; });
++  if (!credited) return "ignored";
++  await afterCredit(s, String(p.planId));
++  return "credited";
++}
++
++async function afterCredit(s: Secrets, planId: string): Promise<void> {
++  try {
++    const pl = (await plansCol().doc(planId).get()).data() as PlanDoc;
++    const { targetMinor } = await resolveTarget(pl.agentId, pl.tenantId, pl);
++    const pct = targetMinor > 0 ? Math.min(100, Math.floor((pl.creditedMinor * 100) / targetMinor)) : 100;
++    const m = newMilestone(pct, pl.milestonesSent ?? []);
++    if (m !== null) {
++      await plansCol().doc(planId).update({ milestonesSent: FieldValue.arrayUnion(...[25, 50, 75, 100].filter((x) => x <= m)), lastSmsAt: Date.now() });
++      if (pl.tenantPhone) await sendOnce(`ms_${planId}_${pl.settleSeq}_${m}`, toMsisdn(pl.tenantPhone), lmmText.milestone({ name: pl.tenantName, pct: m, paidMinor: pl.creditedMinor, leftMinor: Math.max(0, targetMinor - pl.creditedMinor) }));
++    }
++    if (targetMinor > 0 && pl.creditedMinor >= targetMinor) await settlePlan(s, planId, "target");
++  } catch (err) { await alertOps("UNEXPECTED", `afterCredit ${planId}: ${(err as Error)?.message}`); }
++}
++
++// ---------------------------------------------------------------------------------------------------- 2. settle a plan
++export async function settlePlan(s: Secrets, planId: string, reason: "target" | "fifth"): Promise<string> {
++  const planRef = plansCol().doc(planId);
++  const plan = (await planRef.get()).data() as PlanDoc | undefined;
++  if (!plan || plan.creditedMinor <= 0) return "nothing";
++  if (plan.creditedMinor < LMM.MIN_SETTLEMENT_MINOR) return "below_minimum";
++
++  const paySnap = await paymentsCol().where("planId", "==", planId).where("status", "==", "credited").where("settled", "==", false).get();
++  const pays = paySnap.docs.map((d) => ({ ...(d.data() as { creditMinor: number; chargeMinor: number }), id: d.id }));
++  const gross = pays.reduce((sum, p) => sum + Number(p.creditMinor), 0);
++  if (pays.length === 0 || pays.length > 400) { await alertOps("PLAN_MISMATCH", `${planId}: ${pays.length} credited payments`); return "held"; }
++  if (gross !== plan.creditedMinor) { await alertOps("PLAN_MISMATCH", `${planId}: payments total ${gross} but plan says ${plan.creditedMinor}`); return "held"; }
++  if (gross > LMM.MAX_SETTLEMENT_MINOR) { await alertOps("OVER_CAP", `${planId}: ${gross} is above the automatic limit`); return "held"; }
++
++  const rec = await getVerifiedRecipient(s, plan.agentId);
++  if (!rec) return "held";
++  let chunks;
++  try { chunks = planTransfers(gross, rec.type); } catch (e) { await alertOps("AMOUNT_MISMATCH", `${planId}: ${(e as Error).message}`); return "held"; }
++
++  // every payment must still be exactly what Paystack says it was
++  const checks = await Promise.all(pays.map((p) => verifyCharge(s, p.id)));
++  const bad = pays.findIndex((p, i) => !checks[i].ok || checks[i].amount !== p.chargeMinor || chargeFor(p.creditMinor).chargeMinor !== checks[i].amount);
++  if (bad >= 0) { await alertOps("PAYMENT_UNVERIFIED", `${planId}: ${pays[bad].id} no longer matches Paystack`); return "held"; }
++
++  const seq = plan.settleSeq + 1;
++  const sid = `${planId}_${seq}`;
++  const base = crypto.createHash("sha256").update(sid).digest("hex").slice(0, 16);
++  const chunkDocs = chunks.map((c, i) => ({ i, grossMinor: c.grossMinor, feeMinor: c.feeMinor, sendMinor: c.sendMinor, attempt: 0, reference: `lmm-${base}-${i}-0`, status: "queued" }));
++  const paymentRefs = pays.map((p) => p.id);
++  const seal = sealSettlement(s.seal, { id: sid, planId, landlordId: plan.agentId, recipientCode: rec.recipientCode, grossMinor: gross, sendMinors: chunks.map((c) => c.sendMinor), paymentRefs });
++  const dayRef = db().collection("lmm_counters").doc(`out_${eatDay(Date.now())}`);
++
++  try {
++    await db().runTransaction(async (tx) => {
++      const [pl, day, ...ps] = await Promise.all([tx.get(planRef), tx.get(dayRef), ...paymentRefs.map((r) => tx.get(paymentsCol().doc(r)))]);
++      const cur = pl.data() as PlanDoc;
++      if (cur.settleSeq !== plan.settleSeq || cur.creditedMinor !== gross) throw new Hold("plan changed while settling");
++      if (ps.some((x) => x.data()?.status !== "credited" || x.data()?.settled !== false)) throw new Hold("a payment changed while settling");
++      const out = Number(day.data()?.outMinor ?? 0);
++      if (out + gross > LMM.DAILY_OUTFLOW_CAP_MINOR) throw new Hold("daily outflow cap");
++      tx.set(settlementsCol().doc(sid), {
++        id: sid, planId, agentId: plan.agentId, tenantId: plan.tenantId, tenantName: plan.tenantName, grossMinor: gross, reason, recipientCode: rec.recipientCode,
++        chunks: chunkDocs, refs: chunkDocs.map((c) => c.reference), paymentRefs, status: "locked", seal, createdAt: Date.now(),
++      });
++      for (const r of paymentRefs) tx.update(paymentsCol().doc(r), { settled: true, settlementId: sid });
++      tx.update(planRef, { settleSeq: seq, creditedMinor: FieldValue.increment(-gross), inFlightMinor: FieldValue.increment(gross) });
++      tx.set(dayRef, { outMinor: out + gross, updatedAt: Date.now() }, { merge: true });
++    });
++  } catch (e) {
++    if (e instanceof Hold) { if (/cap/.test(e.message)) await alertOps("OVER_CAP", `${planId}: today's outflow cap reached`); else console.warn("LMM settle held:", e.message); return "held"; }
++    throw e;
++  }
++  await sendSettlement(s, sid);
++  return "started";
++}
++
++// ---------------------------------------------------------------------------------------------------- 3. send the transfers
++export async function sendSettlement(s: Secrets, sid: string): Promise<void> {
++  const ref = settlementsCol().doc(sid);
++  const st = (await ref.get()).data();
++  if (!st || st.status !== "locked") return;
++  const want = sealSettlement(s.seal, { id: sid, planId: st.planId, landlordId: st.agentId, recipientCode: st.recipientCode, grossMinor: st.grossMinor, sendMinors: st.chunks.map((c: any) => c.sendMinor), paymentRefs: st.paymentRefs });
++  if (!sameSeal(st.seal, want)) { await ref.update({ status: "blocked" }); await alertOps("SEAL_MISMATCH", `settlement ${sid} was altered`); return; }
++  const rec = await getVerifiedRecipient(s, st.agentId);
++  if (!rec || rec.recipientCode !== st.recipientCode) return;   // alert already raised; stays locked, retried by the sweep
++
++  for (const c of st.chunks as any[]) {
++    if (c.status === "success" || c.status === "sent") continue;
++    try {
++      const res = await axios.post(`${PAYSTACK_API_BASE}/transfer`, {
++        source: "balance", amount: c.sendMinor, recipient: st.recipientCode, reference: c.reference, currency: "KES", reason: "Rent via Lipa Mos Mos",
++      }, { headers: hdr(s), timeout: 30_000 });
++      const status = String(res.data?.data?.status ?? "");
++      if (status === "otp") { await alertOps("OTP_REQUIRED", `Paystack wants an OTP for ${sid}. Turn off transfer confirmation in Paystack settings.`); return; }
++      if (status === "failed" || status === "reversed") { await setChunk(ref, c.i, { status: "queued", attempt: c.attempt + 1, reference: nextRef(sid, c) }, true); await alertOps("TRANSFER_FAILED", `${sid} part ${c.i} ${status}`); return; }
++      await setChunk(ref, c.i, { status: status === "success" ? "success" : "sent", transferCode: String(res.data?.data?.transfer_code ?? ""), sentAt: Date.now() });
++    } catch (err) {
++      const msg = String((err as { response?: { data?: { message?: string } } })?.response?.data?.message ?? (err as Error)?.message ?? "");
++      if (/balance/i.test(msg)) { await alertOps("LOW_BALANCE", `not enough Paystack balance for ${sid} (${c.sendMinor / 100})`); return; }
++      if (/duplicate/i.test(msg)) { await setChunk(ref, c.i, { status: "sent" }); continue; }   // the first attempt did go through; the webhook or sweep confirms it
++      await alertOps("TRANSFER_FAILED", `${sid} part ${c.i}: ${msg.slice(0, 80)}`);
++      if (c.attempt >= 2) await ref.update({ status: "failed" });
++      else await setChunk(ref, c.i, { attempt: c.attempt + 1, reference: nextRef(sid, c) }, true);
++      return;
++    }
++  }
++  await finalizeIfDone(s, sid);
++}
++
++const nextRef = (sid: string, c: { i: number; attempt: number }): string =>
++  `lmm-${crypto.createHash("sha256").update(sid).digest("hex").slice(0, 16)}-${c.i}-${c.attempt + 1}`;
++
++async function setChunk(ref: admin.firestore.DocumentReference, index: number, patch: Record<string, unknown>, newRef = false): Promise<void> {
++  await db().runTransaction(async (tx) => {
++    const d = (await tx.get(ref)).data();
++    if (!d) return;
++    const chunks = (d.chunks as any[]).map((c) => (c.i === index ? { ...c, ...patch } : c));
++    tx.update(ref, { chunks, ...(newRef ? { refs: FieldValue.arrayUnion(String(patch.reference)) } : {}) });
++  });
++}
++
++// ---------------------------------------------------------------------------------------------------- 4. confirmations
++export async function onTransferEvent(s: Secrets, event: string, d: any): Promise<void> {
++  const reference = String(d?.reference ?? "");
++  if (!reference.startsWith("lmm-")) return;
++  const q = await settlementsCol().where("refs", "array-contains", reference).limit(1).get();
++  if (q.empty) { await alertOps("PLAN_MISMATCH", `transfer ${reference} matches no settlement`); return; }
++  const ref = q.docs[0].ref; const st = q.docs[0].data();
++  const chunk = (st.chunks as any[]).find((c) => c.reference === reference);
++  if (!chunk) return;
++  if (Number(d?.amount) !== chunk.sendMinor || (d?.recipient?.recipient_code && d.recipient.recipient_code !== st.recipientCode)) {
++    await alertOps("AMOUNT_MISMATCH", `transfer ${reference}: amount or recipient differs from the settlement`); return;
++  }
++  if (event === "transfer.success") { if (chunk.status === "success") return; await setChunk(ref, chunk.i, { status: "success", confirmedAt: Date.now() }); await finalizeIfDone(s, st.id); return; }
++  if (event === "transfer.failed" || event === "transfer.reversed") {
++    await alertOps(event === "transfer.failed" ? "TRANSFER_FAILED" : "TRANSFER_REVERSED", `${st.id} part ${chunk.i}`);
++    if (chunk.attempt >= 2) await ref.update({ status: "failed" });
++    else await setChunk(ref, chunk.i, { status: "queued", attempt: chunk.attempt + 1, reference: nextRef(st.id, chunk) }, true);
++  }
++}
++
++async function finalizeIfDone(s: Secrets, sid: string): Promise<void> {
++  void s;
++  const ref = settlementsCol().doc(sid);
++  const moved = await db().runTransaction(async (tx) => {
++    const st = (await tx.get(ref)).data();
++    if (!st || st.status !== "locked" || !(st.chunks as any[]).every((c) => c.status === "success")) return null;
++    const planRef = plansCol().doc(st.planId);
++    tx.update(ref, { status: "paid_unapplied", paidAt: Date.now() });
++    tx.update(planRef, { inFlightMinor: FieldValue.increment(-st.grossMinor), settledTotalMinor: FieldValue.increment(st.grossMinor), milestonesSent: [] });
++    return st;
++  });
++  if (moved) await applySettlement(sid);
++}
++
++/** Matches the settled money to invoices (decided once, stored, then applied exactly once per invoice), then tells the tenant. */
++export async function applySettlement(sid: string): Promise<void> {
++  const ref = settlementsCol().doc(sid);
++  let st = (await ref.get()).data();
++  if (!st || (st.status !== "paid_unapplied")) return;
++  try {
++    let alloc: Allocation = st.allocation;
++    if (!alloc) {
++      alloc = allocate(await openInvoices(st.agentId, st.tenantId), st.grossMinor);
++      await ref.update({ allocation: alloc });   // fixed here, so a re-run applies the same lines
++    }
++    await applyAllocation(st.agentId, st.tenantId, st.tenantName, sid, alloc);
++    await db().runTransaction(async (tx) => {
++      const cur = (await tx.get(ref)).data();
++      if (!cur || cur.status !== "paid_unapplied") return;
++      tx.update(ref, { status: "paid" });
++      if (alloc.leftMinor > 0) tx.update(plansCol().doc(st!.planId), { unappliedMinor: FieldValue.increment(alloc.leftMinor) });
++    });
++    st = (await ref.get()).data();
++    const pl = (await plansCol().doc(st!.planId).get()).data() as PlanDoc;
++    // what is STILL owed on open invoices (not next month's rent, which is not due yet)
++    const owed = (await openInvoices(pl.agentId, pl.tenantId)).reduce((sum, i) => sum + i.outstandingMinor, 0);
++    if (pl.tenantPhone) await sendOnce(`paid_${sid}`, toMsisdn(pl.tenantPhone), lmmText.landlordPaid({ name: pl.tenantName, paidMinor: st!.grossMinor, leftMinor: Math.max(0, owed - pl.creditedMinor) }));
++  } catch (err) { await alertOps("INVOICE_APPLY_FAILED", `${sid}: ${(err as Error)?.message}`); }
++}
++
++/** Sweep helper: ask Paystack about transfers that were sent but never confirmed by webhook. */
++export async function reconcileSent(s: Secrets, sid: string): Promise<void> {
++  const ref = settlementsCol().doc(sid);
++  const st = (await ref.get()).data();
++  if (!st || st.status !== "locked") return;
++  for (const c of st.chunks as any[]) {
++    if (c.status !== "sent") continue;
++    try {
++      const res = await axios.get(`${PAYSTACK_API_BASE}/transfer/verify/${encodeURIComponent(c.reference)}`, { headers: hdr(s), timeout: 20_000 });
++      const d = res.data?.data;
++      if (d?.status === "success" && Number(d.amount) === c.sendMinor) await setChunk(ref, c.i, { status: "success", confirmedAt: Date.now() });
++      else if (d?.status === "failed" || d?.status === "reversed") await onTransferEvent(s, `transfer.${d.status}`, d);
++    } catch { /* try again next sweep */ }
++  }
++  await finalizeIfDone(s, sid);
++}
+diff --git a/functions/src/lmm/sms.ts b/functions/src/lmm/sms.ts
+new file mode 100644
+index 0000000..9cf98af
+--- /dev/null
++++ b/functions/src/lmm/sms.ts
+@@ -0,0 +1,62 @@
++// Lipa Mos Mos SMS: sender, message texts (each under 144 characters, each starting "Dear {first name},") and send-once logging.
++import * as admin from "firebase-admin";
++import axios from "axios";
++import { dearLine } from "./dear";
++
++const MAX = 144;
++
++/** Plain GSM-safe text, hard-capped at 144 characters (the texts below are written shorter; this is the safety net). */
++export function fit144(text: string): string {
++  const clean = text.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}]/gu, "").replace(/[^\x20-\x7E]/g, "").replace(/\s+/g, " ").trim();
++  return clean.length <= MAX ? clean : clean.slice(0, MAX).trimEnd();
++}
++
++export const kes = (minor: number): string => {
++  const v = minor / 100;
++  return `KES ${Number.isInteger(v) ? v.toLocaleString("en-KE") : v.toLocaleString("en-KE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
++};
++
++export const lmmText = {
++  started: (p: { name: string; targetMinor: number }) =>
++    fit144(`${dearLine(p.name)} your Lipa Mos Mos plan for ${kes(p.targetMinor)} rent is on. Pay a little at a time. Landlord is paid on the 5th. Samuhia Payments.`),
++  missed: (p: { name: string; days: number; balanceMinor: number }) =>
++    fit144(`${dearLine(p.name)} no Lipa Mos Mos payment for ${p.days} days. Balance ${kes(p.balanceMinor)}. Pay any amount on WhatsApp or Samuhia Payments.`),
++  milestone: (p: { name: string; pct: number; paidMinor: number; leftMinor: number }) =>
++    p.pct >= 100
++      ? fit144(`${dearLine(p.name)} well done! Your rent is fully paid (${kes(p.paidMinor)}). Your landlord will be paid shortly.`)
++      : fit144(`${dearLine(p.name)} well done! You have paid ${p.pct}% of your rent (${kes(p.paidMinor)}). ${kes(p.leftMinor)} to go. Keep going.`),
++  landlordPaid: (p: { name: string; paidMinor: number; leftMinor: number }) =>
++    p.leftMinor > 0
++      ? fit144(`${dearLine(p.name)} ${kes(p.paidMinor)} was sent to your landlord today. Balance ${kes(p.leftMinor)} stays on your plan.`)
++      : fit144(`${dearLine(p.name)} your landlord has been paid ${kes(p.paidMinor)} for rent. Thank you for using Lipa Mos Mos.`),
++};
++
++/** Low-level HostPinnacle send (same account and variables as the rest of PAY). Never throws. */
++export async function sendSms(mobile: string, message: string): Promise<boolean> {
++  try {
++    const { HP_SMS_USERID, HP_SMS_PASSWORD, HP_SMS_APIKEY, HP_SMS_SENDERID } = process.env;
++    if (!HP_SMS_USERID || !HP_SMS_APIKEY) { console.warn("LMM SMS skipped: HostPinnacle credentials not configured"); return false; }
++    const params = new URLSearchParams({
++      userid: HP_SMS_USERID, password: HP_SMS_PASSWORD || "", sendMethod: "quick", mobile, msg: message,
++      senderid: HP_SMS_SENDERID || "", msgType: "text", duplicatecheck: "true", output: "json",
++    });
++    const res = await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", params.toString(), {
++      headers: { apikey: HP_SMS_APIKEY, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10_000,
++    });
++    const d = res.data;
++    return !(d?.status === "error" || d?.ErrorCode !== undefined || (typeof d?.status === "string" && d.status.toLowerCase().includes("fail")));
++  } catch (err) {
++    console.error("LMM SMS failed:", (err as Error)?.message);
++    return false;
++  }
++}
++
++/** Sends at most once per `key` (a webhook repeat or a re-run of the sweep never texts the tenant twice). */
++export async function sendOnce(key: string, mobile: string, message: string): Promise<boolean> {
++  const ref = admin.firestore().collection("lmm_sms_log").doc(key.slice(0, 200));
++  try { await ref.create({ mobile: mobile.slice(-4), createdAt: admin.firestore.FieldValue.serverTimestamp(), status: "sending" }); }
++  catch (e) { if ((e as { code?: number }).code === 6) return false; throw e; }
++  const ok = await sendSms(mobile, message);
++  if (ok) await ref.update({ status: "sent" }); else await ref.delete();
++  return ok;
++}
+diff --git a/functions/test/lmm-fake-firestore.js b/functions/test/lmm-fake-firestore.js
+new file mode 100644
+index 0000000..7d9a5a8
+--- /dev/null
++++ b/functions/test/lmm-fake-firestore.js
+@@ -0,0 +1,62 @@
++/* In-memory Firestore for the Lipa Mos Mos flow test: transactions, FieldValue.increment / arrayUnion / delete, create(), and where() with
++ * ==, >, <, in and array-contains. (The desk fake is == only.) */
++const admin = require("firebase-admin");
++const clone = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
++const kind = (v) => (v && typeof v === "object" ? v.constructor.name : "");
++let auto = 0;
++function applyUpdate(cur, data) {
++  const next = { ...cur };
++  for (const [k, v] of Object.entries(data)) {
++    const t = kind(v);
++    if (t === "DeleteTransform") delete next[k];
++    else if (t === "NumericIncrementTransform") next[k] = (Number(next[k]) || 0) + v.operand;
++    else if (t === "ArrayUnionTransform") { const a = Array.isArray(next[k]) ? [...next[k]] : []; for (const e of v.elements) if (!a.some((x) => JSON.stringify(x) === JSON.stringify(e))) a.push(clone(e)); next[k] = a; }
++    else if (t === "ServerTimestampTransform") next[k] = Date.now();
++    else next[k] = clone(v);
++  }
++  return next;
++}
++class Snap { constructor(db, path, data) { this.ref = new DocRef(db, path); this.id = this.ref.id; this._d = data; this.exists = data !== undefined; } data() { return this._d === undefined ? undefined : clone(this._d); } }
++class QSnap { constructor(docs) { this.docs = docs; this.size = docs.length; this.empty = docs.length === 0; } }
++class DocRef {
++  constructor(db, path) { this._db = db; this.path = path; this.id = path.split("/").pop(); }
++  collection(n) { return new CollRef(this._db, `${this.path}/${n}`); }
++  async get() { return new Snap(this._db, this.path, this._db.store.get(this.path)); }
++  async set(d, o) { const cur = this._db.store.get(this.path); this._db.store.set(this.path, o && o.merge && cur ? applyUpdate(cur, d) : applyUpdate({}, d)); }
++  async create(d) { if (this._db.store.has(this.path)) throw Object.assign(new Error("6 ALREADY_EXISTS " + this.path), { code: 6 }); this._db.store.set(this.path, applyUpdate({}, d)); }
++  async update(d) { const cur = this._db.store.get(this.path); if (cur === undefined) throw Object.assign(new Error("NOT_FOUND " + this.path), { code: 5 }); this._db.store.set(this.path, applyUpdate(cur, d)); }
++  async delete() { this._db.store.delete(this.path); }
++}
++const ops = { "==": (a, b) => a === b, ">": (a, b) => a > b, "<": (a, b) => a < b, in: (a, b) => b.includes(a), "array-contains": (a, b) => Array.isArray(a) && a.includes(b) };
++class CollRef {
++  constructor(db, path, f = [], lim = null) { this._db = db; this.path = path; this._f = f; this._l = lim; }
++  doc(id) { return new DocRef(this._db, `${this.path}/${id || "auto" + ++auto}`); }
++  where(field, op, value) { if (!ops[op]) throw new Error("fake: unsupported op " + op); return new CollRef(this._db, this.path, [...this._f, { field, op, value }], this._l); }
++  orderBy() { return this; }
++  limit(n) { return new CollRef(this._db, this.path, this._f, n); }
++  async get() {
++    const depth = this.path.split("/").length + 1; let docs = [];
++    for (const [p, d] of this._db.store) { if (!p.startsWith(this.path + "/") || p.split("/").length !== depth) continue; if (this._f.every(({ field, op, value }) => ops[op](d[field], value))) docs.push(new Snap(this._db, p, d)); }
++    if (this._l !== null) docs = docs.slice(0, this._l);
++    return new QSnap(docs);
++  }
++}
++class FakeDb {
++  constructor() { this.store = new Map(); }
++  doc(p) { return new DocRef(this, p); }
++  collection(p) { return new CollRef(this, p); }
++  async runTransaction(fn) {
++    const writes = [];
++    const tx = { get: async (r) => r.get(), set: (r, d, o) => writes.push(() => r.set(d, o)), create: (r, d) => writes.push(() => r.create(d)), update: (r, d) => writes.push(() => r.update(d)), delete: (r) => writes.push(() => r.delete()) };
++    const out = await fn(tx); for (const w of writes) await w(); return out;
++  }
++  seed(p, d) { this.store.set(p, clone(d)); }
++  read(p) { return clone(this.store.get(p)); }
++  list(prefix) { return [...this.store.keys()].filter((p) => p.startsWith(prefix + "/")); }
++}
++/** Makes `admin.firestore()` return `db`, keeping `admin.firestore.FieldValue`. */
++function install(db) {
++  const real = admin.firestore; const fn = () => db; Object.assign(fn, real);
++  Object.defineProperty(admin, "firestore", { value: fn, configurable: true, writable: true });
++}
++module.exports = { FakeDb, install };
+diff --git a/functions/test/lmm-flow.check.js b/functions/test/lmm-flow.check.js
+new file mode 100644
+index 0000000..e8b5280
+--- /dev/null
++++ b/functions/test/lmm-flow.check.js
+@@ -0,0 +1,218 @@
++/* Lipa Mos Mos end to end against an in-memory Firestore and a mocked Paystack/SMS (no network, no emulator).
++ * Run:  cd functions && npm run build && node test/lmm-flow.check.js   (exit 1 on failure) */
++process.env.PAYSTACK_SECRET_KEY = "sk_test_x"; process.env.LMM_SEAL_KEY = "seal-key-for-tests";
++process.env.HP_SMS_USERID = "u"; process.env.HP_SMS_APIKEY = "k"; process.env.HP_SMS_PASSWORD = "p"; process.env.HP_SMS_SENDERID = "s";
++const assert = require("assert");
++const path = require("path");
++const axios = require("axios");
++const { FakeDb, install } = require("./lmm-fake-firestore");
++const db = new FakeDb(); install(db);
++const lib = (p) => require(path.join(__dirname, "..", "lib", "lmm", p));
++const settle = lib("settle"), plan = lib("plan"), rec = lib("recipient"), index = lib("index"), cfg = lib("config");
++
++const SECRETS = { paystack: "sk_test_x", seal: "seal-key-for-tests" };
++const KES = (n) => n * 100;
++let passed = 0, failed = 0;
++const sms = [], transfers = [], otpAttempts = [], charges = new Map(), recipients = new Map();
++let transferMode = "pending";        // "pending" | "otp" | "nobalance"
++const resetPaystack = () => { sms.length = 0; transfers.length = 0; otpAttempts.length = 0; charges.clear(); recipients.clear(); transferMode = "pending"; };
++
++axios.post = async (url, body) => {
++  if (url.includes("hostpinnacle")) { const p = new URLSearchParams(body); sms.push({ mobile: p.get("mobile"), msg: p.get("msg") }); return { data: { status: "success" } }; }
++  if (url.endsWith("/transferrecipient")) { const code = "RCP_test" + (recipients.size + 1); recipients.set(code, { type: body.type, bank_code: body.bank_code, account_number: body.account_number }); return { data: { status: true, data: { recipient_code: code } } }; }
++  if (url.endsWith("/charge")) { assert.ok(!("split_code" in body) && !("subaccount" in body) && !("split" in body), "LMM charges must never carry a split"); charges.set(body.reference, { amount: body.amount, status: "pending" }); return { data: { status: true, data: { status: "pay_offline", display_text: "Enter PIN" } } }; }
++  if (url.endsWith("/transfer")) {
++    if (transferMode === "nobalance") throw Object.assign(new Error("x"), { response: { data: { message: "Your balance is not enough to fulfil this request" } } });
++    if (transferMode === "otp") { otpAttempts.push(body); return { data: { status: true, data: { status: "otp", transfer_code: "TRF_otp" } } }; }
++    transfers.push(body); return { data: { status: true, data: { status: "pending", transfer_code: "TRF_" + transfers.length } } };
++  }
++  throw new Error("unexpected POST " + url);
++};
++axios.get = async (url) => {
++  let m = url.match(/\/transaction\/verify\/(.+)$/);
++  if (m) { const c = charges.get(decodeURIComponent(m[1])); if (!c) throw new Error("404"); return { data: { status: true, data: { status: c.status, reference: decodeURIComponent(m[1]), amount: c.amount, currency: "KES", fees: Math.round(c.amount * 0.015) } } }; }
++  m = url.match(/\/transferrecipient\/(.+)$/);
++  if (m) { const r = recipients.get(decodeURIComponent(m[1])); if (!r) throw new Error("404"); return { data: { status: true, data: { recipient_code: decodeURIComponent(m[1]), type: r.type, active: true, details: { account_number: r.account_number, bank_code: r.bank_code } } } }; }
++  m = url.match(/\/transfer\/verify\/(.+)$/);
++  if (m) { const t = transfers.find((x) => x.reference === decodeURIComponent(m[1])); return { data: { status: true, data: { status: t ? "success" : "failed", amount: t ? t.amount : 0 } } }; }
++  throw new Error("unexpected GET " + url);
++};
++
++const world = async ({ rent = 10000, invoiceTotal = 10000 } = {}) => {
++  db.store.clear(); resetPaystack();
++  db.seed("users/A1", { paymentInfo: { accountId: "ACCT_1", settlementType: "bank", settlementBankCode: "068", accountNumber: "1234567890", businessName: "Landlord Ltd" } });
++  db.seed("users/A1/tenants/1", { name: "John Doe", phone: "0712345678", rentAmount: rent, isActive: true });
++  if (invoiceTotal) db.seed("users/A1/invoices/I1", { tenantId: 1, billingMonth: "2026-11", dueDate: "2026-11-05", totalAmount: invoiceTotal, amountPaid: 0, arrears: invoiceTotal, isPaid: false });
++  const r = await rec.createSealedRecipient(SECRETS, { landlordId: "A1", settlementType: "bank", bankCode: "068", accountNumber: "1234567890", name: "Landlord Ltd" });
++  assert.ok(r.ok);
++  const out = await plan.lmm_start.run({ data: { agentId: "A1", tenantId: "1", frequency: "weekly" } });
++  assert.ok(out.available);
++};
++/** Tenant pays `kes` and Paystack confirms it. Returns the credit result. */
++const payAndConfirm = async (kes, { paidMinorDelta = 0 } = {}) => {
++  const out = await plan.lmm_pay.run({ data: { agentId: "A1", tenantId: "1", amount: kes, phone: "0712345678" } });
++  const c = charges.get(out.reference); c.status = "success"; c.amount += paidMinorDelta;
++  db.store.get(`lmm_payments/${out.reference}`).status = "pending"; db.store.get(`lmm_payments/${out.reference}`).createdAt = 1;   // let the next prompt through
++  return { reference: out.reference, result: await settle.creditPayment(SECRETS, out.reference, c.amount), out };
++};
++const alerts = () => sms.filter((s) => s.mobile === cfg.LMM.ALERT_MOBILE);
++const tenantSms = () => sms.filter((s) => s.mobile === "254712345678").map((s) => s.msg);
++const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
++
++(async () => {
++  await ok("plan starts, tenant is charged 2.5% extra, the charge has NO split, and the rent is credited exactly", async () => {
++    await world();
++    assert.deepStrictEqual(tenantSms().length, 1); assert.match(tenantSms()[0], /^Dear John, your Lipa Mos Mos plan for KES 10,000 rent is on\./);
++    const { out, result } = await payAndConfirm(3000);
++    assert.deepStrictEqual([out.creditMinor, out.chargeMinor, out.surchargeMinor], [KES(3000), KES(3075), KES(75)]);
++    assert.strictEqual(result, "credited");
++    const p = db.read("lmm_plans/A1_1"); assert.strictEqual(p.creditedMinor, KES(3000));
++    assert.ok(tenantSms().some((m) => /^Dear John, well done! You have paid 25% of your rent \(KES 3,000\)\./.test(m)), tenantSms().join(" | "));
++    assert.strictEqual(transfers.length, 0, "nothing is sent before the target or the 5th");
++  });
++
++  await ok("a webhook sent twice credits once", async () => {
++    await world();
++    const { reference } = await payAndConfirm(2000);
++    assert.strictEqual(await settle.creditPayment(SECRETS, reference, charges.get(reference).amount), "ignored");
++    assert.strictEqual(db.read("lmm_plans/A1_1").creditedMinor, KES(2000));
++  });
++
++  await ok("reaching the invoice settles the landlord: one transfer of the full amount minus the KES 95 fee, to the SEALED recipient", async () => {
++    await world();
++    await payAndConfirm(4000); await payAndConfirm(3000); await payAndConfirm(3000);
++    assert.strictEqual(transfers.length, 1);
++    const t = transfers[0]; assert.deepStrictEqual([t.source, t.amount, t.recipient, t.currency], ["balance", KES(10000 - 95), "RCP_test1", "KES"]); assert.match(t.reference, /^lmm-[0-9a-f]{16}-0-0$/);
++    const st = db.read("lmm_settlements/A1_1_1"); assert.strictEqual(st.status, "locked"); assert.strictEqual(db.read("lmm_plans/A1_1").inFlightMinor, KES(10000));
++    // Paystack confirms
++    await settle.onTransferEvent(SECRETS, "transfer.success", { reference: t.reference, amount: t.amount, recipient: { recipient_code: "RCP_test1" } });
++    const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.status, inv.amountPaid, inv.arrears], [true, "paid", 10000, 0]);
++    assert.strictEqual(db.read("lmm_settlements/A1_1_1").status, "paid"); const p = db.read("lmm_plans/A1_1"); assert.deepStrictEqual([p.inFlightMinor, p.settledTotalMinor, p.creditedMinor], [0, KES(10000), 0]);
++    assert.ok(tenantSms().some((m) => /^Dear John, your landlord has been paid KES 10,000 for rent\./.test(m)), tenantSms().join(" | "));
++    // replayed webhook changes nothing
++    const before = JSON.stringify([...db.store]); await settle.onTransferEvent(SECRETS, "transfer.success", { reference: t.reference, amount: t.amount, recipient: { recipient_code: "RCP_test1" } });
++    assert.strictEqual(JSON.stringify([...db.store]), before);
++  });
++
++  await ok("on the 5th, a partly paid invoice is settled and marked PARTIAL; the rest stays on the plan", async () => {
++    await world({ invoiceTotal: 20000 });
++    await payAndConfirm(5000);
++    assert.strictEqual(transfers.length, 0);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "started");
++    assert.strictEqual(transfers[0].amount, KES(5000 - 95));
++    await settle.onTransferEvent(SECRETS, "transfer.success", { reference: transfers[0].reference, amount: transfers[0].amount, recipient: { recipient_code: "RCP_test1" } });
++    const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.status, inv.amountPaid, inv.arrears], [false, "partial", 5000, 15000]);
++    assert.ok(tenantSms().some((m) => /^Dear John, KES 5,000 was sent to your landlord today\. Balance KES 15,000 stays on your plan\./.test(m)), tenantSms().join(" | "));
++  });
++
++  await ok("a new invoice retargets the plan; with no invoice the target is a month's rent", async () => {
++    await world({ rent: 8000, invoiceTotal: 0 });
++    assert.strictEqual((await plan.lmm_getPlan.run({ data: { agentId: "A1", tenantId: "1" } })).plan.targetMinor, KES(8000));
++    db.seed("users/A1/invoices/I9", { tenantId: 1, billingMonth: "2026-11", dueDate: "2026-11-05", totalAmount: 9500, amountPaid: 0, isPaid: false });
++    assert.strictEqual((await plan.lmm_getPlan.run({ data: { agentId: "A1", tenantId: "1" } })).plan.targetMinor, KES(9500));
++  });
++
++  await ok("settlement with no open invoice still pays the landlord and keeps the credit to apply to the next invoice", async () => {
++    await world({ rent: 8000, invoiceTotal: 0 });
++    await payAndConfirm(8000);                      // target (rent) reached
++    assert.strictEqual(transfers.length, 1);
++    await settle.onTransferEvent(SECRETS, "transfer.success", { reference: transfers[0].reference, amount: transfers[0].amount, recipient: { recipient_code: "RCP_test1" } });
++    assert.strictEqual(db.read("lmm_plans/A1_1").unappliedMinor, KES(8000));
++    db.seed("users/A1/invoices/I2", { tenantId: 1, billingMonth: "2026-12", dueDate: "2026-12-05", totalAmount: 8000, amountPaid: 0, isPaid: false });
++    assert.strictEqual((await plan.lmm_getPlan.run({ data: { agentId: "A1", tenantId: "1" } })).plan.targetMinor, 0, "already paid ahead");
++  });
++
++  await ok("TAMPER: editing the recipient record blocks the transfer and texts 0791286165", async () => {
++    await world(); await payAndConfirm(5000);
++    db.store.get("lmm_recipients/A1").recipientCode = "RCP_attacker";
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /SEAL_MISMATCH/.test(a.msg)), JSON.stringify(alerts()));
++  });
++  await ok("TAMPER: swapping the account on Paystack's side (recipient no longer matches the seal) blocks the transfer", async () => {
++    await world(); await payAndConfirm(5000);
++    recipients.get("RCP_test1").account_number = "9999999999";
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /RECIPIENT_MISMATCH/.test(a.msg)));
++  });
++  await ok("TAMPER: inflating a payment's credited amount in Firestore cannot raise the transfer", async () => {
++    await world(); const { reference } = await payAndConfirm(5000);
++    const p = db.store.get(`lmm_payments/${reference}`); p.creditMinor = KES(9000); db.store.get("lmm_plans/A1_1").creditedMinor = KES(9000);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /PAYMENT_UNVERIFIED|AMOUNT_MISMATCH/.test(a.msg)));
++  });
++  await ok("TAMPER: raising the plan's credited total without matching payments is caught", async () => {
++    await world(); await payAndConfirm(5000);
++    db.store.get("lmm_plans/A1_1").creditedMinor = KES(9000);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /PLAN_MISMATCH/.test(a.msg)));
++  });
++  await ok("TAMPER: editing the settlement between locking and sending blocks the send", async () => {
++    await world(); transferMode = "otp"; await payAndConfirm(10000);              // locks, then Paystack asks for an OTP: nothing sent
++    assert.ok(alerts().some((a) => /OTP_REQUIRED/.test(a.msg))); assert.strictEqual(db.read("lmm_settlements/A1_1_1").status, "locked");
++    db.store.get("lmm_settlements/A1_1_1").chunks[0].sendMinor = KES(99999);
++    transferMode = "pending"; sms.length = 0;
++    await settle.sendSettlement(SECRETS, "A1_1_1");
++    assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /SEAL_MISMATCH/.test(a.msg))); assert.strictEqual(db.read("lmm_settlements/A1_1_1").status, "blocked");
++  });
++  await ok("OTP still required: nothing is sent, an alert goes out, and once it is off the SAME settlement sends exactly once", async () => {
++    await world(); transferMode = "otp"; await payAndConfirm(10000);
++    assert.ok(alerts().some((a) => /OTP_REQUIRED/.test(a.msg)));
++    transferMode = "pending"; await settle.sendSettlement(SECRETS, "A1_1_1"); await settle.sendSettlement(SECRETS, "A1_1_1");
++    assert.strictEqual(transfers.length, 1, "exactly one real transfer"); assert.ok(otpAttempts.length >= 1 && transfers[0].reference === otpAttempts[0].reference, "same reference throughout");
++    assert.strictEqual(db.read("lmm_settlements/A1_1_1").chunks[0].status, "sent");
++  });
++  await ok("an under- or over-paid charge is never credited, and an alert goes out", async () => {
++    await world();
++    const { result } = await payAndConfirm(3000, { paidMinorDelta: -100 });
++    assert.strictEqual(result, "rejected"); assert.strictEqual(db.read("lmm_plans/A1_1").creditedMinor, 0); assert.ok(alerts().some((a) => /AMOUNT_MISMATCH/.test(a.msg)));
++  });
++  await ok("an unconfirmed charge (Paystack says not successful) is never credited", async () => {
++    await world();
++    const out = await plan.lmm_pay.run({ data: { agentId: "A1", tenantId: "1", amount: 3000, phone: "0712345678" } });
++    assert.strictEqual(await settle.creditPayment(SECRETS, out.reference, charges.get(out.reference).amount), "rejected");
++    assert.strictEqual(db.read("lmm_plans/A1_1").creditedMinor, 0);
++  });
++  await ok("the daily outflow cap stops a settlement and alerts", async () => {
++    await world(); await payAndConfirm(5000);
++    const day = new Date(Date.now() + 3 * 3_600_000).toISOString().slice(0, 10).replace(/-/g, "");
++    db.seed(`lmm_counters/out_${day}`, { outMinor: cfg.LMM.DAILY_OUTFLOW_CAP_MINOR });
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /OVER_CAP/.test(a.msg)));
++  });
++  await ok("below the KES 300 minimum nothing is sent (the fee would eat it)", async () => {
++    await world(); await payAndConfirm(200);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "below_minimum"); assert.strictEqual(transfers.length, 0);
++  });
++  await ok("a failed transfer is retried with a NEW reference (max 3 tries), with alerts", async () => {
++    await world(); await payAndConfirm(10000);
++    const t0 = transfers[0];
++    await settle.onTransferEvent(SECRETS, "transfer.failed", { reference: t0.reference, amount: t0.amount, recipient: { recipient_code: "RCP_test1" } });
++    assert.ok(alerts().some((a) => /TRANSFER_FAILED/.test(a.msg)));
++    await settle.sendSettlement(SECRETS, "A1_1_1");
++    assert.strictEqual(transfers.length, 2); assert.notStrictEqual(transfers[1].reference, t0.reference); assert.match(transfers[1].reference, /-0-1$/);
++  });
++  await ok("a transfer event with a different amount or recipient is not trusted", async () => {
++    await world(); await payAndConfirm(10000);
++    const t0 = transfers[0];
++    await settle.onTransferEvent(SECRETS, "transfer.success", { reference: t0.reference, amount: t0.amount + 100, recipient: { recipient_code: "RCP_test1" } });
++    await settle.onTransferEvent(SECRETS, "transfer.success", { reference: t0.reference, amount: t0.amount, recipient: { recipient_code: "RCP_attacker" } });
++    assert.strictEqual(db.read("lmm_settlements/A1_1_1").status, "locked"); assert.ok(alerts().some((a) => /AMOUNT_MISMATCH/.test(a.msg)));
++  });
++  await ok("Airtel and Paybill landlords get no plan, and tenants are told", async () => {
++    db.store.clear(); resetPaystack();
++    db.seed("users/A2", { paymentInfo: { accountId: "X" } });
++    await rec.createSealedRecipient(SECRETS, { landlordId: "A2", settlementType: "airtel-ke", bankCode: "ATL", accountNumber: "0733000000", name: "L" });
++    const out = await plan.lmm_getPlan.run({ data: { agentId: "A2", tenantId: "1" } });
++    assert.strictEqual(out.available, false); await assert.rejects(plan.lmm_start.run({ data: { agentId: "A2", tenantId: "1", frequency: "daily" } }), /not enabled/);
++  });
++  await ok("instalments are validated server-side (whole shillings, min, max, no overpaying, Safaricom only)", async () => {
++    await world();
++    const pay = (amount, phone = "0712345678") => plan.lmm_pay.run({ data: { agentId: "A1", tenantId: "1", amount, phone } });
++    await assert.rejects(pay(5), /whole-shilling/); await assert.rejects(pay(1000.5), /whole-shilling/); await assert.rejects(pay(20000), /more than you owe/);
++    await assert.rejects(pay(1000, "0733123456"), /Safaricom/i);
++    const small = await pay(50); assert.deepStrictEqual([small.creditMinor, small.chargeMinor], [KES(50), KES(53)]);   // 5% for under KES 100: 52.5 -> 53
++  });
++
++  console.log(`\n${passed} passed, ${failed} failed`);
++  process.exit(failed ? 1 : 0);
++})();
+diff --git a/functions/test/lmm.check.js b/functions/test/lmm.check.js
+new file mode 100644
+index 0000000..23620c4
+--- /dev/null
++++ b/functions/test/lmm.check.js
+@@ -0,0 +1,117 @@
++/* Lipa Mos Mos: fee maths, transfer fees and splitting, sealing, name cut, reminders, message lengths.
++ * Run:  cd functions && npm run build && node test/lmm.check.js   (exit 1 on failure) */
++const assert = require("assert");
++const path = require("path");
++const lib = (p) => require(path.join(__dirname, "..", "lib", "lmm", p));
++const F = lib("fees"), C = lib("config"), D = lib("dear"), S = lib("seal"), R = lib("reminders"), T = lib("sms"), RC = lib("recipient");
++let passed = 0, failed = 0;
++const ok = (name, fn) => { try { fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
++const KES = (n) => n * 100;
++
++ok("tenant surcharge: 2.5% normally, 5% under KES 100; rent credited EXACTLY what was chosen", () => {
++  const a = F.chargeFor(KES(1000)); assert.deepStrictEqual([a.creditMinor, a.chargeMinor, a.surchargeBps], [KES(1000), KES(1025), 250]);
++  const b = F.chargeFor(KES(99)); assert.deepStrictEqual([b.chargeMinor, b.surchargeBps], [KES(104), 500]);   // 99 + 5% = 103.95 -> 104
++  const c = F.chargeFor(KES(100)); assert.strictEqual(c.surchargeBps, 250);
++  const d = F.chargeFor(KES(10)); assert.deepStrictEqual([d.chargeMinor, d.surchargeBps], [KES(11), 500]);   // 10.5 -> 11
++});
++ok("only whole shillings between the minimum and maximum are accepted", () => {
++  for (const bad of [0, 999, 1050, 15_000_100, -1000, 12.5, NaN, "1000"]) assert.throws(() => F.chargeFor(bad), RangeError, String(bad));
++  assert.ok(F.isValidCredit(KES(10)) && F.isValidCredit(KES(150000)));
++});
++ok("Samuhia keeps about 0.96% of the credited rent (never below 0.9%) after Paystack's 1.5% of the bigger charge", () => {
++  for (const credit of [KES(1000), KES(5000), KES(25000), KES(100000)]) {
++    const c = F.chargeFor(credit), fee = Math.round(c.chargeMinor * 0.015), kept = F.keptMinor(c, fee);
++    assert.ok(kept / credit > 0.009 && kept / credit < 0.0101, `${credit}: ${kept / credit}`);
++  }
++});
++ok("a small instalment still leaves Samuhia a positive amount", () => {
++  for (const kes of [10, 20, 50, 99]) { const c = F.chargeFor(KES(kes)); assert.ok(F.keptMinor(c, Math.round(c.chargeMinor * 0.015)) > 0, String(kes)); }
++});
++ok("transfer fee tiers: <=10,000 -> 95, <40,000 -> 183, <=900,000 -> 257, above -> refused", () => {
++  assert.strictEqual(F.transferFeeMinor(KES(300)), KES(95)); assert.strictEqual(F.transferFeeMinor(KES(10000)), KES(95));
++  assert.strictEqual(F.transferFeeMinor(KES(10000) + 1), KES(183)); assert.strictEqual(F.transferFeeMinor(KES(39999)), KES(183)); assert.strictEqual(F.transferFeeMinor(KES(39999.99)), KES(183));
++  assert.strictEqual(F.transferFeeMinor(KES(40000)), KES(257)); assert.strictEqual(F.transferFeeMinor(KES(900000)), KES(257));
++  assert.throws(() => F.transferFeeMinor(KES(900000) + 1), RangeError); assert.throws(() => F.transferFeeMinor(0), RangeError);
++});
++ok("a settlement must cover its own fee and the minimum; the landlord receives gross minus the fee", () => {
++  assert.throws(() => F.planTransfers(KES(299), "kepss"), RangeError);
++  const [t] = F.planTransfers(KES(25000), "kepss"); assert.deepStrictEqual([t.grossMinor, t.feeMinor, t.sendMinor], [KES(25000), KES(183), KES(24817)]);
++  assert.throws(() => F.planTransfers(KES(900001), "kepss"), RangeError);
++});
++ok("M-PESA wallet settlements above KES 150,000 are split evenly, each part within the limit and paying its own fee", () => {
++  const one = F.planTransfers(KES(150000), "mobile_money"); assert.strictEqual(one.length, 1);
++  const parts = F.planTransfers(KES(400000), "mobile_money");
++  assert.strictEqual(parts.length, 3); assert.strictEqual(parts.reduce((s, p) => s + p.grossMinor, 0), KES(400000));
++  assert.ok(parts.every((p) => p.grossMinor <= C.LMM.WALLET_MAX_TRANSFER_MINOR && p.sendMinor === p.grossMinor - p.feeMinor));
++  assert.strictEqual(F.planTransfers(KES(400000), "kepss").length, 1, "banks take it in one");
++  const odd = F.planTransfers(KES(150000) + 1, "mobile_money"); assert.strictEqual(odd.reduce((s, p) => s + p.grossMinor, 0), KES(150000) + 1);
++});
++
++ok("Dear {first name}: cut at the first space, tidy, safe", () => {
++  assert.strictEqual(D.dearLine("John Doe"), "Dear John,"); assert.strictEqual(D.dearLine("  mary   wanjiku "), "Dear Mary,");
++  assert.strictEqual(D.dearLine(""), "Dear Tenant,"); assert.strictEqual(D.dearLine(undefined), "Dear Tenant,"); assert.strictEqual(D.dearLine("O'Brien Pat"), "Dear O'Brien,");
++  assert.strictEqual(D.firstName("J0hn\nDoe"), "Jhn");
++});
++
++ok("seals: any change to the recipient or the settlement breaks them", () => {
++  const k = "unit-test-key", r = { landlordId: "L1", recipientCode: "RCP_abc", type: "kepss", bankCode: "068", fp: S.fingerprint(k, "068", "1234567890") };
++  const seal = S.sealRecipient(k, r);
++  assert.ok(S.sameSeal(seal, S.sealRecipient(k, r)));
++  for (const [f, v] of [["landlordId", "L2"], ["recipientCode", "RCP_xyz"], ["type", "mobile_money"], ["bankCode", "070"], ["fp", S.fingerprint(k, "068", "9999999999")]]) assert.ok(!S.sameSeal(seal, S.sealRecipient(k, { ...r, [f]: v })), f);
++  assert.ok(!S.sameSeal(seal, S.sealRecipient("other-key", r)), "a different key never validates");
++  const s = { id: "p_1", planId: "p", landlordId: "L1", recipientCode: "RCP_abc", grossMinor: KES(5000), sendMinors: [KES(4817)], paymentRefs: ["a", "b"] };
++  const ss = S.sealSettlement(k, s);
++  for (const [f, v] of [["grossMinor", KES(9000)], ["recipientCode", "RCP_evil"], ["sendMinors", [KES(9000)]], ["paymentRefs", ["a"]], ["landlordId", "L9"]]) assert.ok(!S.sameSeal(ss, S.sealSettlement(k, { ...s, [f]: v })), f);
++  assert.ok(S.sameSeal(ss, S.sealSettlement(k, { ...s, paymentRefs: ["b", "a"] })), "ref order does not matter");
++  assert.ok(!S.sameSeal(undefined, seal) && !S.sameSeal("short", seal));
++});
++ok("the account fingerprint ignores spaces and bank-code case, but not digits", () => {
++  const k = "k"; assert.strictEqual(S.fingerprint(k, "mpesa", "0712 345 678"), S.fingerprint(k, "MPESA", "0712345678")); assert.notStrictEqual(S.fingerprint(k, "MPESA", "0712345678"), S.fingerprint(k, "MPESA", "0712345679"));
++});
++
++ok("recipient types: wallet, till and bank map correctly; Airtel and Paybill are refused", () => {
++  assert.deepStrictEqual(RC.recipientSpec({ settlementType: "mpesa", bankCode: "MPESA", accountNumber: "0712345678" }), { ok: true, type: "mobile_money", bankCode: "MPESA", accountNumber: "0712345678" });
++  assert.strictEqual(RC.recipientSpec({ settlementType: "till", bankCode: "x", accountNumber: "123456" }).type, "mobile_money_business");
++  assert.strictEqual(RC.recipientSpec({ settlementType: "bank", bankCode: "068", accountNumber: "123" }).type, "kepss");
++  assert.strictEqual(RC.recipientSpec({ settlementType: "airtel-ke", bankCode: "ATL", accountNumber: "0733" }).ok, false);
++  assert.strictEqual(RC.recipientSpec({ settlementType: "paybill", bankCode: "x", accountNumber: "1" }).ok, false);
++  assert.strictEqual(RC.recipientSpec({ settlementType: "bank", bankCode: "068", accountNumber: "" }).ok, false);
++});
++
++ok("reminders: quiet period per frequency, spacing, a cap of 3, silent when nothing is owed", () => {
++  const day = 86_400_000, now = 100 * day, base = { frequency: "weekly", status: "active", remainingMinor: KES(5000), createdAt: now - 30 * day, lastPaymentAt: now - 9 * day, lastSmsAt: 0, missedCount: 0 };
++  assert.deepStrictEqual(R.missedReminder(base, now), { send: true, days: 9 });
++  assert.strictEqual(R.missedReminder({ ...base, lastPaymentAt: now - 5 * day }, now).send, false, "weekly waits 8 days");
++  assert.strictEqual(R.missedReminder({ ...base, frequency: "daily", lastPaymentAt: now - 2 * day }, now).send, true);
++  assert.strictEqual(R.missedReminder({ ...base, frequency: "biweekly", lastPaymentAt: now - 14 * day }, now).send, false);
++  assert.strictEqual(R.missedReminder({ ...base, lastSmsAt: now - 2 * day }, now).send, false, "no SMS closer than the spacing");
++  assert.strictEqual(R.missedReminder({ ...base, lastSmsAt: now - 8 * day }, now).send, true);
++  assert.strictEqual(R.missedReminder({ ...base, missedCount: 3 }, now).send, false);
++  assert.strictEqual(R.missedReminder({ ...base, remainingMinor: 0 }, now).send, false); assert.strictEqual(R.missedReminder({ ...base, status: "paused" }, now).send, false);
++  assert.strictEqual(R.missedReminder({ ...base, lastPaymentAt: 0, createdAt: now - 1 * day }, now).send, false, "a new plan is not 'missed'");
++});
++ok("milestones: only the highest newly reached one, never repeated", () => {
++  assert.strictEqual(R.newMilestone(10, []), null); assert.strictEqual(R.newMilestone(30, []), 25); assert.strictEqual(R.newMilestone(80, []), 75);
++  assert.strictEqual(R.newMilestone(80, [25, 50, 75]), null); assert.strictEqual(R.newMilestone(100, [25, 50, 75]), 100); assert.strictEqual(R.newMilestone(60, [25]), 50);
++});
++
++ok("every SMS starts 'Dear {first name},', stays under 144 characters, even with the longest realistic values", () => {
++  const long = "Christopher Wanjiru-Kamau";
++  const msgs = [
++    T.lmmText.started({ name: long, targetMinor: KES(1_250_000) }), T.lmmText.missed({ name: long, days: 15, balanceMinor: KES(1_250_000) }),
++    T.lmmText.milestone({ name: long, pct: 50, paidMinor: KES(1_250_000), leftMinor: KES(1_250_000) }), T.lmmText.milestone({ name: long, pct: 100, paidMinor: KES(1_250_000), leftMinor: 0 }),
++    T.lmmText.landlordPaid({ name: long, paidMinor: KES(1_250_000), leftMinor: KES(1_250_000) }), T.lmmText.landlordPaid({ name: long, paidMinor: KES(1_250_000), leftMinor: 0 }),
++  ];
++  for (const m of msgs) { assert.ok(m.length <= 144, `${m.length}: ${m}`); assert.ok(m.startsWith("Dear Christopher,"), m); }
++  assert.ok(T.lmmText.started({ name: "John Doe", targetMinor: KES(25000) }).startsWith("Dear John,"));
++  assert.strictEqual(T.fit144("x".repeat(300)).length, 144); assert.ok(!/[^\x20-\x7E]/.test(T.fit144("Hi 😀 café")));
++});
++
++ok("hard limits live in code and match the spec", () => {
++  assert.strictEqual(C.LMM.ALERT_MOBILE, "254791286165"); assert.strictEqual(C.LMM.SETTLE_DAY, 5);
++  assert.strictEqual(C.LMM.SURCHARGE_BPS, 250); assert.strictEqual(C.LMM.SMALL_SURCHARGE_BPS, 500); assert.ok(Object.isFrozen === Object.isFrozen);
++  assert.deepStrictEqual(C.FREQUENCIES, ["daily", "weekly", "biweekly"]);
++});
++
++console.log(`\n${passed} passed, ${failed} failed`);
++process.exit(failed ? 1 : 0);
+diff --git a/src/AgentView.tsx b/src/AgentView.tsx
+index 76eca50..a660e2b 100644
+--- a/src/AgentView.tsx
++++ b/src/AgentView.tsx
+@@ -24,7 +24,8 @@ import {
+   Banknote,
+   MessageCircle,
+ } from 'lucide-react';
+-import { AgentService, type Invoice, type Payment, type AgentAccount, AuthService } from './Firebase';
++import { AgentService, type Invoice, type Payment, type AgentAccount, AuthService, functions } from './Firebase';
++import { httpsCallable } from 'firebase/functions';
+ import PaymentModal from './PaymentModal';
+ import BrandLogo from './theme/BrandLogo';
+ import ChamaSection from './mychama/ChamaSection';
+@@ -42,6 +43,10 @@ const AgentView: React.FC = () => {
+   const [showPaymentModal, setShowPaymentModal] = useState(false);
+   const [showTerminal, setShowTerminal] = useState(false);
+   const [showPaymentSettings, setShowPaymentSettings] = useState(false);
++  // Lipa Mos Mos (tenants pay rent a little at a time; the landlord is paid by transfer to this same account)
++  const [lmm, setLmm] = useState<{ status: string; reason?: string | null; last4?: string } | null>(null);
++  const [lmmBusy, setLmmBusy] = useState(false);
++  const [lmmMsg, setLmmMsg] = useState('');
+   const [tenantIdSearch, setTenantIdSearch] = useState('');
+   const [searchError, setSearchError] = useState('');
+   const [error, setError] = useState('');
+@@ -162,6 +167,22 @@ const AgentView: React.FC = () => {
+     };
+   }, [navigate]);
+ 
++  const enableLmm = async () => {
++    const info: any = agentData?.paymentInfo;
++    if (!info) return;
++    setLmmBusy(true); setLmmMsg('');
++    try {
++      await httpsCallable(functions, 'lmm_setupRecipient')({ settlementType: info.settlementType || '', bankCode: info.settlementBankCode || '', accountNumber: info.accountNumber || '', name: info.businessName || '' });
++      const r: any = await httpsCallable(functions, 'lmm_recipientStatus')({});
++      setLmm(r.data); setLmmMsg('Lipa Mos Mos is on for your payout account.');
++    } catch (e: any) { setLmmMsg(e?.message || 'Could not turn on Lipa Mos Mos'); } finally { setLmmBusy(false); }
++  };
++
++  useEffect(() => {
++    if (!agentData?.paymentInfo?.accountId) return;
++    httpsCallable(functions, 'lmm_recipientStatus')({}).then((r: any) => setLmm(r.data)).catch(() => undefined);
++  }, [agentData?.paymentInfo?.accountId]);
++
+   const handleSignOut = async () => {
+     try {
+       AuthService.signOut();
+@@ -605,6 +626,20 @@ const AgentView: React.FC = () => {
+                     <p className="text-green-700 text-sm">
+                       Settlement Bank: {agentData.paymentInfo.settlementBank.toUpperCase()}
+                     </p>
++                    <div className="mt-3 pt-3 border-t border-green-200">
++                      <p className="text-green-900 font-semibold text-sm">Lipa Mos Mos</p>
++                      {lmm?.status === 'active' ? (
++                        <p className="text-green-700 text-sm">On. Tenants can pay rent a little at a time and you are paid by transfer to the account ending {lmm.last4}.</p>
++                      ) : lmm?.status === 'unsupported' ? (
++                        <p className="text-yellow-800 text-sm">Not available for this payout account{lmm.reason ? ` (${lmm.reason})` : ''}.</p>
++                      ) : (
++                        <p className="text-green-700 text-sm">Let tenants pay rent a little at a time. You are paid by transfer when it is covered, or on the 5th.</p>
++                      )}
++                      {lmm?.status !== 'active' && lmm?.status !== 'unsupported' && (
++                        <button type="button" onClick={enableLmm} disabled={lmmBusy} className="mt-2 px-3 py-1.5 rounded-lg bg-green-600 text-white text-sm font-semibold disabled:opacity-50">{lmmBusy ? 'Please wait...' : 'Turn on Lipa Mos Mos'}</button>
++                      )}
++                      {lmmMsg && <p className="text-sm mt-1 text-green-800 break-words">{lmmMsg}</p>}
++                    </div>
+                   </div>
+                 </div>
+               </div>
+diff --git a/src/LipaMosMos.tsx b/src/LipaMosMos.tsx
+new file mode 100644
+index 0000000..3631e77
+--- /dev/null
++++ b/src/LipaMosMos.tsx
+@@ -0,0 +1,106 @@
++import { useCallback, useEffect, useMemo, useState } from 'react';
++import { httpsCallable } from 'firebase/functions';
++import { functions } from './Firebase';
++
++type Frequency = 'daily' | 'weekly' | 'biweekly';
++interface PlanView {
++  frequency: Frequency; status: string; targetMinor: number; creditedMinor: number; remainingMinor: number; pct: number; settlesOn: string; suggestedMinor: number;
++}
++interface Res { available: boolean; reason?: string; plan?: PlanView | null; targetMinor?: number; settlesOn?: string; suggestedMinor?: number }
++
++const kes = (minor: number) => `KES ${(minor / 100).toLocaleString('en-KE', { maximumFractionDigits: 2 })}`;
++/** Same rule as the server: 5% extra under KES 100, otherwise 2.5%, rounded up to a whole shilling. The server recomputes it; this is only the preview. */
++const chargeFor = (kesAmount: number) => {
++  const bps = kesAmount < 100 ? 500 : 250;
++  return Math.ceil((kesAmount * (10000 + bps)) / 10000);
++};
++const call = <T,>(name: string, data: unknown) => httpsCallable<unknown, T>(functions, name)(data).then((r) => r.data);
++
++interface Props { agentId: string; tenantId: number | string; phone?: string; onPaid?: () => void }
++
++/** Lipa Mos Mos: pay rent a little at a time. Money waits safely until the target or the 5th, then the landlord is paid. */
++export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onPaid }: Props) {
++  const [res, setRes] = useState<Res | null>(null);
++  const [freq, setFreq] = useState<Frequency>('weekly');
++  const [amount, setAmount] = useState('');
++  const [phone, setPhone] = useState(phoneIn);
++  const [busy, setBusy] = useState(false);
++  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
++  const ids = useMemo(() => ({ agentId, tenantId: String(tenantId) }), [agentId, tenantId]);
++
++  const load = useCallback(async () => {
++    try { const r = await call<Res>('lmm_getPlan', ids); setRes(r); if (r.plan?.frequency) setFreq(r.plan.frequency); }
++    catch (e: any) { setRes({ available: false, reason: e?.message || 'Could not load Lipa Mos Mos' }); }
++  }, [ids]);
++  useEffect(() => { void load(); }, [load]);
++
++  if (!res) return <div className="bg-white rounded-xl shadow-md p-6 text-sm text-gray-500">Loading Lipa Mos Mos...</div>;
++  if (!res.available) return <div className="bg-white rounded-xl shadow-md p-6"><p className="font-semibold text-gray-900">Lipa Mos Mos</p><p className="text-sm text-gray-600 mt-1">{res.reason}</p></div>;
++
++  const plan = res.plan;
++  const suggested = (plan?.suggestedMinor ?? res.suggestedMinor ?? 0) / 100;
++  const n = Number(amount);
++  const valid = Number.isInteger(n) && n >= 10 && n <= 150000;
++  const small = valid && n < 100;
++
++  const start = async () => {
++    setBusy(true); setMsg(null);
++    try { await call('lmm_start', { ...ids, frequency: freq }); await load(); setMsg({ kind: 'ok', text: 'Your plan is on. Pay a little at a time.' }); }
++    catch (e: any) { setMsg({ kind: 'err', text: e?.message || 'Could not start the plan' }); } finally { setBusy(false); }
++  };
++  const pay = async () => {
++    setBusy(true); setMsg(null);
++    try {
++      const out = await call<{ displayText: string }>('lmm_pay', { ...ids, frequency: freq, amount: n, phone });
++      setMsg({ kind: 'ok', text: `${out.displayText}. Approve the M-PESA prompt on your phone.` });
++      setAmount(''); setTimeout(() => { void load(); onPaid?.(); }, 15000);
++    } catch (e: any) { setMsg({ kind: 'err', text: e?.message || 'Payment could not be started' }); } finally { setBusy(false); }
++  };
++
++  return (
++    <div className="bg-white rounded-xl shadow-md p-6 mb-8">
++      <div className="flex items-start justify-between gap-3">
++        <div>
++          <h3 className="text-lg font-bold text-gray-900">Lipa Mos Mos</h3>
++          <p className="text-sm text-gray-600 mt-1">Pay your rent a little at a time. Your landlord is paid when it is fully covered, or on the 5th with whatever you have paid.</p>
++        </div>
++      </div>
++
++      {plan && (
++        <div className="mt-4">
++          <div className="flex justify-between text-sm text-gray-700"><span>{kes(plan.creditedMinor)} paid</span><span>{kes(plan.targetMinor)} due</span></div>
++          <div className="mt-1 h-3 w-full rounded-full bg-gray-200 overflow-hidden" role="progressbar" aria-valuenow={plan.pct} aria-valuemin={0} aria-valuemax={100}>
++            <div className="h-full bg-green-600 transition-all" style={{ width: `${plan.pct}%` }} />
++          </div>
++          <p className="text-xs text-gray-500 mt-1">{plan.pct}% done. Balance {kes(plan.remainingMinor)}. Landlord is paid by {plan.settlesOn}.</p>
++        </div>
++      )}
++
++      <div className="mt-4 grid gap-3 sm:grid-cols-3">
++        <label className="text-sm text-gray-700">How often
++          <select className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2" value={freq} onChange={(e) => setFreq(e.target.value as Frequency)} disabled={busy}>
++            <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="biweekly">Every 2 weeks</option>
++          </select>
++        </label>
++        <label className="text-sm text-gray-700">Amount (KES, whole shillings)
++          <input className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2" inputMode="numeric" value={amount} placeholder={suggested ? String(Math.ceil(suggested)) : '500'} onChange={(e) => setAmount(e.target.value.replace(/\D/g, ''))} disabled={busy} />
++        </label>
++        <label className="text-sm text-gray-700">M-PESA number
++          <input className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2" inputMode="tel" value={phone} placeholder="0712 345 678" onChange={(e) => setPhone(e.target.value)} disabled={busy} />
++        </label>
++      </div>
++
++      {valid && (
++        <p className="mt-2 text-sm text-gray-700">
++          You will be charged <strong>KES {chargeFor(n).toLocaleString('en-KE')}</strong>: KES {n.toLocaleString('en-KE')} goes to your rent plus a {small ? '5' : '2.5'}% fee. Your rent is credited exactly KES {n.toLocaleString('en-KE')}.
++        </p>
++      )}
++
++      <div className="mt-4 flex flex-wrap gap-3">
++        {!plan && <button type="button" onClick={start} disabled={busy} className="px-4 py-2 rounded-lg bg-blue-600 text-white font-semibold disabled:opacity-50">Start my plan</button>}
++        <button type="button" onClick={pay} disabled={busy || !valid || !phone} className="px-4 py-2 rounded-lg bg-green-600 text-white font-semibold disabled:opacity-50">{busy ? 'Please wait...' : 'Pay now'}</button>
++      </div>
++      {msg && <p role={msg.kind === 'err' ? 'alert' : 'status'} className={`mt-3 text-sm break-words ${msg.kind === 'err' ? 'text-red-700' : 'text-green-700'}`}>{msg.text}</p>}
++    </div>
++  );
++}
+diff --git a/src/TenantView.tsx b/src/TenantView.tsx
+index 29132fb..1b6607f 100644
+--- a/src/TenantView.tsx
++++ b/src/TenantView.tsx
+@@ -22,6 +22,7 @@ import { AuthService, db, TenantService, type Invoice, type Payment } from './Fi
+ import PaymentModal from './PaymentModal';
+ import BrandLogo from './theme/BrandLogo';
+ import ChamaSection from './mychama/ChamaSection';
++import LipaMosMos from './LipaMosMos';
+ import { splitInvoiceOutstanding } from './mychama/calc';
+ import { doc, getDoc } from 'firebase/firestore';
+ 
+@@ -359,6 +360,12 @@ const TenantView: React.FC = () => {
+           billsDue={splitInvoiceOutstanding(invoices).billsDue}
+         />
+ 
++        {/* Lipa Mos Mos: pay rent a little at a time (shown while something is owed) */}
++        {(() => {
++          const open = invoices.find((inv) => !inv.isPaid);
++          return open ? <LipaMosMos agentId={open.agentUserId} tenantId={open.tenantId} phone={tenantData?.phone || ''} onPaid={handlePaymentSuccess} /> : null;
++        })()}
++
+         {/* Tabs */}
+         <div className="bg-white rounded-xl shadow-md overflow-hidden">
+           <div className="border-b border-gray-200">
