@@ -1233,7 +1233,7 @@ async function getPaystackBanks(secretValue: string, country = "kenya"): Promise
 
 interface SetupAccountRequest {
   businessName: string;
-  settlementBank: "mpesa" | "airtel-ke" | "till" | "bank";
+  settlementBank: "mpesa" | "till" | "bank";
   bankCode?: string;   // required when settlementBank === "bank": a code from listKenyaBanks
   accountNumber: string;
   email: string;
@@ -1362,6 +1362,9 @@ export const setupAccount = onCall({
     let validBankCode = settlementBank.toLowerCase();
     let storedBankLabel: string = settlementBank;
     const settlementType = settlementBank.toLowerCase();
+    if (!["mpesa", "till", "bank"].includes(settlementType)) {
+      throw new HttpsError("invalid-argument", "Settlement must be M-Pesa (Safaricom), Till or Bank.");
+    }
     
     // Search for M-Pesa or the provided bank name
     const bankMatch = banks?.find(bank => 

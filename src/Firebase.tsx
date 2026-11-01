@@ -618,9 +618,15 @@ export class AgentService {
     }
   }
 
+  static async listKenyaBanks(): Promise<{ name: string; code: string }[]> {
+    const res = await httpsCallable<unknown, { banks: { name: string; code: string }[] }>(functions, 'listKenyaBanks')({});
+    return res.data.banks;
+  }
+
   static async setupPaymentAccount(data: {
     businessName: string;
-    settlementBank: 'mpesa' | 'airtel-ke';
+    settlementBank: 'mpesa' | 'till' | 'bank';
+    bankCode?: string;
     accountNumber: string;
     email: string;
     name: string;
