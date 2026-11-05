@@ -1,15 +1,16 @@
 // TRACK A — mychamaSync callable (see service.ts for the orchestration).
 import { onCall, type CallableRequest } from "firebase-functions/v2/https";
-import { REGION, MYCHAMA_ID_PEPPER } from "../config";
+import { REGION } from "../config";
 import { myChamaError } from "../errors";
 import type { SyncReason, SyncRequest, SyncResponse } from "../contract";
 import { resolveCaller } from "./identity";
 import { runSyncFor } from "./service";
+import { BUNDLE_SECRETS } from "../../secretsBundle";
 
 const REASONS: SyncReason[] = ["login", "reload", "manual"];
 
 export const mychamaSync = onCall(
-  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 120, secrets: [MYCHAMA_ID_PEPPER] },
+  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 120, secrets: BUNDLE_SECRETS },
   async (req: CallableRequest<SyncRequest>): Promise<SyncResponse> => {
     if (!req.auth) throw myChamaError("unauthenticated", "Sign in required.", "unauthenticated");
     const reason = req.data?.reason;

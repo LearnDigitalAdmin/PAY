@@ -1,16 +1,17 @@
 // TRACK A — linking callables (SMS-code flow). Silent linking happens inside mychamaSync.
 import { onCall, type CallableRequest } from "firebase-functions/v2/https";
-import { REGION, MYCHAMA_ID_PEPPER } from "../config";
-import { MYCHAMA_HP_SECRETS } from "../sms";
+import { REGION } from "../config";
+
 import { myChamaError } from "../errors";
 import type { RequestCodeRequest, RequestCodeResponse, VerifyCodeRequest, VerifyCodeResponse } from "../contract";
 import { resolveCaller } from "../sync/identity";
 import { requestCode, verifyCode } from "./challenge";
 import { runLinkPass } from "./engine";
 import { runSyncFor } from "../sync/service";
+import { BUNDLE_SECRETS } from "../../secretsBundle";
 
 export const mychamaLinkRequestCode = onCall(
-  { region: REGION, cors: true, maxInstances: 10, secrets: [MYCHAMA_ID_PEPPER, ...MYCHAMA_HP_SECRETS] },
+  { region: REGION, cors: true, maxInstances: 10, secrets: BUNDLE_SECRETS },
   async (req: CallableRequest<RequestCodeRequest>): Promise<RequestCodeResponse> => {
     if (!req.auth) throw myChamaError("unauthenticated", "Sign in required.", "unauthenticated");
     const caller = await resolveCaller(req.auth);
@@ -19,7 +20,7 @@ export const mychamaLinkRequestCode = onCall(
 );
 
 export const mychamaLinkVerifyCode = onCall(
-  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 120, secrets: [MYCHAMA_ID_PEPPER] },
+  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 120, secrets: BUNDLE_SECRETS },
   async (req: CallableRequest<VerifyCodeRequest>): Promise<VerifyCodeResponse> => {
     if (!req.auth) throw myChamaError("unauthenticated", "Sign in required.", "unauthenticated");
     const caller = await resolveCaller(req.auth);

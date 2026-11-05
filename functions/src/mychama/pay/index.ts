@@ -2,7 +2,7 @@
 // Mirrors Chama `mychama/payments.py::initiatePayment` (self-pay branch) field-for-field, charging with the
 // NEW Paystack account's key. Money is only ever marked received by the webhook (../webhook).
 import { onCall, HttpsError } from "firebase-functions/v2/https";
-import { REGION, MYCHAMA_PAYSTACK_SECRET_KEY, MYCHAMA_ID_PEPPER, mychamaDb, plotDb, normalizeKePhone, computePhoneKey } from "../config";
+import { REGION, MYCHAMA_PAYSTACK_SECRET_KEY, mychamaDb, plotDb, normalizeKePhone, computePhoneKey } from "../config";
 import { myChamaError } from "../errors";
 import { MYCHAMA_PATHS } from "../contract";
 import type { ChamaLinkDoc, PayInitiateRequest, PayInitiateResponse } from "../contract";
@@ -12,6 +12,7 @@ import {
 } from "./fees";
 import { chargeMobileMoney } from "./paystack";
 import { recordResult, releaseKey, reserveKey } from "./idempotency";
+import { BUNDLE_SECRETS } from "../../secretsBundle";
 import {
   SPLIT_KEY_VERSION, assertGrossWithinLimit, cleanRequest, detectProvider, isSafeId, isValidKenyanPhone, phoneRejectionMessage, validateTarget,
   type CleanRequest, type Target,
@@ -40,7 +41,7 @@ async function resolveLink(uid: string, chamaId: string): Promise<ChamaLinkDoc> 
 }
 
 export const mychamaPayInitiate = onCall(
-  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 60, secrets: [MYCHAMA_PAYSTACK_SECRET_KEY, MYCHAMA_ID_PEPPER] },
+  { region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 60, secrets: BUNDLE_SECRETS },
   async (req): Promise<PayInitiateResponse> => {
     const uid = req.auth?.uid;
     if (!uid) throw myChamaError("unauthenticated", "Sign in to pay.", "unauthenticated");

@@ -5,9 +5,10 @@
 // NOTE: ../index.ts does `export * from "./webhook"` — keep ONLY deployable functions exported from here.
 import { onRequest } from "firebase-functions/v2/https";
 import { REGION, MYCHAMA_PAYSTACK_SECRET_KEY } from "../config";
-import { MYCHAMA_HP_SECRETS } from "../sms";
+
 import { dispatchChargeFailed, dispatchChargeSuccess, dispatchRefundProcessed, type PaystackChargeData } from "./dispatch";
 import { verifyPaystackSignature } from "./util";
+import { BUNDLE_SECRETS } from "../../secretsBundle";
 
 export { reconcileMyChamaIntentsV2 } from "./reconcile";
 
@@ -19,7 +20,7 @@ export const mychamaPaystackCallback = onRequest(
     timeoutSeconds: 60,
     // ...MYCHAMA_HP_SECRETS is REQUIRED: the confirmation SMS is sent from inside the handler. The legacy webhook
     // does not bind them, so its confirmation SMS has most likely been failing silently (see contract §9).
-    secrets: [MYCHAMA_PAYSTACK_SECRET_KEY, ...MYCHAMA_HP_SECRETS],
+    secrets: BUNDLE_SECRETS,
   },
   async (req, res) => {
     if (req.method !== "POST") {

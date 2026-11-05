@@ -1,12 +1,11 @@
 // Transports for Landlord Watch: Firebase callables (PMS, CYBER web) and one HTTPS endpoint (WhatsApp bot).
 // Identical semantics; see LANDLORD_WATCH_CONTRACT.md section 7.
 import * as admin from "firebase-admin";
-import { defineSecret } from "firebase-functions/params";
 import { onCall, onRequest, type CallableRequest } from "firebase-functions/v2/https";
 import { checkSafaricomPhone } from "../phone/safaricom";
-import { MYCHAMA_ID_PEPPER, REGION, plotDb } from "../mychama/config";
-import { MYCHAMA_HP_SECRETS, sendHpSmsChecked } from "../mychama/sms";
-import { PAYSTACK_SECRET_KEY } from "../desk/paystack";
+import { REGION, plotDb } from "../mychama/config";
+import { sendHpSmsChecked } from "../mychama/sms";
+
 import { type Actor, actorFromBot, actorFromCallable } from "./actors";
 import { LwError, toBotError, toHttpsError } from "./errors";
 import { safeEqual } from "./keys";
@@ -16,11 +15,12 @@ import { paystackPort, settleTranscriptPayment } from "./payments";
 import * as svc from "./service";
 import type { Ctx, Deps } from "./service";
 import type { Lang } from "./types";
+import { BUNDLE_SECRETS, bundleSecret } from "../secretsBundle";
 
 /** Shared with the WhatsApp bot through Secret Manager (same project). Create it once:  firebase functions:secrets:set LW_BOT_API_KEY */
-export const LW_BOT_API_KEY = defineSecret("LW_BOT_API_KEY");
+export const LW_BOT_API_KEY = bundleSecret("LW_BOT_API_KEY");
 
-const SECRETS = [MYCHAMA_ID_PEPPER, ...MYCHAMA_HP_SECRETS, PAYSTACK_SECRET_KEY];
+const SECRETS = BUNDLE_SECRETS;
 
 export function defaultDeps(): Deps {
   return {
@@ -103,7 +103,7 @@ export const lwTranscriptStatus = callable("transcriptStatus", HEAVY);
 export const lwTranscriptList = callable("transcriptList");
 
 /** WhatsApp bot endpoint: POST { action, actor: { phone }, ...params } with header x-lw-key. */
-export const lwBotApi = onRequest({ ...HEAVY, secrets: [...SECRETS, LW_BOT_API_KEY], cors: false }, async (req, res) => {
+export const lwBotApi = onRequest({ ...HEAVY, secrets: BUNDLE_SECRETS, cors: false }, async (req, res) => {
   if (req.method !== "POST") { res.status(405).json({ ok: false, error: { code: "LW_NOT_ALLOWED", message: "POST only." } }); return; }
   const key = String(req.get("x-lw-key") ?? "");
   if (!key || !safeEqual(key, LW_BOT_API_KEY.value())) { res.status(401).json({ ok: false, error: { code: "LW_NOT_ALLOWED", message: "Unauthorized." } }); return; }

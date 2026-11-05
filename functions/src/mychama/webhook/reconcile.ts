@@ -11,9 +11,10 @@ import axios from "axios";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as admin from "firebase-admin";
 import { MYCHAMA_PAYSTACK_SECRET_KEY, mychamaDb, plotDb } from "../config";
-import { MYCHAMA_HP_SECRETS } from "../sms";
+
 import { PAYSTACK_API_BASE } from "../pay/paystack";
 import { handleMyChamaPayment } from "./handlers";
+import { BUNDLE_SECRETS } from "../../secretsBundle";
 
 export const CUTOVER_DOC = "mychamaConfig/cutover";
 const FIVE_MIN = 5 * 60 * 1000;
@@ -34,7 +35,7 @@ export const reconcileMyChamaIntentsV2 = onSchedule(
     region: "us-central1",
     memory: "256MiB",
     timeoutSeconds: 300,
-    secrets: [MYCHAMA_PAYSTACK_SECRET_KEY, ...MYCHAMA_HP_SECRETS],
+    secrets: BUNDLE_SECRETS,
   },
   async () => {
     const cutoverAt = Number((await plotDb().doc(CUTOVER_DOC).get()).data()?.cutoverAt);

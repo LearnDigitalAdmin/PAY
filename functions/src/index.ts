@@ -44,7 +44,7 @@ import { alertOps as lmmAlert } from "./lmm/alert";
 import { firstName } from "./lmm/dear";
 import { createSealedRecipient } from "./lmm/recipient";
 import { LMM_SEAL_KEY } from "./lmm/seal";
-import { HP_SECRETS, sendHpSms } from "./hpSms";
+import { sendHpSms } from "./hpSms";
 export { lmm_getPlan, lmm_start, lmm_pay, lmm_setupRecipient, lmm_recipientStatus, lmm_dailySweep } from "./lmm";
 import { getDeskConfig } from "./desk/config";
 import { rentRateForTier } from "./desk/rent";
@@ -65,7 +65,8 @@ import { findExistingAccount, trialAlreadyClaimed, recordTrialClaims } from "./i
 export { reconcileIdentityDuplicates } from "./identity/trialGuard";
 import { recordRentPaymentEvent, recordSubscriptionEvent, recordRefundEvent, type MyChamaChargeFacts } from "./desk/hooks";
 import { mychamaDb } from "./mychama/config";
-import { MYCHAMA_HP_SECRETS } from "./mychama/sms";
+
+import { BUNDLE_SECRETS } from "./secretsBundle";
 import {
   handleMyChamaPayment,
   handleMyChamaSmsTopup,
@@ -137,7 +138,7 @@ export const chargeSmsTopUp = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: BUNDLE_SECRETS,
 }, async (request: CallableRequest<ChargeSmsTopUpRequest>) => {
   try {
     if (!request.auth) {
@@ -633,7 +634,7 @@ export const reconcileMyChamaIntents = onSchedule({
   region: "us-central1",
   memory: "256MiB",
   timeoutSeconds: 300,
-  secrets: [PAYSTACK_SECRET_KEY, ...MYCHAMA_HP_SECRETS],
+  secrets: BUNDLE_SECRETS,
 }, async () => {
   const db2 = mychamaDb();
   const now = Date.now();
@@ -1244,7 +1245,7 @@ export const setupAccount = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY, ...HP_SECRETS],
+  secrets: BUNDLE_SECRETS,
 }, async (request: CallableRequest<SetupAccountRequest>) => {
   try {
     //const paystackHeaders = getPaystackHeaders(PAYSTACK_SECRET_KEY.value());
@@ -1574,7 +1575,7 @@ export const processPayment = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: BUNDLE_SECRETS,
 }, async (request: CallableRequest<ProcessPaymentRequest>) => {
   try {
     //const paystackHeaders = getPaystackHeaders(PAYSTACK_SECRET_KEY.value());
@@ -1632,7 +1633,7 @@ export const chargeCustomer = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: BUNDLE_SECRETS,
 }, async (request: CallableRequest<ChargeCustomerRequest>) => {
   try {
     const { amount, phone, pId, uid, id, service } = request.data;
@@ -1828,7 +1829,7 @@ export const paystackCallback = onRequest({
   cors: false,
   maxInstances: 10,
   region: "africa-south1",
-  secrets: [PAYSTACK_SECRET_KEY, LMM_SEAL_KEY, ...HP_SECRETS],
+  secrets: BUNDLE_SECRETS,
 }, async (req, res) => {
   console.log(`Webhook request received: ${req.method}`);
 
@@ -2991,7 +2992,7 @@ export const verifyTransaction = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: BUNDLE_SECRETS,
 }, async (request: CallableRequest<{ reference: string }>) => {
   try {
     //const paystackHeaders = getPaystackHeaders(PAYSTACK_SECRET_KEY.value());
@@ -3055,7 +3056,7 @@ export const listKenyaBanks = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: BUNDLE_SECRETS,
 }, async (request) => {
   if (!request.auth) throw new HttpsError("unauthenticated", "User must be authenticated");
   return { banks: await kenyaBanksOnly(PAYSTACK_SECRET_KEY.value()) };
@@ -3068,7 +3069,7 @@ export const listBanks = onCall({
   maxInstances: 10,
   region: "africa-south1",
   cors: true,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: BUNDLE_SECRETS,
 }, async (request: CallableRequest<{ country?: string }>) => {
   try {
     const country = request.data?.country || "kenya";
@@ -3433,7 +3434,7 @@ export const desk_runRentBatch = onDocumentCreated({
   memory: "512MiB",
   maxInstances: 5,
   retry: false,
-  secrets: [PAYSTACK_SECRET_KEY],
+  secrets: BUNDLE_SECRETS,
 }, async (event) => {
   await runRentBatch(event.params.batchId);
 });

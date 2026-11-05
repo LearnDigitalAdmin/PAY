@@ -1,9 +1,9 @@
 // Tamper-evidence for money destinations and amounts. The key lives in Secret Manager (never in Firestore, never in the client).
 // A value stored in Firestore is only trusted when its HMAC seal still matches; a mismatch blocks the transfer and raises an alert.
-import { defineSecret } from "firebase-functions/params";
 import * as crypto from "crypto";
+import { bundleSecret } from "../secretsBundle";
 
-export const LMM_SEAL_KEY = defineSecret("LMM_SEAL_KEY");
+export const LMM_SEAL_KEY = bundleSecret("LMM_SEAL_KEY");
 
 const hmac = (key: string, label: string, parts: ReadonlyArray<string | number>): string =>
   crypto.createHmac("sha256", key).update([label, ...parts.map(String)].join("\u241f")).digest("hex");

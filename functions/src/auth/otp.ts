@@ -20,10 +20,11 @@ import { onCall, HttpsError } from "firebase-functions/v2/https";
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
 import { REGION, normalizeKePhone, plotDb, MYCHAMA_ID_PEPPER } from "../mychama/config";
-import { MYCHAMA_HP_SECRETS, sendHpSmsChecked } from "../mychama/sms";
+import { sendHpSmsChecked } from "../mychama/sms";
+import { BUNDLE_SECRETS } from "../secretsBundle";
 import { checkSafaricomPhone } from "../phone/safaricom";
 
-const OTP_SECRETS = [MYCHAMA_ID_PEPPER, ...MYCHAMA_HP_SECRETS];
+const OTP_SECRETS = BUNDLE_SECRETS;
 
 const KE_MOBILE = /^\+254[17]\d{8}$/;
 const COLLECTION = "authOtp";                 // server-only: no client rule should ever allow access

@@ -1,15 +1,15 @@
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
-import { defineSecret } from "firebase-functions/params";
 import { MYCHAMA_REGION } from "./contract";
+import { bundleSecret } from "../secretsBundle";
 
 export const REGION = MYCHAMA_REGION;
 
 // ─── Secrets (declare ONCE here; bind per-function via `secrets: [...]`) ───
 /** The NEW Paystack account's secret key. Used ONLY by MyChama code paths. */
-export const MYCHAMA_PAYSTACK_SECRET_KEY = defineSecret("MYCHAMA_PAYSTACK_SECRET_KEY");
+export const MYCHAMA_PAYSTACK_SECRET_KEY = bundleSecret("MYCHAMA_PAYSTACK_SECRET_KEY");
 /** HMAC pepper for idKey/phoneKey. MUST be the identical value in mychama1 (Python side). */
-export const MYCHAMA_ID_PEPPER = defineSecret("MYCHAMA_ID_PEPPER");
+export const MYCHAMA_ID_PEPPER = bundleSecret("MYCHAMA_ID_PEPPER");
 // HostPinnacle SMS secrets live in ./sms.ts (MYCHAMA_HP_SECRETS).
 
 // ─── Firestore handles ───

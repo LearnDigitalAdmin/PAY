@@ -10,11 +10,11 @@ for (const f of files) {
 }
 const idx = fs.readFileSync(path.join(root, "index.ts"), "utf8");
 for (const name of ["setupAccount", "paystackCallback"]) {
-  const m = idx.match(new RegExp(`export const ${name} = on\\w+\\(\\{[\\s\\S]*?secrets:\\s*\\[([^\\]]*)\\]`));
-  if (!m || !/HP_SECRETS/.test(m[1])) fail(`${name} does not bind ...HP_SECRETS`);
+  const m = idx.match(new RegExp(`export const ${name} = on\\w+\\(\\{[\\s\\S]*?secrets:\\s*\\[?([^\\],}]*)`));
+  if (!m || !/(HP|BUNDLE)_SECRETS/.test(m[1])) fail(`${name} does not bind HP_SECRETS / BUNDLE_SECRETS`);
 }
 for (const [file, names] of [["lmm/index.ts", ["lmm_setupRecipient", "lmm_dailySweep"]], ["lmm/plan.ts", ["lmm_start", "lmm_pay"]]]) {
   const t = fs.readFileSync(path.join(root, file), "utf8");
-  for (const n of names) { const m = t.match(new RegExp(`export const ${n} = on\\w+\\([\\s\\S]*?secrets:\\s*\\[([^\\]]*)\\]`)); if (!m || !/HP_SECRETS/.test(m[1])) fail(`${n} does not bind ...HP_SECRETS`); }
+  for (const n of names) { const m = t.match(new RegExp(`export const ${n} = on\\w+\\([\\s\\S]*?secrets:\\s*\\[?([^\\],}]*)`)); if (!m || !/(HP|BUNDLE)_SECRETS/.test(m[1])) fail(`${n} does not bind HP_SECRETS / BUNDLE_SECRETS`); }
 }
 if (bad) process.exit(1); console.log("no-env-credentials: OK");

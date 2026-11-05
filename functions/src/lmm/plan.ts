@@ -10,7 +10,8 @@ import { FREQUENCY_DAYS, LMM, isFrequency, type Frequency } from "./config";
 import { chargeFor, isValidCredit } from "./fees";
 import { openInvoices } from "./invoices";
 import { sendOnce, lmmText } from "./sms";
-import { HP_SECRETS } from "../hpSms";
+
+import { BUNDLE_SECRETS } from "../secretsBundle";
 
 const db = () => admin.firestore();
 export const plansCol = () => db().collection("lmm_plans");
@@ -118,7 +119,7 @@ export const lmm_getPlan = onCall(opts, async (request: CallableRequest<Req>) =>
   return { available: true, plan: await view(snap.id, snap.data() as PlanDoc, now) };
 });
 
-export const lmm_start = onCall({ ...opts, secrets: [...HP_SECRETS] }, async (request: CallableRequest<Req>) => {
+export const lmm_start = onCall({ ...opts, secrets: BUNDLE_SECRETS }, async (request: CallableRequest<Req>) => {
   const agentId = asId(request.data?.agentId, "agentId"), tenantId = asId(request.data?.tenantId, "tenantId");
   if (!isFrequency(request.data?.frequency)) throw new HttpsError("invalid-argument", "Choose daily, weekly or biweekly");
   const avail = await lmmAvailable(agentId);
@@ -132,7 +133,7 @@ export const lmm_start = onCall({ ...opts, secrets: [...HP_SECRETS] }, async (re
   return { available: true, plan: v };
 });
 
-export const lmm_pay = onCall({ ...opts, secrets: [PAYSTACK_SECRET_KEY, ...HP_SECRETS] }, async (request: CallableRequest<Req>) => {
+export const lmm_pay = onCall({ ...opts, secrets: BUNDLE_SECRETS }, async (request: CallableRequest<Req>) => {
   const agentId = asId(request.data?.agentId, "agentId"), tenantId = asId(request.data?.tenantId, "tenantId");
   const phone = checkSafaricomPhone(request.data?.phone);
   if (!phone.ok) throw new HttpsError("invalid-argument", phone.message);
