@@ -7,7 +7,6 @@ import { onRequest } from "firebase-functions/v2/https";
 import * as admin from "firebase-admin";
 import axios from "axios";
 import * as crypto from "crypto";
-import { hash } from "@node-rs/argon2";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { onDocumentCreated } from "firebase-functions/v2/firestore";
 
@@ -47,7 +46,7 @@ import { LMM_SEAL_KEY } from "./lmm/seal";
 import { sendHpSms } from "./hpSms";
 export { lmm_getPlan, lmm_start, lmm_pay, lmm_setupRecipient, lmm_recipientStatus, lmm_dailySweep } from "./lmm";
 import { getDeskConfig } from "./desk/config";
-import { rentRateForTier } from "./desk/rent";
+import { conveniencePctForTier } from "./desk/rentFees";
 import { initiateRentCharge } from "./desk/rentCharge";
 import { runRentBatch } from "./desk/rentBatch";
 export { deskSmsCommission } from "./deskSmsEndpoint";
@@ -58,6 +57,9 @@ export {
   lwTranscriptList, lwBotApi,
 } from "./landlordWatch";
 import { settleTranscriptPayment, failTranscriptPayment } from "./landlordWatch/payments";
+// Compliance reports (MRI working paper, annual rental income summary): KES 200 or one free per property per month on Business+.
+export { crQuote, crOrder, crCheckout, crStatus, crList, crServerApi, crScheduler } from "./compliance";
+import { settleReportPayment, failReportPayment } from "./compliance/payments";
 import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
 import { landlordRentSms, tenantRentSms, settlementDate } from "./desk/rentSettlement";
 import { checkSafaricomPhone, toMsisdn } from "./phone/safaricom";
@@ -593,6 +595,7 @@ async function handlePmsSmsTopUp(
 // Replace your existing determineChargeType with this one:
 function determineChargeType(reference: string): string {
   if (reference.startsWith("SMS_"))    return "sms_topup";
+  if (reference.startsWith("CRP_"))    return "compliance_report";
   if (reference.startsWith("REPORT_")) return "report_charge";
   if (reference.startsWith("SHOP_"))   return "shop_charge";
   if (reference.startsWith("CYBER_"))  return "cyber_service";
@@ -1360,8 +1363,10 @@ export const setupAccount = onCall({
     const userData = userDoc.data();
     const userTier = userData?.tier?.toUpperCase() || "SOLO";
 
-    // Determine the take rate from the tier (one table: ./desk/rent RENT_TAKE_RATE_BY_TIER; unknown tiers use SOLO)
-    const commissionRate = rentRateForTier(userTier);
+    // The subaccount's percentage_charge is a FALLBACK only: rent charges use a flat split (rentCharge.ts), which ignores it.
+    // It is set from the same single fee table as every real charge (rentFees.ts: the plan's platform fee), so a path that
+    // ever used it would still charge the published rate. Unknown tiers pay the default 0.95%.
+    const commissionRate = conveniencePctForTier(userTier);
 
     console.log(`Setting up account for user ${userId} with tier ${userTier} at ${commissionRate}%`);
 
@@ -1885,6 +1890,11 @@ export const paystackCallback = onRequest({
         await settleTranscriptPayment(db, reference, data, metadata);
       }
 
+      // ── Compliance report (KES 200, company revenue; desk reports use CYBER_DSK_) ──
+      else if (reference.startsWith("CRP_")) {
+        await settleReportPayment(db, reference, data, metadata);
+      }
+
       // ── NEW: SMS top-up → settle in project 2 ────────────────────────────
       else if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
         if (metadata.targetProject === "pms") {
@@ -1989,6 +1999,8 @@ export const paystackCallback = onRequest({
         await admin.firestore().collection("lmm_payments").doc(reference).update({ status: "failed", error: String(data.gateway_response ?? "").slice(0, 200) }).catch(() => undefined);
       } else if (reference.startsWith("LWT_")) {
         await failTranscriptPayment(db, reference, data.gateway_response);
+      } else if (reference.startsWith("CRP_")) {
+        await failReportPayment(db, reference, data.gateway_response);
       } else if (chargeType === "sms_topup" || reference.startsWith("SMS_")) {
         const targetDb = data.metadata?.targetProject === "pms" ? db : db2;
         const pendingRef = targetDb.collection("sms-topup-transactions").doc(reference);
@@ -3105,23 +3117,6 @@ export const listBanks = onCall({
 
 
 
-/**
- * Hash password using argon2id (server-side)
- */
-async function hashPassword(password: string): Promise<string> {
-  try {
-    const passwordHash = await hash(password, {
-      memoryCost: 65536, // 64 MB
-      timeCost: 3,
-      parallelism: 1,
-      outputLen: 32,
-    });
-    return passwordHash;
-  } catch (error) {
-    console.error("Error hashing password:", error);
-    throw new Error("Failed to hash password");
-  }
-}
 
 export const createUserWithFirebaseAuth = onCall({
   timeoutSeconds: 60,
@@ -3191,9 +3186,8 @@ export const createUserWithFirebaseAuth = onCall({
 
     console.log(`Creating user - Type: ${creationType}, Email: ${email}, Phone: ${formattedPhone}`);
 
-    // Hash the password on the server
-    const passwordHash = await hashPassword(password);
-    console.log(`Password hashed successfully`);
+    // No password hash is stored in Firestore: Firebase Auth owns the password, and each device keeps its own local hash
+    // for offline sign-in (PMS AuthWrapper). Documents must never carry one.
 
     // Prepare Firebase Auth creation options
     const authUserOptions: any = {
@@ -3229,7 +3223,6 @@ export const createUserWithFirebaseAuth = onCall({
       name: userData.name,
       email: email,
       phone: formattedPhone,
-      passwordHash: passwordHash,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       userId: documentId,

@@ -16,7 +16,7 @@ export interface DeskConfig {
   subShareByRank: Record<Rank, number>;  // % of net after fees
   reportShareByRank: Record<Rank, number>;
   rentDeskSharePct: number;              // 40 (% of Plot Yangu's take)
-  rentTakeCapMinor: number;              // 25000 = KES 250 per transaction
+  rentTakeCapMinor: number;              // DEPRECATED, unused: the platform fee on rent has no cap (rentFees.ts)
   milestone: { blockSize: number; bonusMinor: number; lifetimeCapMinor: number; minPaidMonths: number };
   paystackAccounts: Record<Product, "main" | "separate">;
   projects: { chama: string; school: string };

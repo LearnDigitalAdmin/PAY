@@ -53,7 +53,7 @@ export function smsPlan(
   return { agentSharePct: floorPct2(s * (1 - cost / base) * 100), rule: first ? "sms_first_purchase" : "sms_standard" };
 }
 
-/** Plot Yangu's take on a rent payment: rate (0.7%-2% by tier) of rent, capped per transaction. */
+/** LEGACY kernel helper, not used for rent charges (those use rentFees.ts: plan rate, no cap). Kept for kernel parity. */
 export function rentTake(rentMinor: number, ratePct: number, cfg: DeskConfig): number {
   assertMinor(rentMinor, "rent");
   return Math.min(pctHalfUp(rentMinor, ratePct), cfg.rentTakeCapMinor);

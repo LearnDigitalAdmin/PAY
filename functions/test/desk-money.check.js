@@ -5,7 +5,6 @@ const path = require("path");
 const lib = (p) => require(path.join(__dirname, "..", "lib", "desk", p));
 const M = lib("money");
 const { DEFAULT_DESK_CONFIG: cfg, mergeConfig } = lib("config");
-const R = lib("rent");
 
 const RF = lib("rentFees");
 let passed = 0, failed = 0;
@@ -54,21 +53,6 @@ ok("rent 2000000 at 2% is capped at KES 250 -> landlord 98.75, agent 0.5", () =>
   assert.strictEqual(take, 25000);
   const p = M.rentPlan({ rentMinor: 2000000, takeMinor: take }, cfg);
   assert.strictEqual(p.landlordSharePct, 98.75); assert.strictEqual(p.agentSharePct, 0.5);
-});
-ok("rent tier table: ENTERPRISE 0.7 PRO 1.2 BUSINESS 1.6 SOLO 2.0; unknown tiers use SOLO; case-insensitive", () => {
-  assert.deepStrictEqual({ ...R.RENT_TAKE_RATE_BY_TIER }, { ENTERPRISE: 0.7, PRO: 1.2, BUSINESS: 1.6, SOLO: 2.0 });
-  for (const t of ["free", "low", "starter", "", undefined, null, "toString", "__proto__"]) assert.strictEqual(R.rentRateForTier(t), 2.0, String(t));
-  assert.strictEqual(R.rentRateForTier("pro"), 1.2); assert.strictEqual(R.rentRateForTier(" Enterprise "), 0.7);
-});
-ok("planRentSplit: owner desk -> three-way; anyone else -> two-way with the same take", () => {
-  const owner = R.planRentSplit({ rentMinor: 800000, tier: "business", ownerDesk: true }, cfg);
-  const other = R.planRentSplit({ rentMinor: 800000, tier: "business", ownerDesk: false }, cfg);
-  assert.strictEqual(owner.takeMinor, 12800); assert.strictEqual(other.takeMinor, 12800);   // 1.6% of 8000.00
-  assert.strictEqual(owner.threeWay, true); assert.strictEqual(other.threeWay, false);
-  assert.strictEqual(other.agentSharePct, 0); assert.strictEqual(other.landlordSharePct, 98.4);
-  assert.strictEqual(owner.landlordSharePct, 98.4); assert.strictEqual(owner.agentSharePct, 0.64);
-  const capped = R.planRentSplit({ rentMinor: 2000000, tier: "solo", ownerDesk: false }, cfg);
-  assert.strictEqual(capped.takeMinor, 25000); assert.strictEqual(capped.landlordSharePct, 98.75);
 });
 ok("settledAmounts rejects a fee above the gross and non-integers", () => {
   assert.throws(() => M.settledAmounts({ grossMinor: 100, feeMinor: 101, agentSharePct: 10 }), RangeError);
