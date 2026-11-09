@@ -1,6 +1,7 @@
 // Lipa Mos Mos SMS: sender, message texts (each under 144 characters, each starting "Dear {first name},") and send-once logging.
 import * as admin from "firebase-admin";
 import { dearLine } from "./dear";
+import { shortDate } from "./due";
 import { sendHpSms } from "../hpSms";
 
 const MAX = 144;
@@ -25,6 +26,20 @@ export const lmmText = {
     p.pct >= 100
       ? fit144(`${dearLine(p.name)} well done! Your rent is fully paid (${kes(p.paidMinor)}). Your landlord will be paid shortly.`)
       : fit144(`${dearLine(p.name)} well done! You have paid ${p.pct}% of your rent (${kes(p.paidMinor)}). ${kes(p.leftMinor)} to go. Keep going.`),
+  /** 5 days before the due date, tenant holds KES 40 (wallet) to 299: what comes off, and what reaches their rent. */
+  feeWarning: (p: { name: string; creditedMinor: number; feeMinor: number; netMinor: number; dueOn: string }) =>
+    fit144(`${dearLine(p.name)} you paid ${kes(p.creditedMinor)} on Lipa Mos Mos. On ${shortDate(p.dueOn)} a ${kes(p.feeMinor)} fee comes off: ${kes(p.netMinor)} reaches rent. Pay KES 300+ to avoid it.`),
+  /** 5 days before the due date, tenant holds too little to send at all. */
+  tooSmallWarning: (p: { name: string; creditedMinor: number; minMinor: number; dueOn: string }) =>
+    fit144(`${dearLine(p.name)} ${kes(p.creditedMinor)} is below the ${kes(p.minMinor)} minimum, so nothing can be sent to your landlord on ${shortDate(p.dueOn)}. Please pay more before then.`),
+  /** On the due date, too little to send: nothing went, it stays on the plan. */
+  tooSmallAtDue: (p: { name: string; creditedMinor: number; minMinor: number }) =>
+    fit144(`${dearLine(p.name)} your ${kes(p.creditedMinor)} is below the ${kes(p.minMinor)} minimum and was not sent. Pay more, or pay the full balance via Pay Rent.`),
+  /** Settled with the tenant bearing the transfer fee: the invoice was credited amount minus fee. */
+  landlordPaidNet: (p: { name: string; paidMinor: number; feeMinor: number; netMinor: number; leftMinor: number }) =>
+    p.leftMinor > 0
+      ? fit144(`${dearLine(p.name)} ${kes(p.netMinor)} reached your rent (${kes(p.paidMinor)} less ${kes(p.feeMinor)} fee). ${kes(p.leftMinor)} still due: pay it via Pay Rent.`)
+      : fit144(`${dearLine(p.name)} ${kes(p.netMinor)} reached your rent (${kes(p.paidMinor)} less ${kes(p.feeMinor)} transfer fee). Thank you for using Lipa Mos Mos.`),
   landlordPaid: (p: { name: string; paidMinor: number; leftMinor: number }) =>
     p.leftMinor > 0
       ? fit144(`${dearLine(p.name)} ${kes(p.paidMinor)} was sent to your landlord today. Balance ${kes(p.leftMinor)} stays on your plan.`)

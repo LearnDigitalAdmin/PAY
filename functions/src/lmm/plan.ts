@@ -6,8 +6,9 @@ import * as crypto from "crypto";
 import { HttpsError, onCall, CallableRequest } from "firebase-functions/v2/https";
 import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "../desk/paystack";
 import { checkSafaricomPhone, toMsisdn } from "../phone/safaricom";
-import { FREQUENCY_DAYS, LMM, isFrequency, type Frequency } from "./config";
-import { chargeFor, isValidCredit } from "./fees";
+import { FREQUENCY_DAYS, LMM, isFrequency, type Frequency, type PayoutKind } from "./config";
+import { settlesOn as settlesOnDate, validDate } from "./due";
+import { chargeFor, isValidCredit, smallPayoutNotice } from "./fees";
 import { openInvoices } from "./invoices";
 import { sendOnce, lmmText } from "./sms";
 
@@ -33,12 +34,20 @@ const asId = (v: unknown, label: string): string => {
 };
 
 /** Lipa Mos Mos is offered only when the landlord has a sealed, active recipient and the feature has not been paused. (Firestore can only pause it.) */
-export async function lmmAvailable(agentId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+export async function lmmAvailable(agentId: string): Promise<{ ok: true; kind: PayoutKind | null } | { ok: false; reason: string }> {
   const [cfg, rec] = await Promise.all([db().collection("lmm_config").doc("global").get(), db().collection("lmm_recipients").doc(agentId).get()]);
   if (cfg.exists && cfg.data()?.enabled === false) return { ok: false, reason: "Lipa Mos Mos is paused right now. Please try again later." };
   const r = rec.data();
   if (!r || r.status !== "active") return { ok: false, reason: "This landlord has not enabled Lipa Mos Mos yet." };
-  return { ok: true };
+  const k = String(r.type ?? "");
+  return { ok: true, kind: k === "mobile_money" || k === "mobile_money_business" || k === "kepss" ? k : null };   // only used to word what the tenant is told; the money path re-verifies the recipient
+}
+
+/** The landlord's payout kind, read only to word what a tenant is told (the money path re-verifies the recipient with Paystack). */
+export async function recipientKind(agentId: string): Promise<PayoutKind | null> {
+  const r = (await db().collection("lmm_recipients").doc(agentId).get()).data();
+  const k = String(r?.type ?? "");
+  return r?.status === "active" && (k === "mobile_money" || k === "mobile_money_business" || k === "kepss") ? k : null;
 }
 
 async function loadTenant(agentId: string, tenantId: string) {
@@ -49,26 +58,22 @@ async function loadTenant(agentId: string, tenantId: string) {
 }
 
 /** What the tenant owes right now: every open invoice (less money already paid to the landlord but not yet matched), else one month's rent. */
-export async function resolveTarget(agentId: string, tenantId: string, plan?: Pick<PlanDoc, "unappliedMinor">): Promise<{ targetMinor: number; basis: "invoices" | "rent" }> {
+export async function resolveTarget(agentId: string, tenantId: string, plan?: Pick<PlanDoc, "unappliedMinor">): Promise<{ targetMinor: number; basis: "invoices" | "rent"; dueOn: string | null }> {
   const open = await openInvoices(agentId, tenantId);
   const unapplied = plan?.unappliedMinor ?? 0;
-  if (open.length > 0) return { targetMinor: Math.max(0, open.reduce((s, i) => s + i.outstandingMinor, 0) - unapplied), basis: "invoices" };
+  if (open.length > 0) {
+    // the landlord is paid on the EARLIEST due date among the open invoices (an invoice with no usable date does not set one)
+    const dates = open.map((i) => validDate(i.dueDate)).filter((d): d is string => d !== null).sort();
+    return { targetMinor: Math.max(0, open.reduce((s, i) => s + i.outstandingMinor, 0) - unapplied), basis: "invoices", dueOn: dates[0] ?? null };
+  }
   const t = await loadTenant(agentId, tenantId);
-  return { targetMinor: Math.max(0, t.rentMinor - unapplied), basis: "rent" };
+  return { targetMinor: Math.max(0, t.rentMinor - unapplied), basis: "rent", dueOn: null };
 }
 
-/** Settlement day: the next 5th (Nairobi time), as YYYY-MM-DD. */
-export function nextSettleOn(now: number): string {
-  const d = new Date(now + 3 * 3_600_000);
-  let y = d.getUTCFullYear(), m = d.getUTCMonth();
-  if (d.getUTCDate() > LMM.SETTLE_DAY) { m += 1; if (m > 11) { m = 0; y += 1; } }
-  return `${y}-${String(m + 1).padStart(2, "0")}-${String(LMM.SETTLE_DAY).padStart(2, "0")}`;
-}
-
-/** A sensible instalment: what is left, spread over the payments between now and the 5th (never below the minimum, never above what is owed). */
-export function suggestInstalment(remainingMinor: number, frequency: Frequency, now: number): number {
+/** A sensible instalment: what is left, spread over the payments between now and the payout day (never below the minimum, never above what is owed). */
+export function suggestInstalment(remainingMinor: number, frequency: Frequency, now: number, settlesOn: string): number {
   if (remainingMinor <= 0) return 0;
-  const days = Math.max(1, Math.round((Date.parse(`${nextSettleOn(now)}T00:00:00+03:00`) - now) / 86_400_000));
+  const days = Math.max(1, Math.round((Date.parse(`${settlesOn}T00:00:00+03:00`) - now) / 86_400_000));
   const periods = Math.max(1, Math.floor(days / FREQUENCY_DAYS[frequency]));
   const each = Math.ceil(remainingMinor / periods / 100) * 100;
   return Math.min(remainingMinor, Math.max(LMM.MIN_CREDIT_MINOR, Math.min(each, LMM.MAX_CREDIT_MINOR)));
@@ -93,13 +98,16 @@ async function ensurePlan(agentId: string, tenantId: string, frequency: Frequenc
   return { id, plan, created: true };
 }
 
-const view = async (id: string, plan: PlanDoc, now: number) => {
-  const { targetMinor, basis } = await resolveTarget(plan.agentId, plan.tenantId, plan);
+const view = async (id: string, plan: PlanDoc, now: number, kind: PayoutKind | null) => {
+  const { targetMinor, basis, dueOn } = await resolveTarget(plan.agentId, plan.tenantId, plan);
   const remaining = Math.max(0, targetMinor - plan.creditedMinor);
+  const settlesOn = settlesOnDate(dueOn, now);
   return {
     planId: id, frequency: plan.frequency, status: plan.status, basis, targetMinor, creditedMinor: plan.creditedMinor, remainingMinor: remaining,
     pct: targetMinor > 0 ? Math.min(100, Math.floor((plan.creditedMinor * 100) / targetMinor)) : 100,
-    settlesOn: nextSettleOn(now), suggestedMinor: suggestInstalment(remaining, plan.frequency, now),
+    dueOn, settlesOn, suggestedMinor: suggestInstalment(remaining, plan.frequency, now, settlesOn),
+    /** Set while the plan holds under KES 300: the fee that will come off what reaches the rent, or that it is too small to send. */
+    payout: kind ? smallPayoutNotice(plan.creditedMinor, kind) : null,
   };
 };
 
@@ -113,10 +121,11 @@ export const lmm_getPlan = onCall(opts, async (request: CallableRequest<Req>) =>
   const snap = await plansCol().doc(planIdOf(agentId, tenantId)).get();
   const now = Date.now();
   if (!snap.exists) {
-    const { targetMinor, basis } = await resolveTarget(agentId, tenantId);
-    return { available: true, plan: null, targetMinor, basis, settlesOn: nextSettleOn(now), suggestedMinor: suggestInstalment(targetMinor, "weekly", now) };
+    const { targetMinor, basis, dueOn } = await resolveTarget(agentId, tenantId);
+    const settlesOn = settlesOnDate(dueOn, now);
+    return { available: true, plan: null, targetMinor, basis, dueOn, settlesOn, suggestedMinor: suggestInstalment(targetMinor, "weekly", now, settlesOn) };
   }
-  return { available: true, plan: await view(snap.id, snap.data() as PlanDoc, now) };
+  return { available: true, plan: await view(snap.id, snap.data() as PlanDoc, now, avail.kind) };
 });
 
 export const lmm_start = onCall({ ...opts, secrets: BUNDLE_SECRETS }, async (request: CallableRequest<Req>) => {
@@ -126,7 +135,7 @@ export const lmm_start = onCall({ ...opts, secrets: BUNDLE_SECRETS }, async (req
   if (!avail.ok) throw new HttpsError("failed-precondition", avail.reason);
   const now = Date.now();
   const { id, plan, created } = await ensurePlan(agentId, tenantId, request.data.frequency, now);
-  const v = await view(id, plan, now);
+  const v = await view(id, plan, now, avail.kind);
   if (created && plan.tenantPhone && v.targetMinor > 0) {
     await sendOnce(`start_${id}`, toMsisdn(plan.tenantPhone), lmmText.started({ name: plan.tenantName, targetMinor: v.targetMinor }));
   }

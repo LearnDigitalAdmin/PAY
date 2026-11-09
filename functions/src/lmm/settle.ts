@@ -6,7 +6,7 @@ import * as crypto from "crypto";
 import { PAYSTACK_API_BASE } from "../desk/paystack";
 import { alertOps } from "./alert";
 import { LMM } from "./config";
-import { chargeFor, keptMinor, planTransfers } from "./fees";
+import { BelowFloor, chargeFor, keptMinor, paystackCostMinor, planSettlement, type SettlementPlan } from "./fees";
 import { allocate, applyAllocation, openInvoices, type Allocation } from "./invoices";
 import { paymentsCol, plansCol, resolveTarget, type PlanDoc } from "./plan";
 import { getVerifiedRecipient } from "./recipient";
@@ -79,11 +79,10 @@ async function afterCredit(s: Secrets, planId: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------------------------------- 2. settle a plan
-export async function settlePlan(s: Secrets, planId: string, reason: "target" | "fifth"): Promise<string> {
+export async function settlePlan(s: Secrets, planId: string, reason: "target" | "due"): Promise<string> {
   const planRef = plansCol().doc(planId);
   const plan = (await planRef.get()).data() as PlanDoc | undefined;
   if (!plan || plan.creditedMinor <= 0) return "nothing";
-  if (plan.creditedMinor < LMM.MIN_SETTLEMENT_MINOR) return "below_minimum";
 
   const paySnap = await paymentsCol().where("planId", "==", planId).where("status", "==", "credited").where("settled", "==", false).get();
   const pays = paySnap.docs.map((d) => ({ ...(d.data() as { creditMinor: number; chargeMinor: number }), id: d.id }));
@@ -94,8 +93,12 @@ export async function settlePlan(s: Secrets, planId: string, reason: "target" | 
 
   const rec = await getVerifiedRecipient(s, plan.agentId);
   if (!rec) return "held";
-  let chunks;
-  try { chunks = planTransfers(gross, rec.type); } catch (e) { await alertOps("AMOUNT_MISMATCH", `${planId}: ${(e as Error).message}`); return "held"; }
+  // Under KES 300 the tenant bears the transfer fee, so it is only ever sent ON THE DUE DATE (never early, when the tenant could still add to it).
+  if (gross < LMM.MIN_SETTLEMENT_MINOR && reason === "target") return "waits_for_due";
+  let sp: SettlementPlan;
+  try { sp = planSettlement(gross, rec.type); }
+  catch (e) { if (e instanceof BelowFloor) return "below_floor"; await alertOps("AMOUNT_MISMATCH", `${planId}: ${(e as Error).message}`); return "held"; }
+  const chunks = sp.chunks;
 
   // every payment must still be exactly what Paystack says it was
   const checks = await Promise.all(pays.map((p) => verifyCharge(s, p.id)));
@@ -105,9 +108,9 @@ export async function settlePlan(s: Secrets, planId: string, reason: "target" | 
   const seq = plan.settleSeq + 1;
   const sid = `${planId}_${seq}`;
   const base = crypto.createHash("sha256").update(sid).digest("hex").slice(0, 16);
-  const chunkDocs = chunks.map((c, i) => ({ i, grossMinor: c.grossMinor, feeMinor: c.feeMinor, sendMinor: c.sendMinor, attempt: 0, reference: `lmm-${base}-${i}-0`, status: "queued" }));
+  const chunkDocs = chunks.map((c, i) => ({ i, grossMinor: c.grossMinor, feeMinor: c.feeMinor, sendMinor: c.sendMinor, paystackCostMinor: paystackCostMinor(c.grossMinor, rec.type), attempt: 0, reference: `lmm-${base}-${i}-0`, status: "queued" }));
   const paymentRefs = pays.map((p) => p.id);
-  const seal = sealSettlement(s.seal, { id: sid, planId, landlordId: plan.agentId, recipientCode: rec.recipientCode, grossMinor: gross, sendMinors: chunks.map((c) => c.sendMinor), paymentRefs });
+  const seal = sealSettlement(s.seal, { id: sid, planId, landlordId: plan.agentId, recipientCode: rec.recipientCode, grossMinor: gross, sendMinors: chunks.map((c) => c.sendMinor), paymentRefs, invoiceMinor: sp.invoiceMinor });
   const dayRef = db().collection("lmm_counters").doc(`out_${eatDay(Date.now())}`);
 
   try {
@@ -119,7 +122,7 @@ export async function settlePlan(s: Secrets, planId: string, reason: "target" | 
       const out = Number(day.data()?.outMinor ?? 0);
       if (out + gross > LMM.DAILY_OUTFLOW_CAP_MINOR) throw new Hold("daily outflow cap");
       tx.set(settlementsCol().doc(sid), {
-        id: sid, planId, agentId: plan.agentId, tenantId: plan.tenantId, tenantName: plan.tenantName, grossMinor: gross, reason, recipientCode: rec.recipientCode,
+        id: sid, planId, agentId: plan.agentId, tenantId: plan.tenantId, tenantName: plan.tenantName, grossMinor: gross, invoiceMinor: sp.invoiceMinor, feeBearer: sp.feeBearer, reason, recipientCode: rec.recipientCode,
         chunks: chunkDocs, refs: chunkDocs.map((c) => c.reference), paymentRefs, status: "locked", seal, createdAt: Date.now(),
       });
       for (const r of paymentRefs) tx.update(paymentsCol().doc(r), { settled: true, settlementId: sid });
@@ -139,7 +142,7 @@ export async function sendSettlement(s: Secrets, sid: string): Promise<void> {
   const ref = settlementsCol().doc(sid);
   const st = (await ref.get()).data();
   if (!st || st.status !== "locked") return;
-  const want = sealSettlement(s.seal, { id: sid, planId: st.planId, landlordId: st.agentId, recipientCode: st.recipientCode, grossMinor: st.grossMinor, sendMinors: st.chunks.map((c: any) => c.sendMinor), paymentRefs: st.paymentRefs });
+  const want = sealSettlement(s.seal, { id: sid, planId: st.planId, landlordId: st.agentId, recipientCode: st.recipientCode, grossMinor: st.grossMinor, sendMinors: st.chunks.map((c: any) => c.sendMinor), paymentRefs: st.paymentRefs, invoiceMinor: st.invoiceMinor ?? st.grossMinor });
   if (!sameSeal(st.seal, want)) { await ref.update({ status: "blocked" }); await alertOps("SEAL_MISMATCH", `settlement ${sid} was altered`); return; }
   const rec = await getVerifiedRecipient(s, st.agentId);
   if (!rec || rec.recipientCode !== st.recipientCode) return;   // alert already raised; stays locked, retried by the sweep
@@ -221,7 +224,7 @@ export async function applySettlement(sid: string): Promise<void> {
   try {
     let alloc: Allocation = st.allocation;
     if (!alloc) {
-      alloc = allocate(await openInvoices(st.agentId, st.tenantId), st.grossMinor);
+      alloc = allocate(await openInvoices(st.agentId, st.tenantId), Number(st.invoiceMinor ?? st.grossMinor));   // gross, or gross minus the fee when the tenant bore it
       await ref.update({ allocation: alloc });   // fixed here, so a re-run applies the same lines
     }
     await applyAllocation(st.agentId, st.tenantId, st.tenantName, sid, alloc);
@@ -235,7 +238,13 @@ export async function applySettlement(sid: string): Promise<void> {
     const pl = (await plansCol().doc(st!.planId).get()).data() as PlanDoc;
     // what is STILL owed on open invoices (not next month's rent, which is not due yet)
     const owed = (await openInvoices(pl.agentId, pl.tenantId)).reduce((sum, i) => sum + i.outstandingMinor, 0);
-    if (pl.tenantPhone) await sendOnce(`paid_${sid}`, toMsisdn(pl.tenantPhone), lmmText.landlordPaid({ name: pl.tenantName, paidMinor: st!.grossMinor, leftMinor: Math.max(0, owed - pl.creditedMinor) }));
+    const left = Math.max(0, owed - pl.creditedMinor);
+    const tenantBore = st!.feeBearer === "tenant" && Number(st!.invoiceMinor) < Number(st!.grossMinor);
+    if (pl.tenantPhone) {
+      await sendOnce(`paid_${sid}`, toMsisdn(pl.tenantPhone), tenantBore
+        ? lmmText.landlordPaidNet({ name: pl.tenantName, paidMinor: st!.grossMinor, feeMinor: st!.grossMinor - st!.invoiceMinor, netMinor: st!.invoiceMinor, leftMinor: left })
+        : lmmText.landlordPaid({ name: pl.tenantName, paidMinor: st!.grossMinor, leftMinor: left }));
+    }
   } catch (err) { await alertOps("INVOICE_APPLY_FAILED", `${sid}: ${(err as Error)?.message}`); }
 }
 

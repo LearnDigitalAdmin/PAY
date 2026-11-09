@@ -1,0 +1,814 @@
+diff --git a/functions/src/lmm/config.ts b/functions/src/lmm/config.ts
+index 067228a..c5d21e2 100644
+--- a/functions/src/lmm/config.ts
++++ b/functions/src/lmm/config.ts
+@@ -9,19 +9,39 @@ export const LMM = {
+   SMALL_BELOW_MINOR: 10_000,            // KES 100
+   MIN_CREDIT_MINOR: 1_000,              // KES 10 (whole shillings only)
+   MAX_CREDIT_MINOR: 15_000_000,         // KES 150,000 per instalment
+-  /** The landlord is paid when the plan reaches its target, or on this day of the month with whatever is in. */
++  /** The landlord is paid when the plan reaches its target, or on the earliest open invoice's DUE DATE with whatever is in. Only a tenant with no open invoice falls back to this day of the month. */
+   SETTLE_DAY: 5,
+-  MIN_SETTLEMENT_MINOR: 30_000,         // KES 300: below this the KES 95 transfer fee would eat the payout; it waits for the next run
++  /** KES 300. Up to and including this, the transfer is priced at Paystack's cost + MARGIN_MINOR (KES 30 to a wallet). Below it the TENANT bears that fee (see fees.ts). */
++  MIN_SETTLEMENT_MINOR: 30_000,
+   MAX_SETTLEMENT_MINOR: 90_000_000,     // KES 900,000: the top of the transfer-fee table; nothing larger is ever sent automatically
+   WALLET_MAX_TRANSFER_MINOR: 15_000_000, // Paystack's M-PESA wallet limit per transfer
+   /** Hard ceiling on what this feature may send out in one Nairobi day, across all landlords. */
+   DAILY_OUTFLOW_CAP_MINOR: 200_000_000, // KES 2,000,000
+-  /** Landlord/agency transfer fee, by the amount being transferred (minor units). Up to 10,000 -> 95 | below 40,000 -> 183 | up to 900,000 -> 257. */
+-  FEE_TIERS: [
+-    { upToMinor: 1_000_000, feeMinor: 9_500 },
+-    { upToMinor: 3_999_999, feeMinor: 18_300 },
+-    { upToMinor: 90_000_000, feeMinor: 25_700 },
+-  ],
++  /**
++   * What PAYSTACK charges US per transfer, by recipient type and the amount sent (minor units). Source: Paystack Kenya transfer pricing
++   * (support.paystack.com/en/articles/2132866). Re-check against the Paystack dashboard after any price change; excise duty is NOT included.
++   * NOTE: the first Till row on Paystack's page is garbled; KES 40 for up to KES 1,500 is assumed (the dearer reading is KES 80, which this
++   * table's margin guard would NOT cover - confirm on the dashboard).
++   */
++  PAYSTACK_TRANSFER_COST: {
++    mobile_money: [{ upToMinor: 150_000, costMinor: 2_000 }, { upToMinor: 2_000_000, costMinor: 4_000 }, { upToMinor: 15_000_000, costMinor: 6_000 }],
++    mobile_money_business: [{ upToMinor: 150_000, costMinor: 4_000 }, { upToMinor: 1_000_000, costMinor: 8_000 }, { upToMinor: 4_000_000, costMinor: 14_000 }, { upToMinor: 99_900_000, costMinor: 18_000 }],
++    kepss: [{ upToMinor: 1_000_000, costMinor: 8_000 }, { upToMinor: 5_000_000, costMinor: 12_000 }, { upToMinor: 99_999_900, costMinor: 14_000 }],
++  },
++  /** Our smallest mark-up over Paystack's cost on any transfer: KES 10. The fee is never below cost + this. */
++  MARGIN_MINOR: 1_000,
++  /** Paystack will not send less than KES 10. */
++  MIN_SEND_MINOR: 1_000,
++  /**
++   * What the landlord is charged for a transfer above KES 300 (always >= Paystack's cost + MARGIN_MINOR, whichever is higher).
++   *  Band 1, up to KES 10,000: 0.95% of the amount, but never below the floor for its size (KES 36 up to 1,500; KES 60 from 1,501), so it reaches
++   *    KES 95 at KES 10,000. Band 2, KES 10,001 to 39,999: rises evenly from KES 120 to KES 183. Band 3, KES 40,000 to 900,000: KES 257 flat.
++   */
++  FEE_BAND1: { topMinor: 1_000_000, pctBps: 95, floors: [{ upToMinor: 150_000, feeMinor: 3_600 }, { upToMinor: 1_000_000, feeMinor: 6_000 }] },
++  FEE_BAND2: { fromMinor: 1_000_000, toMinor: 4_000_000, lowMinor: 12_000, highMinor: 18_300 },
++  FEE_BAND3_MINOR: 25_700,
++  /** Tenants with less than KES 300 credited are warned this many days before the due date that a transfer fee will come off. */
++  WARN_DAYS_BEFORE_DUE: 5,
+   /** Reminder rhythm per plan frequency: days without a payment before a "missed" SMS, and the days between reminders. */
+   MISSED_AFTER_DAYS: { daily: 2, weekly: 8, biweekly: 15 },
+   MIN_DAYS_BETWEEN_SMS: 3,
+@@ -30,6 +50,7 @@ export const LMM = {
+   PENDING_PAYMENT_TTL_MS: 24 * 3_600_000,
+ } as const;
+ 
++export type PayoutKind = "mobile_money" | "mobile_money_business" | "kepss";
+ export type Frequency = "daily" | "weekly" | "biweekly";
+ export const FREQUENCIES: readonly Frequency[] = ["daily", "weekly", "biweekly"];
+ export const FREQUENCY_DAYS: Record<Frequency, number> = { daily: 1, weekly: 7, biweekly: 14 };
+diff --git a/functions/src/lmm/due.ts b/functions/src/lmm/due.ts
+new file mode 100644
+index 0000000..748021f
+--- /dev/null
++++ b/functions/src/lmm/due.ts
+@@ -0,0 +1,48 @@
++// When a plan's money is due to go to the landlord. Pure. Dates are Nairobi calendar days as "YYYY-MM-DD" (they sort as text).
++import { LMM } from "./config";
++
++const EAT = 3 * 3_600_000, DAY = 86_400_000;
++const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
++
++/** Today's date in Nairobi. */
++export const eatDate = (now: number): string => new Date(now + EAT).toISOString().slice(0, 10);
++
++/** An invoice due date if it is a real "YYYY-MM-DD" (anything else is ignored, never guessed). */
++export function validDate(v: unknown): string | null {
++  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v ?? ""));
++  if (!m) return null;
++  const d = `${m[1]}-${m[2]}-${m[3]}`;
++  return Number.isNaN(Date.parse(`${d}T00:00:00Z`)) ? null : d;
++}
++
++/** The next 10:00 Nairobi sweep that has not run yet: today before 10:00, otherwise tomorrow. */
++export function nextSweepDate(now: number): string {
++  const hour = new Date(now + EAT).getUTCHours();
++  return eatDate(hour < 10 ? now : now + DAY);
++}
++
++/** The first "5th" (the old settlement day) on or after `fromIso`. Used only when a tenant has no open invoice. */
++export function fifthOnOrAfter(fromIso: string): string {
++  let y = Number(fromIso.slice(0, 4)), m = Number(fromIso.slice(5, 7)) - 1;
++  if (Number(fromIso.slice(8, 10)) > LMM.SETTLE_DAY) { m += 1; if (m > 11) { m = 0; y += 1; } }
++  return `${y}-${String(m + 1).padStart(2, "0")}-${String(LMM.SETTLE_DAY).padStart(2, "0")}`;
++}
++
++/** The day the landlord is next paid with whatever is collected: the earliest open invoice's due date (or the 5th if nothing is invoiced), but never a sweep that already ran. */
++export function settlesOn(dueOn: string | null, now: number): string {
++  const sweep = nextSweepDate(now);
++  const target = dueOn ?? fifthOnOrAfter(sweep);
++  return target >= sweep ? target : sweep;
++}
++
++/** Does the sweep of `today` pay this plan out? Due date reached (or passed); with no invoice, only on the 5th. */
++export const payoutDue = (dueOn: string | null, today: string): boolean => (dueOn ? dueOn <= today : Number(today.slice(8, 10)) === LMM.SETTLE_DAY);
++
++/** Whole days from today (Nairobi) to a due date; negative once it is past. */
++export const daysUntil = (iso: string, now: number): number => Math.round((Date.parse(`${iso}T00:00:00Z`) - Date.parse(`${eatDate(now)}T00:00:00Z`)) / DAY);
++
++/** "2026-11-05" -> "5 Nov" (for SMS and screens). */
++export function shortDate(iso: string): string {
++  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
++  return m ? `${Number(m[3])} ${MON[Number(m[2]) - 1]}` : iso;
++}
+diff --git a/functions/src/lmm/fees.ts b/functions/src/lmm/fees.ts
+index 0452e50..ba76d42 100644
+--- a/functions/src/lmm/fees.ts
++++ b/functions/src/lmm/fees.ts
+@@ -1,5 +1,5 @@
+ // Lipa Mos Mos money maths. Pure, integer minor units (KES x 100). No imports but config.
+-import { LMM } from "./config";
++import { LMM, type PayoutKind } from "./config";
+ 
+ /** Tenant surcharge in basis points: 5% for an instalment under KES 100, otherwise 2.5%. */
+ export function surchargeBps(creditMinor: number): number {
+@@ -28,20 +28,51 @@ export function chargeFor(creditMinor: number): Charge {
+ /** What Samuhia keeps from one instalment, given the fee Paystack really took. Can be negative only if Paystack's fee exceeds the surcharge. */
+ export const keptMinor = (c: Pick<Charge, "chargeMinor" | "creditMinor">, paystackFeeMinor: number): number => c.chargeMinor - c.creditMinor - paystackFeeMinor;
+ 
+-/** Transfer fee charged to the landlord/agency for sending `amountMinor`. Throws above the top of the table: nothing that large goes out automatically. */
+-export function transferFeeMinor(amountMinor: number): number {
+-  if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) throw new RangeError("amount must be a positive integer");
+-  const tier = LMM.FEE_TIERS.find((t) => amountMinor <= t.upToMinor);
++const wholeShilling = (minor: number): number => Math.ceil(minor / 100) * 100;
++
++/** What Paystack charges US to send `amountMinor` to this kind of recipient (see LMM.PAYSTACK_TRANSFER_COST). */
++export function paystackCostMinor(amountMinor: number, type: PayoutKind): number {
++  const tier = LMM.PAYSTACK_TRANSFER_COST[type].find((t) => amountMinor <= t.upToMinor);
+   if (!tier) throw new RangeError("amount is above the automatic transfer limit");
+-  return tier.feeMinor;
++  return tier.costMinor;
+ }
+ 
++/**
++ * Transfer fee for sending `amountMinor` to a `type` recipient. Whole shillings, and NEVER below Paystack's cost + our KES 10 mark-up.
++ *  - up to KES 300: cost + mark-up only (KES 30 to an M-PESA wallet; KES 50 to a till; KES 90 to a bank).
++ *  - KES 301 to 10,000: 0.95% of the amount, but not below KES 36 (up to 1,500) or KES 60 (from 1,501). KES 95 at KES 10,000.
++ *  - KES 10,001 to 39,999: rises evenly from KES 120 to KES 183.   - KES 40,000 to 900,000: KES 257.
++ * Throws above the top of the table: nothing that large goes out automatically.
++ */
++export function transferFeeMinor(amountMinor: number, type: PayoutKind = "mobile_money"): number {
++  if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) throw new RangeError("amount must be a positive integer");
++  const floor = paystackCostMinor(amountMinor, type) + LMM.MARGIN_MINOR;
++  if (amountMinor <= LMM.MIN_SETTLEMENT_MINOR) return wholeShilling(floor);
++  const b1 = LMM.FEE_BAND1, b2 = LMM.FEE_BAND2;
++  let scaled: number;
++  if (amountMinor <= b1.topMinor) {
++    const band = b1.floors.find((f) => amountMinor <= f.upToMinor)!;
++    scaled = Math.max(band.feeMinor, Math.ceil((amountMinor * b1.pctBps) / 10_000));
++  } else if (amountMinor < b2.toMinor) {
++    scaled = b2.lowMinor + Math.ceil(((amountMinor - b2.fromMinor) * (b2.highMinor - b2.lowMinor)) / (b2.toMinor - b2.fromMinor));
++    scaled = Math.min(b2.highMinor, Math.max(b2.lowMinor, scaled));
++  } else if (amountMinor <= LMM.MAX_SETTLEMENT_MINOR) scaled = LMM.FEE_BAND3_MINOR;
++  else throw new RangeError("amount is above the automatic transfer limit");
++  return wholeShilling(Math.max(scaled, floor));
++}
++
++/** Least that can be settled to this kind of recipient at all: the small-settlement fee plus the KES 10 Paystack will not go below. KES 40 to a wallet. */
++export const minSendableMinor = (type: PayoutKind): number => transferFeeMinor(LMM.MIN_SETTLEMENT_MINOR, type) + LMM.MIN_SEND_MINOR;
++
+ export interface TransferChunk { grossMinor: number; feeMinor: number; sendMinor: number }
++/** Thrown when what the plan holds is too small to send even after the fee (the money stays on the plan). */
++export class BelowFloor extends RangeError { constructor(public readonly floorMinor: number) { super("settlement is below the least that can be sent"); } }
++
+ /**
+- * Splits one settlement into the transfers to make. An M-PESA wallet takes at most KES 150,000 per transfer, so a larger settlement is
+- * split, each part carrying its own fee. Banks and tills take the whole amount in one transfer. Every part must clear its own fee.
++ * Splits one settlement of KES 300 or more into the transfers to make. An M-PESA wallet takes at most KES 150,000 per transfer, so a larger
++ * settlement is split, each part carrying its own fee. Banks and tills take the whole amount in one transfer. Every part must clear its own fee.
+  */
+-export function planTransfers(grossMinor: number, recipientType: "mobile_money" | "mobile_money_business" | "kepss"): TransferChunk[] {
++export function planTransfers(grossMinor: number, recipientType: PayoutKind): TransferChunk[] {
+   if (!Number.isSafeInteger(grossMinor) || grossMinor < LMM.MIN_SETTLEMENT_MINOR) throw new RangeError("settlement is below the minimum");
+   if (grossMinor > LMM.MAX_SETTLEMENT_MINOR) throw new RangeError("settlement is above the automatic transfer limit");
+   // Wallet: as few transfers as the KES 150,000 limit allows, shared evenly so no part is a crumb. Bank / till: one transfer.
+@@ -49,8 +80,39 @@ export function planTransfers(grossMinor: number, recipientType: "mobile_money"
+   const base = Math.floor(grossMinor / n), extra = grossMinor - base * n;
+   const parts = Array.from({ length: n }, (_, i) => base + (i < extra ? 1 : 0));
+   return parts.map((g) => {
+-    const feeMinor = transferFeeMinor(g);
++    const feeMinor = transferFeeMinor(g, recipientType);
+     if (g <= feeMinor) throw new RangeError("settlement does not cover its transfer fee");
+     return { grossMinor: g, feeMinor, sendMinor: g - feeMinor };
+   });
+ }
++
++export interface SettlementPlan { chunks: TransferChunk[]; feeBearer: "landlord" | "tenant"; invoiceMinor: number }
++/**
++ * Who pays the transfer fee, and what the invoice is credited.
++ *  - KES 300 or more: the LANDLORD bears it (as before). The invoice is credited the full amount.
++ *  - KES 40 (wallet) to 299: the TENANT bears a flat Paystack cost + KES 10 (KES 30 to a wallet). The landlord receives, and the invoice is
++ *    credited, only amount - fee; the tenant still owes that fee on the invoice. The landlord never pays for a tenant who did not clear.
++ *  - below the least that can be sent: nothing is sent (BelowFloor); the money stays on the plan.
++ */
++export function planSettlement(grossMinor: number, type: PayoutKind): SettlementPlan {
++  if (!Number.isSafeInteger(grossMinor) || grossMinor <= 0) throw new RangeError("settlement must be a positive integer");
++  if (grossMinor >= LMM.MIN_SETTLEMENT_MINOR) return { chunks: planTransfers(grossMinor, type), feeBearer: "landlord", invoiceMinor: grossMinor };
++  const feeMinor = transferFeeMinor(grossMinor, type);
++  if (grossMinor < feeMinor + LMM.MIN_SEND_MINOR) throw new BelowFloor(feeMinor + LMM.MIN_SEND_MINOR);
++  return { chunks: [{ grossMinor, feeMinor, sendMinor: grossMinor - feeMinor }], feeBearer: "tenant", invoiceMinor: grossMinor - feeMinor };
++}
++
++export type SmallPayoutNotice =
++  | { kind: "fee_from_rent"; creditedMinor: number; feeMinor: number; netMinor: number; thresholdMinor: number }
++  | { kind: "too_small"; creditedMinor: number; minMinor: number; thresholdMinor: number };
++/**
++ * What a tenant holding under KES 300 should be told: the fee that will come off what reaches their rent (and how much does reach it), or that what they
++ * hold is too small to send at all. null when nothing is held or the amount is KES 300 or more (the landlord bears the fee then). One source for SMS and screens.
++ */
++export function smallPayoutNotice(creditedMinor: number, type: PayoutKind): SmallPayoutNotice | null {
++  if (!Number.isSafeInteger(creditedMinor) || creditedMinor <= 0 || creditedMinor >= LMM.MIN_SETTLEMENT_MINOR) return null;
++  const thresholdMinor = LMM.MIN_SETTLEMENT_MINOR, feeMinor = transferFeeMinor(creditedMinor, type), minMinor = feeMinor + LMM.MIN_SEND_MINOR;
++  return creditedMinor < minMinor
++    ? { kind: "too_small", creditedMinor, minMinor, thresholdMinor }
++    : { kind: "fee_from_rent", creditedMinor, feeMinor, netMinor: creditedMinor - feeMinor, thresholdMinor };
++}
+diff --git a/functions/src/lmm/index.ts b/functions/src/lmm/index.ts
+index 397d12f..cbc17ab 100644
+--- a/functions/src/lmm/index.ts
++++ b/functions/src/lmm/index.ts
+@@ -11,7 +11,9 @@ import { createSealedRecipient } from "./recipient";
+ import { missedReminder } from "./reminders";
+ import { LMM_SEAL_KEY } from "./seal";
+ import { applySettlement, creditPayment, onTransferEvent, reconcileSent, sendSettlement, settlePlan, settlementsCol, type Secrets } from "./settle";
+-import { plansCol, paymentsCol, resolveTarget, type PlanDoc } from "./plan";
++import { daysUntil, eatDate, payoutDue } from "./due";
++import { minSendableMinor, smallPayoutNotice } from "./fees";
++import { plansCol, paymentsCol, recipientKind, resolveTarget, type PlanDoc } from "./plan";
+ import { lmmText, sendOnce } from "./sms";
+ import { BUNDLE_SECRETS } from "../secretsBundle";
+ 
+@@ -53,7 +55,7 @@ export const lmm_recipientStatus = onCall({ region: "africa-south1", cors: true,
+ 
+ const eat = (now: number) => new Date(now + 3 * 3_600_000);
+ 
+-/** 10:00 Nairobi daily: resume anything half-done, settle on the 5th, send reminders, expire dead charges. */
++/** 10:00 Nairobi daily: resume anything half-done, pay out plans whose due date has come, warn and remind tenants, expire dead charges. */
+ export const lmm_dailySweep = onSchedule(
+   { schedule: "0 10 * * *", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 540, memory: "512MiB", secrets: BUNDLE_SECRETS },
+   async () => {
+@@ -67,17 +69,41 @@ export const lmm_dailySweep = onSchedule(
+           else await applySettlement(d.id);
+         } catch (e) { await alertOps("UNEXPECTED", `resume ${d.id}: ${(e as Error).message}`); }
+       }
+-      // 2) the 5th: pay out whatever has been collected, even if the target was not reached (invoices become "partial")
+-      if (eat(now).getUTCDate() === LMM.SETTLE_DAY) {
+-        for (const d of (await plansCol().where("creditedMinor", ">", 0).get()).docs) {
+-          try { await settlePlan(s, d.id, "fifth"); } catch (e) { await alertOps("UNEXPECTED", `settle ${d.id}: ${(e as Error).message}`); }
+-        }
++      // 2) pay out every plan whose DUE DATE has come (the earliest open invoice's dueDate, today or already past; the 5th only when nothing is invoiced).
++      //    Whatever has been collected goes, even if the target was not reached (invoices become "partial"). A plan that was missed on its day is caught up here.
++      const today = eatDate(now);
++      for (const d of (await plansCol().where("creditedMinor", ">", 0).get()).docs) {
++        const p = d.data() as PlanDoc;
++        let dueOn: string | null;
++        try { dueOn = (await resolveTarget(p.agentId, p.tenantId, p)).dueOn; } catch (e) { console.error("LMM due date failed", d.id, (e as Error).message); continue; }
++        if (!payoutDue(dueOn, today)) continue;
++        try {
++          const r = await settlePlan(s, d.id, "due");
++          if (r === "below_floor" && p.tenantPhone) {
++            // too little to send even after the fee: nothing goes, the money stays on the plan, and the tenant is told (once per due date)
++            const kind = await recipientKind(p.agentId);
++            if (kind) await sendOnce(`floor_${d.id}_${dueOn ?? today.slice(0, 7)}`, toMsisdn(p.tenantPhone), lmmText.tooSmallAtDue({ name: p.tenantName, creditedMinor: p.creditedMinor, minMinor: minSendableMinor(kind) }));
++          }
++        } catch (e) { await alertOps("UNEXPECTED", `settle ${d.id}: ${(e as Error).message}`); }
+       }
+-      // 3) gentle reminders
++      // 3) tenant messages: the 5-day fee warning, then the gentle missed-payment reminder
+       for (const d of (await plansCol().where("status", "==", "active").get()).docs) {
+         const p = d.data() as PlanDoc;
+         try {
+-          const { targetMinor, basis } = await resolveTarget(p.agentId, p.tenantId, p);
++          const { targetMinor, basis, dueOn } = await resolveTarget(p.agentId, p.tenantId, p);
++          // 3a) FIVE DAYS BEFORE THE DUE DATE a tenant holding under KES 300 is told what a payout will cost them. Once per due date and kind of notice.
++          if (p.tenantPhone && dueOn && p.creditedMinor > 0 && p.creditedMinor < LMM.MIN_SETTLEMENT_MINOR) {
++            const days = daysUntil(dueOn, now);
++            const kind = days >= 0 && days <= LMM.WARN_DAYS_BEFORE_DUE ? await recipientKind(p.agentId) : null;
++            const n = kind ? smallPayoutNotice(p.creditedMinor, kind) : null;
++            if (n) {
++              const msisdn = toMsisdn(p.tenantPhone);
++              const sent = await sendOnce(`warn_${d.id}_${dueOn}_${n.kind}`, msisdn, n.kind === "fee_from_rent"
++                ? lmmText.feeWarning({ name: p.tenantName, creditedMinor: n.creditedMinor, feeMinor: n.feeMinor, netMinor: n.netMinor, dueOn })
++                : lmmText.tooSmallWarning({ name: p.tenantName, creditedMinor: n.creditedMinor, minMinor: n.minMinor, dueOn }));
++              if (sent) { await d.ref.update({ lastSmsAt: now }); continue; }   // one message a day is enough
++            }
++          }
+           if (basis !== "invoices") continue;          // nothing is due yet (no open invoice): never nag
+           const remaining = targetMinor - p.creditedMinor;
+           const m = missedReminder({ frequency: p.frequency, status: p.status, remainingMinor: remaining, createdAt: p.createdAt, lastPaymentAt: p.lastPaymentAt, lastSmsAt: p.lastSmsAt, missedCount: p.missedCount }, now);
+diff --git a/functions/src/lmm/plan.ts b/functions/src/lmm/plan.ts
+index 2f5efd6..921c181 100644
+--- a/functions/src/lmm/plan.ts
++++ b/functions/src/lmm/plan.ts
+@@ -6,8 +6,9 @@ import * as crypto from "crypto";
+ import { HttpsError, onCall, CallableRequest } from "firebase-functions/v2/https";
+ import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "../desk/paystack";
+ import { checkSafaricomPhone, toMsisdn } from "../phone/safaricom";
+-import { FREQUENCY_DAYS, LMM, isFrequency, type Frequency } from "./config";
+-import { chargeFor, isValidCredit } from "./fees";
++import { FREQUENCY_DAYS, LMM, isFrequency, type Frequency, type PayoutKind } from "./config";
++import { settlesOn as settlesOnDate, validDate } from "./due";
++import { chargeFor, isValidCredit, smallPayoutNotice } from "./fees";
+ import { openInvoices } from "./invoices";
+ import { sendOnce, lmmText } from "./sms";
+ 
+@@ -33,12 +34,20 @@ const asId = (v: unknown, label: string): string => {
+ };
+ 
+ /** Lipa Mos Mos is offered only when the landlord has a sealed, active recipient and the feature has not been paused. (Firestore can only pause it.) */
+-export async function lmmAvailable(agentId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
++export async function lmmAvailable(agentId: string): Promise<{ ok: true; kind: PayoutKind | null } | { ok: false; reason: string }> {
+   const [cfg, rec] = await Promise.all([db().collection("lmm_config").doc("global").get(), db().collection("lmm_recipients").doc(agentId).get()]);
+   if (cfg.exists && cfg.data()?.enabled === false) return { ok: false, reason: "Lipa Mos Mos is paused right now. Please try again later." };
+   const r = rec.data();
+   if (!r || r.status !== "active") return { ok: false, reason: "This landlord has not enabled Lipa Mos Mos yet." };
+-  return { ok: true };
++  const k = String(r.type ?? "");
++  return { ok: true, kind: k === "mobile_money" || k === "mobile_money_business" || k === "kepss" ? k : null };   // only used to word what the tenant is told; the money path re-verifies the recipient
++}
++
++/** The landlord's payout kind, read only to word what a tenant is told (the money path re-verifies the recipient with Paystack). */
++export async function recipientKind(agentId: string): Promise<PayoutKind | null> {
++  const r = (await db().collection("lmm_recipients").doc(agentId).get()).data();
++  const k = String(r?.type ?? "");
++  return r?.status === "active" && (k === "mobile_money" || k === "mobile_money_business" || k === "kepss") ? k : null;
+ }
+ 
+ async function loadTenant(agentId: string, tenantId: string) {
+@@ -49,26 +58,22 @@ async function loadTenant(agentId: string, tenantId: string) {
+ }
+ 
+ /** What the tenant owes right now: every open invoice (less money already paid to the landlord but not yet matched), else one month's rent. */
+-export async function resolveTarget(agentId: string, tenantId: string, plan?: Pick<PlanDoc, "unappliedMinor">): Promise<{ targetMinor: number; basis: "invoices" | "rent" }> {
++export async function resolveTarget(agentId: string, tenantId: string, plan?: Pick<PlanDoc, "unappliedMinor">): Promise<{ targetMinor: number; basis: "invoices" | "rent"; dueOn: string | null }> {
+   const open = await openInvoices(agentId, tenantId);
+   const unapplied = plan?.unappliedMinor ?? 0;
+-  if (open.length > 0) return { targetMinor: Math.max(0, open.reduce((s, i) => s + i.outstandingMinor, 0) - unapplied), basis: "invoices" };
++  if (open.length > 0) {
++    // the landlord is paid on the EARLIEST due date among the open invoices (an invoice with no usable date does not set one)
++    const dates = open.map((i) => validDate(i.dueDate)).filter((d): d is string => d !== null).sort();
++    return { targetMinor: Math.max(0, open.reduce((s, i) => s + i.outstandingMinor, 0) - unapplied), basis: "invoices", dueOn: dates[0] ?? null };
++  }
+   const t = await loadTenant(agentId, tenantId);
+-  return { targetMinor: Math.max(0, t.rentMinor - unapplied), basis: "rent" };
+-}
+-
+-/** Settlement day: the next 5th (Nairobi time), as YYYY-MM-DD. */
+-export function nextSettleOn(now: number): string {
+-  const d = new Date(now + 3 * 3_600_000);
+-  let y = d.getUTCFullYear(), m = d.getUTCMonth();
+-  if (d.getUTCDate() > LMM.SETTLE_DAY) { m += 1; if (m > 11) { m = 0; y += 1; } }
+-  return `${y}-${String(m + 1).padStart(2, "0")}-${String(LMM.SETTLE_DAY).padStart(2, "0")}`;
++  return { targetMinor: Math.max(0, t.rentMinor - unapplied), basis: "rent", dueOn: null };
+ }
+ 
+-/** A sensible instalment: what is left, spread over the payments between now and the 5th (never below the minimum, never above what is owed). */
+-export function suggestInstalment(remainingMinor: number, frequency: Frequency, now: number): number {
++/** A sensible instalment: what is left, spread over the payments between now and the payout day (never below the minimum, never above what is owed). */
++export function suggestInstalment(remainingMinor: number, frequency: Frequency, now: number, settlesOn: string): number {
+   if (remainingMinor <= 0) return 0;
+-  const days = Math.max(1, Math.round((Date.parse(`${nextSettleOn(now)}T00:00:00+03:00`) - now) / 86_400_000));
++  const days = Math.max(1, Math.round((Date.parse(`${settlesOn}T00:00:00+03:00`) - now) / 86_400_000));
+   const periods = Math.max(1, Math.floor(days / FREQUENCY_DAYS[frequency]));
+   const each = Math.ceil(remainingMinor / periods / 100) * 100;
+   return Math.min(remainingMinor, Math.max(LMM.MIN_CREDIT_MINOR, Math.min(each, LMM.MAX_CREDIT_MINOR)));
+@@ -93,13 +98,16 @@ async function ensurePlan(agentId: string, tenantId: string, frequency: Frequenc
+   return { id, plan, created: true };
+ }
+ 
+-const view = async (id: string, plan: PlanDoc, now: number) => {
+-  const { targetMinor, basis } = await resolveTarget(plan.agentId, plan.tenantId, plan);
++const view = async (id: string, plan: PlanDoc, now: number, kind: PayoutKind | null) => {
++  const { targetMinor, basis, dueOn } = await resolveTarget(plan.agentId, plan.tenantId, plan);
+   const remaining = Math.max(0, targetMinor - plan.creditedMinor);
++  const settlesOn = settlesOnDate(dueOn, now);
+   return {
+     planId: id, frequency: plan.frequency, status: plan.status, basis, targetMinor, creditedMinor: plan.creditedMinor, remainingMinor: remaining,
+     pct: targetMinor > 0 ? Math.min(100, Math.floor((plan.creditedMinor * 100) / targetMinor)) : 100,
+-    settlesOn: nextSettleOn(now), suggestedMinor: suggestInstalment(remaining, plan.frequency, now),
++    dueOn, settlesOn, suggestedMinor: suggestInstalment(remaining, plan.frequency, now, settlesOn),
++    /** Set while the plan holds under KES 300: the fee that will come off what reaches the rent, or that it is too small to send. */
++    payout: kind ? smallPayoutNotice(plan.creditedMinor, kind) : null,
+   };
+ };
+ 
+@@ -113,10 +121,11 @@ export const lmm_getPlan = onCall(opts, async (request: CallableRequest<Req>) =>
+   const snap = await plansCol().doc(planIdOf(agentId, tenantId)).get();
+   const now = Date.now();
+   if (!snap.exists) {
+-    const { targetMinor, basis } = await resolveTarget(agentId, tenantId);
+-    return { available: true, plan: null, targetMinor, basis, settlesOn: nextSettleOn(now), suggestedMinor: suggestInstalment(targetMinor, "weekly", now) };
++    const { targetMinor, basis, dueOn } = await resolveTarget(agentId, tenantId);
++    const settlesOn = settlesOnDate(dueOn, now);
++    return { available: true, plan: null, targetMinor, basis, dueOn, settlesOn, suggestedMinor: suggestInstalment(targetMinor, "weekly", now, settlesOn) };
+   }
+-  return { available: true, plan: await view(snap.id, snap.data() as PlanDoc, now) };
++  return { available: true, plan: await view(snap.id, snap.data() as PlanDoc, now, avail.kind) };
+ });
+ 
+ export const lmm_start = onCall({ ...opts, secrets: BUNDLE_SECRETS }, async (request: CallableRequest<Req>) => {
+@@ -126,7 +135,7 @@ export const lmm_start = onCall({ ...opts, secrets: BUNDLE_SECRETS }, async (req
+   if (!avail.ok) throw new HttpsError("failed-precondition", avail.reason);
+   const now = Date.now();
+   const { id, plan, created } = await ensurePlan(agentId, tenantId, request.data.frequency, now);
+-  const v = await view(id, plan, now);
++  const v = await view(id, plan, now, avail.kind);
+   if (created && plan.tenantPhone && v.targetMinor > 0) {
+     await sendOnce(`start_${id}`, toMsisdn(plan.tenantPhone), lmmText.started({ name: plan.tenantName, targetMinor: v.targetMinor }));
+   }
+diff --git a/functions/src/lmm/seal.ts b/functions/src/lmm/seal.ts
+index e288b39..47b3f0f 100644
+--- a/functions/src/lmm/seal.ts
++++ b/functions/src/lmm/seal.ts
+@@ -14,9 +14,11 @@ export const fingerprint = (key: string, bankCode: string, accountNumber: string
+ export const sealRecipient = (key: string, r: { landlordId: string; recipientCode: string; type: string; bankCode: string; fp: string }): string =>
+   hmac(key, "recipient", [r.landlordId, r.recipientCode, r.type, r.bankCode.toUpperCase(), r.fp]);
+ 
+-/** Everything that decides one settlement: the plan, the recipient, how much and in how many parts. Re-checked right before sending. */
+-export const sealSettlement = (key: string, s: { id: string; planId: string; landlordId: string; recipientCode: string; grossMinor: number; sendMinors: number[]; paymentRefs: string[] }): string =>
+-  hmac(key, "settlement", [s.id, s.planId, s.landlordId, s.recipientCode, s.grossMinor, s.sendMinors.join(","), [...s.paymentRefs].sort().join(",")]);
++/** Everything that decides one settlement: the plan, the recipient, how much, in how many parts, and what the invoice is credited. Re-checked right before sending. */
++export const sealSettlement = (key: string, s: { id: string; planId: string; landlordId: string; recipientCode: string; grossMinor: number; sendMinors: number[]; paymentRefs: string[]; invoiceMinor?: number }): string =>
++  hmac(key, "settlement", [s.id, s.planId, s.landlordId, s.recipientCode, s.grossMinor, s.sendMinors.join(","), [...s.paymentRefs].sort().join(","),
++    // what the invoice is credited is part of the seal only when the tenant bears the fee (invoiceMinor < gross), so settlements sealed before this existed still verify
++    ...(s.invoiceMinor !== undefined && s.invoiceMinor !== s.grossMinor ? [`inv:${s.invoiceMinor}`] : [])]);
+ 
+ export function sameSeal(a: unknown, b: string): boolean {
+   if (typeof a !== "string" || a.length !== b.length) return false;
+diff --git a/functions/src/lmm/settle.ts b/functions/src/lmm/settle.ts
+index e918009..5d4a1f8 100644
+--- a/functions/src/lmm/settle.ts
++++ b/functions/src/lmm/settle.ts
+@@ -6,7 +6,7 @@ import * as crypto from "crypto";
+ import { PAYSTACK_API_BASE } from "../desk/paystack";
+ import { alertOps } from "./alert";
+ import { LMM } from "./config";
+-import { chargeFor, keptMinor, planTransfers } from "./fees";
++import { BelowFloor, chargeFor, keptMinor, paystackCostMinor, planSettlement, type SettlementPlan } from "./fees";
+ import { allocate, applyAllocation, openInvoices, type Allocation } from "./invoices";
+ import { paymentsCol, plansCol, resolveTarget, type PlanDoc } from "./plan";
+ import { getVerifiedRecipient } from "./recipient";
+@@ -79,11 +79,10 @@ async function afterCredit(s: Secrets, planId: string): Promise<void> {
+ }
+ 
+ // ---------------------------------------------------------------------------------------------------- 2. settle a plan
+-export async function settlePlan(s: Secrets, planId: string, reason: "target" | "fifth"): Promise<string> {
++export async function settlePlan(s: Secrets, planId: string, reason: "target" | "due"): Promise<string> {
+   const planRef = plansCol().doc(planId);
+   const plan = (await planRef.get()).data() as PlanDoc | undefined;
+   if (!plan || plan.creditedMinor <= 0) return "nothing";
+-  if (plan.creditedMinor < LMM.MIN_SETTLEMENT_MINOR) return "below_minimum";
+ 
+   const paySnap = await paymentsCol().where("planId", "==", planId).where("status", "==", "credited").where("settled", "==", false).get();
+   const pays = paySnap.docs.map((d) => ({ ...(d.data() as { creditMinor: number; chargeMinor: number }), id: d.id }));
+@@ -94,8 +93,12 @@ export async function settlePlan(s: Secrets, planId: string, reason: "target" |
+ 
+   const rec = await getVerifiedRecipient(s, plan.agentId);
+   if (!rec) return "held";
+-  let chunks;
+-  try { chunks = planTransfers(gross, rec.type); } catch (e) { await alertOps("AMOUNT_MISMATCH", `${planId}: ${(e as Error).message}`); return "held"; }
++  // Under KES 300 the tenant bears the transfer fee, so it is only ever sent ON THE DUE DATE (never early, when the tenant could still add to it).
++  if (gross < LMM.MIN_SETTLEMENT_MINOR && reason === "target") return "waits_for_due";
++  let sp: SettlementPlan;
++  try { sp = planSettlement(gross, rec.type); }
++  catch (e) { if (e instanceof BelowFloor) return "below_floor"; await alertOps("AMOUNT_MISMATCH", `${planId}: ${(e as Error).message}`); return "held"; }
++  const chunks = sp.chunks;
+ 
+   // every payment must still be exactly what Paystack says it was
+   const checks = await Promise.all(pays.map((p) => verifyCharge(s, p.id)));
+@@ -105,9 +108,9 @@ export async function settlePlan(s: Secrets, planId: string, reason: "target" |
+   const seq = plan.settleSeq + 1;
+   const sid = `${planId}_${seq}`;
+   const base = crypto.createHash("sha256").update(sid).digest("hex").slice(0, 16);
+-  const chunkDocs = chunks.map((c, i) => ({ i, grossMinor: c.grossMinor, feeMinor: c.feeMinor, sendMinor: c.sendMinor, attempt: 0, reference: `lmm-${base}-${i}-0`, status: "queued" }));
++  const chunkDocs = chunks.map((c, i) => ({ i, grossMinor: c.grossMinor, feeMinor: c.feeMinor, sendMinor: c.sendMinor, paystackCostMinor: paystackCostMinor(c.grossMinor, rec.type), attempt: 0, reference: `lmm-${base}-${i}-0`, status: "queued" }));
+   const paymentRefs = pays.map((p) => p.id);
+-  const seal = sealSettlement(s.seal, { id: sid, planId, landlordId: plan.agentId, recipientCode: rec.recipientCode, grossMinor: gross, sendMinors: chunks.map((c) => c.sendMinor), paymentRefs });
++  const seal = sealSettlement(s.seal, { id: sid, planId, landlordId: plan.agentId, recipientCode: rec.recipientCode, grossMinor: gross, sendMinors: chunks.map((c) => c.sendMinor), paymentRefs, invoiceMinor: sp.invoiceMinor });
+   const dayRef = db().collection("lmm_counters").doc(`out_${eatDay(Date.now())}`);
+ 
+   try {
+@@ -119,7 +122,7 @@ export async function settlePlan(s: Secrets, planId: string, reason: "target" |
+       const out = Number(day.data()?.outMinor ?? 0);
+       if (out + gross > LMM.DAILY_OUTFLOW_CAP_MINOR) throw new Hold("daily outflow cap");
+       tx.set(settlementsCol().doc(sid), {
+-        id: sid, planId, agentId: plan.agentId, tenantId: plan.tenantId, tenantName: plan.tenantName, grossMinor: gross, reason, recipientCode: rec.recipientCode,
++        id: sid, planId, agentId: plan.agentId, tenantId: plan.tenantId, tenantName: plan.tenantName, grossMinor: gross, invoiceMinor: sp.invoiceMinor, feeBearer: sp.feeBearer, reason, recipientCode: rec.recipientCode,
+         chunks: chunkDocs, refs: chunkDocs.map((c) => c.reference), paymentRefs, status: "locked", seal, createdAt: Date.now(),
+       });
+       for (const r of paymentRefs) tx.update(paymentsCol().doc(r), { settled: true, settlementId: sid });
+@@ -139,7 +142,7 @@ export async function sendSettlement(s: Secrets, sid: string): Promise<void> {
+   const ref = settlementsCol().doc(sid);
+   const st = (await ref.get()).data();
+   if (!st || st.status !== "locked") return;
+-  const want = sealSettlement(s.seal, { id: sid, planId: st.planId, landlordId: st.agentId, recipientCode: st.recipientCode, grossMinor: st.grossMinor, sendMinors: st.chunks.map((c: any) => c.sendMinor), paymentRefs: st.paymentRefs });
++  const want = sealSettlement(s.seal, { id: sid, planId: st.planId, landlordId: st.agentId, recipientCode: st.recipientCode, grossMinor: st.grossMinor, sendMinors: st.chunks.map((c: any) => c.sendMinor), paymentRefs: st.paymentRefs, invoiceMinor: st.invoiceMinor ?? st.grossMinor });
+   if (!sameSeal(st.seal, want)) { await ref.update({ status: "blocked" }); await alertOps("SEAL_MISMATCH", `settlement ${sid} was altered`); return; }
+   const rec = await getVerifiedRecipient(s, st.agentId);
+   if (!rec || rec.recipientCode !== st.recipientCode) return;   // alert already raised; stays locked, retried by the sweep
+@@ -221,7 +224,7 @@ export async function applySettlement(sid: string): Promise<void> {
+   try {
+     let alloc: Allocation = st.allocation;
+     if (!alloc) {
+-      alloc = allocate(await openInvoices(st.agentId, st.tenantId), st.grossMinor);
++      alloc = allocate(await openInvoices(st.agentId, st.tenantId), Number(st.invoiceMinor ?? st.grossMinor));   // gross, or gross minus the fee when the tenant bore it
+       await ref.update({ allocation: alloc });   // fixed here, so a re-run applies the same lines
+     }
+     await applyAllocation(st.agentId, st.tenantId, st.tenantName, sid, alloc);
+@@ -235,7 +238,13 @@ export async function applySettlement(sid: string): Promise<void> {
+     const pl = (await plansCol().doc(st!.planId).get()).data() as PlanDoc;
+     // what is STILL owed on open invoices (not next month's rent, which is not due yet)
+     const owed = (await openInvoices(pl.agentId, pl.tenantId)).reduce((sum, i) => sum + i.outstandingMinor, 0);
+-    if (pl.tenantPhone) await sendOnce(`paid_${sid}`, toMsisdn(pl.tenantPhone), lmmText.landlordPaid({ name: pl.tenantName, paidMinor: st!.grossMinor, leftMinor: Math.max(0, owed - pl.creditedMinor) }));
++    const left = Math.max(0, owed - pl.creditedMinor);
++    const tenantBore = st!.feeBearer === "tenant" && Number(st!.invoiceMinor) < Number(st!.grossMinor);
++    if (pl.tenantPhone) {
++      await sendOnce(`paid_${sid}`, toMsisdn(pl.tenantPhone), tenantBore
++        ? lmmText.landlordPaidNet({ name: pl.tenantName, paidMinor: st!.grossMinor, feeMinor: st!.grossMinor - st!.invoiceMinor, netMinor: st!.invoiceMinor, leftMinor: left })
++        : lmmText.landlordPaid({ name: pl.tenantName, paidMinor: st!.grossMinor, leftMinor: left }));
++    }
+   } catch (err) { await alertOps("INVOICE_APPLY_FAILED", `${sid}: ${(err as Error)?.message}`); }
+ }
+ 
+diff --git a/functions/src/lmm/sms.ts b/functions/src/lmm/sms.ts
+index a4857db..747e057 100644
+--- a/functions/src/lmm/sms.ts
++++ b/functions/src/lmm/sms.ts
+@@ -1,6 +1,7 @@
+ // Lipa Mos Mos SMS: sender, message texts (each under 144 characters, each starting "Dear {first name},") and send-once logging.
+ import * as admin from "firebase-admin";
+ import { dearLine } from "./dear";
++import { shortDate } from "./due";
+ import { sendHpSms } from "../hpSms";
+ 
+ const MAX = 144;
+@@ -25,6 +26,20 @@ export const lmmText = {
+     p.pct >= 100
+       ? fit144(`${dearLine(p.name)} well done! Your rent is fully paid (${kes(p.paidMinor)}). Your landlord will be paid shortly.`)
+       : fit144(`${dearLine(p.name)} well done! You have paid ${p.pct}% of your rent (${kes(p.paidMinor)}). ${kes(p.leftMinor)} to go. Keep going.`),
++  /** 5 days before the due date, tenant holds KES 40 (wallet) to 299: what comes off, and what reaches their rent. */
++  feeWarning: (p: { name: string; creditedMinor: number; feeMinor: number; netMinor: number; dueOn: string }) =>
++    fit144(`${dearLine(p.name)} you paid ${kes(p.creditedMinor)} on Lipa Mos Mos. On ${shortDate(p.dueOn)} a ${kes(p.feeMinor)} fee comes off: ${kes(p.netMinor)} reaches rent. Pay KES 300+ to avoid it.`),
++  /** 5 days before the due date, tenant holds too little to send at all. */
++  tooSmallWarning: (p: { name: string; creditedMinor: number; minMinor: number; dueOn: string }) =>
++    fit144(`${dearLine(p.name)} ${kes(p.creditedMinor)} is below the ${kes(p.minMinor)} minimum, so nothing can be sent to your landlord on ${shortDate(p.dueOn)}. Please pay more before then.`),
++  /** On the due date, too little to send: nothing went, it stays on the plan. */
++  tooSmallAtDue: (p: { name: string; creditedMinor: number; minMinor: number }) =>
++    fit144(`${dearLine(p.name)} your ${kes(p.creditedMinor)} is below the ${kes(p.minMinor)} minimum and was not sent. Pay more, or pay the full balance via Pay Rent.`),
++  /** Settled with the tenant bearing the transfer fee: the invoice was credited amount minus fee. */
++  landlordPaidNet: (p: { name: string; paidMinor: number; feeMinor: number; netMinor: number; leftMinor: number }) =>
++    p.leftMinor > 0
++      ? fit144(`${dearLine(p.name)} ${kes(p.netMinor)} reached your rent (${kes(p.paidMinor)} less ${kes(p.feeMinor)} fee). ${kes(p.leftMinor)} still due: pay it via Pay Rent.`)
++      : fit144(`${dearLine(p.name)} ${kes(p.netMinor)} reached your rent (${kes(p.paidMinor)} less ${kes(p.feeMinor)} transfer fee). Thank you for using Lipa Mos Mos.`),
+   landlordPaid: (p: { name: string; paidMinor: number; leftMinor: number }) =>
+     p.leftMinor > 0
+       ? fit144(`${dearLine(p.name)} ${kes(p.paidMinor)} was sent to your landlord today. Balance ${kes(p.leftMinor)} stays on your plan.`)
+diff --git a/functions/test/lmm-flow.check.js b/functions/test/lmm-flow.check.js
+index e8b5280..3280627 100644
+--- a/functions/test/lmm-flow.check.js
++++ b/functions/test/lmm-flow.check.js
+@@ -38,12 +38,13 @@ axios.get = async (url) => {
+   throw new Error("unexpected GET " + url);
+ };
+ 
+-const world = async ({ rent = 10000, invoiceTotal = 10000 } = {}) => {
++const world = async ({ rent = 10000, invoiceTotal = 10000, due = "2026-11-05", wallet = false } = {}) => {
+   db.store.clear(); resetPaystack();
+-  db.seed("users/A1", { paymentInfo: { accountId: "ACCT_1", settlementType: "bank", settlementBankCode: "068", accountNumber: "1234567890", businessName: "Landlord Ltd" } });
++  const pay = wallet ? { settlementType: "mpesa", settlementBankCode: "MPESA", accountNumber: "0712345678" } : { settlementType: "bank", settlementBankCode: "068", accountNumber: "1234567890" };
++  db.seed("users/A1", { paymentInfo: { accountId: "ACCT_1", ...pay, businessName: "Landlord Ltd" } });
+   db.seed("users/A1/tenants/1", { name: "John Doe", phone: "0712345678", rentAmount: rent, isActive: true });
+-  if (invoiceTotal) db.seed("users/A1/invoices/I1", { tenantId: 1, billingMonth: "2026-11", dueDate: "2026-11-05", totalAmount: invoiceTotal, amountPaid: 0, arrears: invoiceTotal, isPaid: false });
+-  const r = await rec.createSealedRecipient(SECRETS, { landlordId: "A1", settlementType: "bank", bankCode: "068", accountNumber: "1234567890", name: "Landlord Ltd" });
++  if (invoiceTotal) db.seed("users/A1/invoices/I1", { tenantId: 1, billingMonth: "2026-11", dueDate: due, totalAmount: invoiceTotal, amountPaid: 0, arrears: invoiceTotal, isPaid: false });
++  const r = await rec.createSealedRecipient(SECRETS, { landlordId: "A1", settlementType: pay.settlementType, bankCode: pay.settlementBankCode, accountNumber: pay.accountNumber, name: "Landlord Ltd" });
+   assert.ok(r.ok);
+   const out = await plan.lmm_start.run({ data: { agentId: "A1", tenantId: "1", frequency: "weekly" } });
+   assert.ok(out.available);
+@@ -94,12 +95,12 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
+     assert.strictEqual(JSON.stringify([...db.store]), before);
+   });
+ 
+-  await ok("on the 5th, a partly paid invoice is settled and marked PARTIAL; the rest stays on the plan", async () => {
++  await ok("on the due date, a partly paid invoice is settled and marked PARTIAL; the rest stays on the plan", async () => {
+     await world({ invoiceTotal: 20000 });
+     await payAndConfirm(5000);
+     assert.strictEqual(transfers.length, 0);
+-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "started");
+-    assert.strictEqual(transfers[0].amount, KES(5000 - 95));
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "started");
++    assert.strictEqual(transfers[0].amount, KES(5000 - 90), "bank landlord: Paystack charges KES 80, so the fee is 90");
+     await settle.onTransferEvent(SECRETS, "transfer.success", { reference: transfers[0].reference, amount: transfers[0].amount, recipient: { recipient_code: "RCP_test1" } });
+     const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.status, inv.amountPaid, inv.arrears], [false, "partial", 5000, 15000]);
+     assert.ok(tenantSms().some((m) => /^Dear John, KES 5,000 was sent to your landlord today\. Balance KES 15,000 stays on your plan\./.test(m)), tenantSms().join(" | "));
+@@ -125,25 +126,25 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
+   await ok("TAMPER: editing the recipient record blocks the transfer and texts 0791286165", async () => {
+     await world(); await payAndConfirm(5000);
+     db.store.get("lmm_recipients/A1").recipientCode = "RCP_attacker";
+-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
+     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /SEAL_MISMATCH/.test(a.msg)), JSON.stringify(alerts()));
+   });
+   await ok("TAMPER: swapping the account on Paystack's side (recipient no longer matches the seal) blocks the transfer", async () => {
+     await world(); await payAndConfirm(5000);
+     recipients.get("RCP_test1").account_number = "9999999999";
+-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
+     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /RECIPIENT_MISMATCH/.test(a.msg)));
+   });
+   await ok("TAMPER: inflating a payment's credited amount in Firestore cannot raise the transfer", async () => {
+     await world(); const { reference } = await payAndConfirm(5000);
+     const p = db.store.get(`lmm_payments/${reference}`); p.creditMinor = KES(9000); db.store.get("lmm_plans/A1_1").creditedMinor = KES(9000);
+-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
+     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /PAYMENT_UNVERIFIED|AMOUNT_MISMATCH/.test(a.msg)));
+   });
+   await ok("TAMPER: raising the plan's credited total without matching payments is caught", async () => {
+     await world(); await payAndConfirm(5000);
+     db.store.get("lmm_plans/A1_1").creditedMinor = KES(9000);
+-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
+     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /PLAN_MISMATCH/.test(a.msg)));
+   });
+   await ok("TAMPER: editing the settlement between locking and sending blocks the send", async () => {
+@@ -176,12 +177,65 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
+     await world(); await payAndConfirm(5000);
+     const day = new Date(Date.now() + 3 * 3_600_000).toISOString().slice(0, 10).replace(/-/g, "");
+     db.seed(`lmm_counters/out_${day}`, { outMinor: cfg.LMM.DAILY_OUTFLOW_CAP_MINOR });
+-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
+     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /OVER_CAP/.test(a.msg)));
+   });
+-  await ok("below the KES 300 minimum nothing is sent (the fee would eat it)", async () => {
+-    await world(); await payAndConfirm(200);
+-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "below_minimum"); assert.strictEqual(transfers.length, 0);
++  const finish = async () => { await settle.onTransferEvent(SECRETS, "transfer.success", { reference: transfers[0].reference, amount: transfers[0].amount, recipient: { recipient_code: "RCP_test1" } }); };
++  await ok("under KES 300 the TENANT bears the fee: KES 40 sends KES 10, the invoice is credited KES 10 and keeps KES 30 open; the landlord is not charged", async () => {
++    await world({ wallet: true, invoiceTotal: 40 }); await payAndConfirm(40);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "target"), "waits_for_due", "never early: the tenant could still add to it");
++    assert.strictEqual(transfers.length, 0); assert.strictEqual(alerts().length, 0);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "started");
++    assert.strictEqual(transfers[0].amount, KES(10)); await finish();
++    const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.status, inv.amountPaid, inv.arrears], [false, "partial", 10, 30]);
++    assert.ok(tenantSms().some((m) => m === "Dear John, KES 10 reached your rent (KES 40 less KES 30 fee). KES 30 still due: pay it via Pay Rent."), tenantSms().join(" | "));
++  });
++  await ok("KES 300 exactly is paid by the landlord (fee 30) and the invoice is credited in full", async () => {
++    await world({ wallet: true, invoiceTotal: 300 }); await payAndConfirm(300);
++    assert.strictEqual(transfers[0].amount, KES(270)); await finish();
++    const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.amountPaid], [true, 300]);
++  });
++  await ok("below the least that can be sent (KES 40 to a wallet) nothing is sent and it stays on the plan; a bank landlord's floor is KES 100", async () => {
++    await world({ wallet: true, invoiceTotal: 39 }); await payAndConfirm(39);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "below_floor"); assert.strictEqual(transfers.length, 0);
++    assert.strictEqual(db.read("lmm_plans/A1_1").creditedMinor, KES(39));
++    await world({ invoiceTotal: 99 }); await payAndConfirm(99);
++    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "below_floor"); assert.strictEqual(transfers.length, 0);
++  });
++  // ---- the daily sweep, run for real against the fake database
++  const today = () => new Date(Date.now() + 3 * 3_600_000).toISOString().slice(0, 10);
++  const inDays = (n) => new Date(Date.now() + 3 * 3_600_000 + n * 86_400_000).toISOString().slice(0, 10);
++  await ok("sweep: an overdue plan is paid at the next sweep (caught up), not a month later", async () => {
++    await world({ invoiceTotal: 20000, due: inDays(-3) }); await payAndConfirm(5000);
++    await index.lmm_dailySweep.run({}); assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, KES(5000 - 90));
++  });
++  await ok("sweep: a plan whose due date has not come is NOT paid (the 5th no longer decides it)", async () => {
++    await world({ invoiceTotal: 20000, due: inDays(20) }); await payAndConfirm(5000);
++    await index.lmm_dailySweep.run({}); assert.strictEqual(transfers.length, 0);
++    assert.strictEqual((await plan.lmm_getPlan.run({ data: { agentId: "A1", tenantId: "1" } })).plan.settlesOn, inDays(20));
++  });
++  await ok("sweep: due today -> paid today; under KES 300 the tenant bears the fee", async () => {
++    await world({ wallet: true, invoiceTotal: 300, due: today() }); await payAndConfirm(200);
++    await index.lmm_dailySweep.run({}); assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, KES(170));
++  });
++  await ok("sweep: FIVE DAYS BEFORE the due date a tenant under KES 300 is told the fee and what reaches rent - once", async () => {
++    await world({ wallet: true, invoiceTotal: 300, due: inDays(5) }); await payAndConfirm(40);
++    await index.lmm_dailySweep.run({}); await index.lmm_dailySweep.run({});
++    const w = tenantSms().filter((m) => /fee comes off/.test(m)); assert.strictEqual(w.length, 1, tenantSms().join(" | "));
++    assert.match(w[0], /^Dear John, you paid KES 40 on Lipa Mos Mos\. On \d{1,2} \w{3} a KES 30 fee comes off: KES 10 reaches rent\. Pay KES 300\+ to avoid it\.$/);
++    assert.strictEqual(transfers.length, 0, "not paid before the due date");
++  });
++  await ok("sweep: no warning 6+ days out, none at KES 300+, and 'too small' is a different message", async () => {
++    await world({ wallet: true, invoiceTotal: 400, due: inDays(6) }); await payAndConfirm(40); await index.lmm_dailySweep.run({}); assert.ok(!tenantSms().some((m) => /fee comes off/.test(m)));
++    await world({ wallet: true, invoiceTotal: 1000, due: inDays(5) }); await payAndConfirm(300); await index.lmm_dailySweep.run({}); assert.ok(!tenantSms().some((m) => /fee comes off|minimum/.test(m)));
++    await world({ wallet: true, invoiceTotal: 300, due: inDays(4) }); await payAndConfirm(30); await index.lmm_dailySweep.run({});
++    assert.ok(tenantSms().some((m) => /^Dear John, KES 30 is below the KES 40 minimum, so nothing can be sent to your landlord on/.test(m)), tenantSms().join(" | "));
++  });
++  await ok("sweep: due today but below the least that can be sent -> nothing sent, the tenant is told once, the money stays", async () => {
++    await world({ wallet: true, invoiceTotal: 300, due: today() }); await payAndConfirm(30);
++    await index.lmm_dailySweep.run({}); await index.lmm_dailySweep.run({});
++    assert.strictEqual(transfers.length, 0); assert.strictEqual(db.read("lmm_plans/A1_1").creditedMinor, KES(30));
++    assert.strictEqual(tenantSms().filter((m) => /was not sent/.test(m)).length, 1, tenantSms().join(" | "));
+   });
+   await ok("a failed transfer is retried with a NEW reference (max 3 tries), with alerts", async () => {
+     await world(); await payAndConfirm(10000);
+diff --git a/functions/test/lmm.check.js b/functions/test/lmm.check.js
+index 23620c4..8d944b3 100644
+--- a/functions/test/lmm.check.js
++++ b/functions/test/lmm.check.js
+@@ -3,7 +3,7 @@
+ const assert = require("assert");
+ const path = require("path");
+ const lib = (p) => require(path.join(__dirname, "..", "lib", "lmm", p));
+-const F = lib("fees"), C = lib("config"), D = lib("dear"), S = lib("seal"), R = lib("reminders"), T = lib("sms"), RC = lib("recipient");
++const F = lib("fees"), C = lib("config"), DUE = lib("due"), D = lib("dear"), S = lib("seal"), R = lib("reminders"), T = lib("sms"), RC = lib("recipient");
+ let passed = 0, failed = 0;
+ const ok = (name, fn) => { try { fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
+ const KES = (n) => n * 100;
+@@ -27,16 +27,44 @@ ok("Samuhia keeps about 0.96% of the credited rent (never below 0.9%) after Pays
+ ok("a small instalment still leaves Samuhia a positive amount", () => {
+   for (const kes of [10, 20, 50, 99]) { const c = F.chargeFor(KES(kes)); assert.ok(F.keptMinor(c, Math.round(c.chargeMinor * 0.015)) > 0, String(kes)); }
+ });
+-ok("transfer fee tiers: <=10,000 -> 95, <40,000 -> 183, <=900,000 -> 257, above -> refused", () => {
+-  assert.strictEqual(F.transferFeeMinor(KES(300)), KES(95)); assert.strictEqual(F.transferFeeMinor(KES(10000)), KES(95));
+-  assert.strictEqual(F.transferFeeMinor(KES(10000) + 1), KES(183)); assert.strictEqual(F.transferFeeMinor(KES(39999)), KES(183)); assert.strictEqual(F.transferFeeMinor(KES(39999.99)), KES(183));
+-  assert.strictEqual(F.transferFeeMinor(KES(40000)), KES(257)); assert.strictEqual(F.transferFeeMinor(KES(900000)), KES(257));
+-  assert.throws(() => F.transferFeeMinor(KES(900000) + 1), RangeError); assert.throws(() => F.transferFeeMinor(0), RangeError);
++const TYPES = ["mobile_money", "mobile_money_business", "kepss"];
++ok("transfer fee: wallet KES 30 up to 300, KES 36 just above, 0.95% scale reaching 95 at 10,000, then 120-183, then 257 flat", () => {
++  const w = (a) => F.transferFeeMinor(KES(a), "mobile_money") / 100;
++  assert.deepStrictEqual([w(40), w(299), w(300), w(301), w(1500), w(1501), w(5000), w(8000), w(10000)], [30, 30, 30, 36, 36, 60, 60, 76, 95]);
++  assert.ok(w(301) > 35, "the lowest fee above KES 300 is more than 35");
++  assert.deepStrictEqual([w(10001), w(25000), w(39999), w(40000), w(150000)], [121, 152, 183, 257, 257]);
++  assert.throws(() => F.transferFeeMinor(KES(900000) + 1, "kepss"), RangeError); assert.throws(() => F.transferFeeMinor(0, "kepss"), RangeError);
+ });
+-ok("a settlement must cover its own fee and the minimum; the landlord receives gross minus the fee", () => {
++ok("the fee is NEVER below what Paystack charges us + KES 10, for every recipient type and amount (till and bank cost more than a wallet)", () => {
++  for (const t of TYPES) {
++    let prev = 0;
++    for (const a of [...Array.from({ length: 40000 }, (_, i) => i + 1), ...Array.from({ length: 861 }, (_, i) => 40000 + i * 1000)]) {
++      if (t === "mobile_money" && a > 150000) break;
++      const fee = F.transferFeeMinor(KES(a), t), cost = F.paystackCostMinor(KES(a), t);
++      assert.ok(fee >= cost + C.LMM.MARGIN_MINOR, `${t} ${a}: fee ${fee} < cost ${cost} + margin`);
++      assert.strictEqual(fee % 100, 0, "whole shillings"); assert.ok(fee <= KES(257), `${t} ${a}`); assert.ok(fee >= prev, `${t} ${a}: fee must not fall as the amount rises`); prev = fee;
++    }
++  }
++  assert.deepStrictEqual(TYPES.map((t) => F.transferFeeMinor(KES(10001), t) / 100), [121, 150, 130], "the KES 120 floor of band 2 would lose money on a till (cost 140) and break even on a bank (120)");
++  assert.deepStrictEqual(TYPES.map((t) => F.minSendableMinor(t) / 100), [40, 60, 100]);
++});
++ok("a settlement of KES 300+ is paid by the landlord: gross minus the fee, invoice credited in full; each wallet part pays its own fee", () => {
+   assert.throws(() => F.planTransfers(KES(299), "kepss"), RangeError);
+-  const [t] = F.planTransfers(KES(25000), "kepss"); assert.deepStrictEqual([t.grossMinor, t.feeMinor, t.sendMinor], [KES(25000), KES(183), KES(24817)]);
++  const [t] = F.planTransfers(KES(25000), "kepss"); assert.deepStrictEqual([t.grossMinor, t.feeMinor, t.sendMinor], [KES(25000), KES(152), KES(24848)]);
+   assert.throws(() => F.planTransfers(KES(900001), "kepss"), RangeError);
++  const a = F.planSettlement(KES(300), "mobile_money"); assert.deepStrictEqual([a.feeBearer, a.invoiceMinor, a.chunks[0].feeMinor, a.chunks[0].sendMinor], ["landlord", KES(300), KES(30), KES(270)]);
++});
++ok("under KES 300 the TENANT bears the fee: KES 40 sends KES 10 and credits the invoice KES 10; under KES 40 nothing is sent", () => {
++  const a = F.planSettlement(KES(40), "mobile_money"); assert.deepStrictEqual([a.feeBearer, a.invoiceMinor, a.chunks[0].feeMinor, a.chunks[0].sendMinor], ["tenant", KES(10), KES(30), KES(10)]);
++  const b = F.planSettlement(KES(299), "mobile_money"); assert.deepStrictEqual([b.invoiceMinor, b.chunks[0].sendMinor], [KES(269), KES(269)]);
++  assert.throws(() => F.planSettlement(KES(39), "mobile_money"), F.BelowFloor);
++  assert.throws(() => F.planSettlement(KES(99), "kepss"), F.BelowFloor); assert.ok(F.planSettlement(KES(100), "kepss").chunks[0].sendMinor === KES(10), "a bank landlord's floor is KES 100 (Paystack charges us KES 80)");
++  for (const t of TYPES) for (let a = 1; a < 300; a++) { try { const p = F.planSettlement(KES(a), t); assert.ok(p.chunks[0].sendMinor >= C.LMM.MIN_SEND_MINOR && p.invoiceMinor === p.chunks[0].sendMinor, `${t} ${a}`); } catch (e) { assert.ok(e instanceof F.BelowFloor, `${t} ${a}`); } }
++});
++ok("what the tenant is told under KES 300: the fee and what reaches rent, or that it is too small; nothing at KES 300+", () => {
++  assert.deepStrictEqual(F.smallPayoutNotice(KES(40), "mobile_money"), { kind: "fee_from_rent", creditedMinor: KES(40), feeMinor: KES(30), netMinor: KES(10), thresholdMinor: KES(300) });
++  assert.deepStrictEqual(F.smallPayoutNotice(KES(30), "mobile_money"), { kind: "too_small", creditedMinor: KES(30), minMinor: KES(40), thresholdMinor: KES(300) });
++  assert.strictEqual(F.smallPayoutNotice(KES(300), "mobile_money"), null); assert.strictEqual(F.smallPayoutNotice(0, "mobile_money"), null);
+ });
+ ok("M-PESA wallet settlements above KES 150,000 are split evenly, each part within the limit and paying its own fee", () => {
+   const one = F.planTransfers(KES(150000), "mobile_money"); assert.strictEqual(one.length, 1);
+@@ -64,6 +92,21 @@ ok("seals: any change to the recipient or the settlement breaks them", () => {
+   for (const [f, v] of [["grossMinor", KES(9000)], ["recipientCode", "RCP_evil"], ["sendMinors", [KES(9000)]], ["paymentRefs", ["a"]], ["landlordId", "L9"]]) assert.ok(!S.sameSeal(ss, S.sealSettlement(k, { ...s, [f]: v })), f);
+   assert.ok(S.sameSeal(ss, S.sealSettlement(k, { ...s, paymentRefs: ["b", "a"] })), "ref order does not matter");
+   assert.ok(!S.sameSeal(undefined, seal) && !S.sameSeal("short", seal));
++  assert.ok(S.sameSeal(ss, S.sealSettlement(k, { ...s, invoiceMinor: s.grossMinor })), "a settlement sealed before invoiceMinor existed still verifies");
++  const tb = S.sealSettlement(k, { ...s, invoiceMinor: KES(4000) });
++  assert.ok(!S.sameSeal(tb, ss) && !S.sameSeal(tb, S.sealSettlement(k, { ...s, invoiceMinor: KES(4500) })) && !S.sameSeal(tb, S.sealSettlement(k, { ...s })), "editing what the invoice is credited breaks the seal");
++});
++ok("due dates: payout on the earliest due date (or the 5th with no invoice), never a sweep that already ran; caught up when missed", () => {
++  const at = (iso, h = 9) => Date.parse(`${iso}T${String(h).padStart(2, "0")}:00:00+03:00`);
++  assert.strictEqual(DUE.nextSweepDate(at("2026-11-08", 9)), "2026-11-08"); assert.strictEqual(DUE.nextSweepDate(at("2026-11-08", 11)), "2026-11-09");
++  assert.strictEqual(DUE.settlesOn("2026-11-25", at("2026-11-08")), "2026-11-25", "a future due date is the payout day");
++  assert.strictEqual(DUE.settlesOn("2026-11-05", at("2026-11-08", 11)), "2026-11-09", "an overdue invoice is paid at the next sweep, not a month later");
++  assert.strictEqual(DUE.settlesOn(null, at("2026-11-08")), "2026-12-05"); assert.strictEqual(DUE.settlesOn(null, at("2026-11-03")), "2026-11-05");
++  assert.ok(DUE.payoutDue("2026-11-05", "2026-11-05") && DUE.payoutDue("2026-11-05", "2026-11-08") && !DUE.payoutDue("2026-11-05", "2026-11-04"));
++  assert.ok(DUE.payoutDue(null, "2026-11-05") && !DUE.payoutDue(null, "2026-11-06"), "no invoice: the 5th only");
++  assert.strictEqual(DUE.validDate("2026-11-05T00:00:00Z"), "2026-11-05"); assert.strictEqual(DUE.validDate("5 Nov"), null); assert.strictEqual(DUE.validDate(undefined), null);
++  assert.strictEqual(DUE.daysUntil("2026-11-10", at("2026-11-05")), 5); assert.strictEqual(DUE.daysUntil("2026-11-05", at("2026-11-08")), -3);
++  assert.strictEqual(DUE.shortDate("2026-11-05"), "5 Nov"); assert.strictEqual(DUE.shortDate("2026-12-25"), "25 Dec");
+ });
+ ok("the account fingerprint ignores spaces and bank-code case, but not digits", () => {
+   const k = "k"; assert.strictEqual(S.fingerprint(k, "mpesa", "0712 345 678"), S.fingerprint(k, "MPESA", "0712345678")); assert.notStrictEqual(S.fingerprint(k, "MPESA", "0712345678"), S.fingerprint(k, "MPESA", "0712345679"));
+@@ -101,14 +144,22 @@ ok("every SMS starts 'Dear {first name},', stays under 144 characters, even with
+     T.lmmText.started({ name: long, targetMinor: KES(1_250_000) }), T.lmmText.missed({ name: long, days: 15, balanceMinor: KES(1_250_000) }),
+     T.lmmText.milestone({ name: long, pct: 50, paidMinor: KES(1_250_000), leftMinor: KES(1_250_000) }), T.lmmText.milestone({ name: long, pct: 100, paidMinor: KES(1_250_000), leftMinor: 0 }),
+     T.lmmText.landlordPaid({ name: long, paidMinor: KES(1_250_000), leftMinor: KES(1_250_000) }), T.lmmText.landlordPaid({ name: long, paidMinor: KES(1_250_000), leftMinor: 0 }),
++    T.lmmText.feeWarning({ name: long, creditedMinor: KES(299), feeMinor: KES(90), netMinor: KES(209), dueOn: "2026-11-30" }),
++    T.lmmText.tooSmallWarning({ name: long, creditedMinor: KES(99), minMinor: KES(100), dueOn: "2026-11-30" }), T.lmmText.tooSmallAtDue({ name: long, creditedMinor: KES(99), minMinor: KES(100) }),
++    T.lmmText.landlordPaidNet({ name: long, paidMinor: KES(299), feeMinor: KES(90), netMinor: KES(209), leftMinor: KES(1_250_000) }), T.lmmText.landlordPaidNet({ name: long, paidMinor: KES(299), feeMinor: KES(90), netMinor: KES(209), leftMinor: 0 }),
+   ];
+   for (const m of msgs) { assert.ok(m.length <= 144, `${m.length}: ${m}`); assert.ok(m.startsWith("Dear Christopher,"), m); }
+   assert.ok(T.lmmText.started({ name: "John Doe", targetMinor: KES(25000) }).startsWith("Dear John,"));
++  assert.strictEqual(T.lmmText.feeWarning({ name: "John Doe", creditedMinor: KES(40), feeMinor: KES(30), netMinor: KES(10), dueOn: "2026-11-05" }),
++    "Dear John, you paid KES 40 on Lipa Mos Mos. On 5 Nov a KES 30 fee comes off: KES 10 reaches rent. Pay KES 300+ to avoid it.");
++  assert.strictEqual(T.lmmText.landlordPaidNet({ name: "John Doe", paidMinor: KES(40), feeMinor: KES(30), netMinor: KES(10), leftMinor: KES(30) }),
++    "Dear John, KES 10 reached your rent (KES 40 less KES 30 fee). KES 30 still due: pay it via Pay Rent.");
+   assert.strictEqual(T.fit144("x".repeat(300)).length, 144); assert.ok(!/[^\x20-\x7E]/.test(T.fit144("Hi 😀 café")));
+ });
+ 
+ ok("hard limits live in code and match the spec", () => {
+   assert.strictEqual(C.LMM.ALERT_MOBILE, "254791286165"); assert.strictEqual(C.LMM.SETTLE_DAY, 5);
++  assert.deepStrictEqual([C.LMM.MIN_SETTLEMENT_MINOR, C.LMM.MARGIN_MINOR, C.LMM.MIN_SEND_MINOR, C.LMM.FEE_BAND3_MINOR, C.LMM.WARN_DAYS_BEFORE_DUE], [KES(300), KES(10), KES(10), KES(257), 5]);
+   assert.strictEqual(C.LMM.SURCHARGE_BPS, 250); assert.strictEqual(C.LMM.SMALL_SURCHARGE_BPS, 500); assert.ok(Object.isFrozen === Object.isFrozen);
+   assert.deepStrictEqual(C.FREQUENCIES, ["daily", "weekly", "biweekly"]);
+ });

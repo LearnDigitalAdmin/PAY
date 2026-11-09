@@ -3,8 +3,12 @@ import { httpsCallable } from 'firebase/functions';
 import { functions } from './Firebase';
 
 type Frequency = 'daily' | 'weekly' | 'biweekly';
+/** Set while the plan holds under KES 300: what a payout will cost the tenant, or that it is too small to send. */
+type Payout =
+  | { kind: 'fee_from_rent'; creditedMinor: number; feeMinor: number; netMinor: number; thresholdMinor: number }
+  | { kind: 'too_small'; creditedMinor: number; minMinor: number; thresholdMinor: number };
 interface PlanView {
-  frequency: Frequency; status: string; targetMinor: number; creditedMinor: number; remainingMinor: number; pct: number; settlesOn: string; suggestedMinor: number;
+  frequency: Frequency; status: string; targetMinor: number; creditedMinor: number; remainingMinor: number; pct: number; settlesOn: string; dueOn?: string | null; suggestedMinor: number; payout?: Payout | null;
 }
 interface Res { available: boolean; reason?: string; plan?: PlanView | null; targetMinor?: number; settlesOn?: string; suggestedMinor?: number }
 
@@ -14,11 +18,16 @@ const chargeFor = (kesAmount: number) => {
   const bps = kesAmount < 100 ? 500 : 250;
   return Math.ceil((kesAmount * (10000 + bps)) / 10000);
 };
+/** "2026-11-05" -> "5 Nov 2026" */
+const niceDate = (iso?: string | null) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
+  return m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }) : iso || '';
+};
 const call = <T,>(name: string, data: unknown) => httpsCallable<unknown, T>(functions, name)(data).then((r) => r.data);
 
 interface Props { agentId: string; tenantId: number | string; phone?: string; onPaid?: () => void }
 
-/** Lipa Mos Mos: pay rent a little at a time. Money waits safely until the target or the 5th, then the landlord is paid. */
+/** Lipa Mos Mos: pay rent a little at a time. Money waits safely until the target or the invoice due date, then the landlord is paid. */
 export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onPaid }: Props) {
   const [res, setRes] = useState<Res | null>(null);
   const [freq, setFreq] = useState<Frequency>('weekly');
@@ -62,7 +71,7 @@ export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onP
       <div className="flex items-start justify-between gap-3">
         <div>
           <h3 className="text-lg font-bold text-gray-900">Lipa Mos Mos</h3>
-          <p className="text-sm text-gray-600 mt-1">Pay your rent a little at a time. Your landlord is paid when it is fully covered, or on the 5th with whatever you have paid.</p>
+          <p className="text-sm text-gray-600 mt-1">Pay your rent a little at a time. Your landlord is paid when it is fully covered, or on the due date with whatever you have paid.</p>
         </div>
       </div>
 
@@ -72,7 +81,17 @@ export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onP
           <div className="mt-1 h-3 w-full rounded-full bg-gray-200 overflow-hidden" role="progressbar" aria-valuenow={plan.pct} aria-valuemin={0} aria-valuemax={100}>
             <div className="h-full bg-green-600 transition-all" style={{ width: `${plan.pct}%` }} />
           </div>
-          <p className="text-xs text-gray-500 mt-1">{plan.pct}% done. Balance {kes(plan.remainingMinor)}. Landlord is paid by {plan.settlesOn}.</p>
+          <p className="text-xs text-gray-500 mt-1">{plan.pct}% done. Balance {kes(plan.remainingMinor)}. {plan.dueOn ? `Due ${niceDate(plan.dueOn)}. ` : ''}Landlord is paid by {niceDate(plan.settlesOn)}.</p>
+          {plan.payout?.kind === 'fee_from_rent' && (
+            <p role="note" className="mt-3 rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-900">
+              <strong>Under KES {plan.payout.thresholdMinor / 100} paid.</strong> If this is all you have by the due date, a transfer fee of {kes(plan.payout.feeMinor)} is deducted: only {kes(plan.payout.netMinor)} of your {kes(plan.payout.creditedMinor)} reaches your rent, and you still owe {kes(plan.payout.feeMinor)} on your invoice. Pay KES {plan.payout.thresholdMinor / 100} or more in total and there is no fee for you.
+            </p>
+          )}
+          {plan.payout?.kind === 'too_small' && (
+            <p role="note" className="mt-3 rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-900">
+              <strong>Not enough to send yet.</strong> The least we can send your landlord is {kes(plan.payout.minMinor)}, and you have paid {kes(plan.payout.creditedMinor)}. It stays safely on your plan until you pay more. Pay KES {plan.payout.thresholdMinor / 100} or more in total to avoid any fee.
+            </p>
+          )}
         </div>
       )}
 

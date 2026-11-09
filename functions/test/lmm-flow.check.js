@@ -38,12 +38,13 @@ axios.get = async (url) => {
   throw new Error("unexpected GET " + url);
 };
 
-const world = async ({ rent = 10000, invoiceTotal = 10000 } = {}) => {
+const world = async ({ rent = 10000, invoiceTotal = 10000, due = "2026-11-05", wallet = false } = {}) => {
   db.store.clear(); resetPaystack();
-  db.seed("users/A1", { paymentInfo: { accountId: "ACCT_1", settlementType: "bank", settlementBankCode: "068", accountNumber: "1234567890", businessName: "Landlord Ltd" } });
+  const pay = wallet ? { settlementType: "mpesa", settlementBankCode: "MPESA", accountNumber: "0712345678" } : { settlementType: "bank", settlementBankCode: "068", accountNumber: "1234567890" };
+  db.seed("users/A1", { paymentInfo: { accountId: "ACCT_1", ...pay, businessName: "Landlord Ltd" } });
   db.seed("users/A1/tenants/1", { name: "John Doe", phone: "0712345678", rentAmount: rent, isActive: true });
-  if (invoiceTotal) db.seed("users/A1/invoices/I1", { tenantId: 1, billingMonth: "2026-11", dueDate: "2026-11-05", totalAmount: invoiceTotal, amountPaid: 0, arrears: invoiceTotal, isPaid: false });
-  const r = await rec.createSealedRecipient(SECRETS, { landlordId: "A1", settlementType: "bank", bankCode: "068", accountNumber: "1234567890", name: "Landlord Ltd" });
+  if (invoiceTotal) db.seed("users/A1/invoices/I1", { tenantId: 1, billingMonth: "2026-11", dueDate: due, totalAmount: invoiceTotal, amountPaid: 0, arrears: invoiceTotal, isPaid: false });
+  const r = await rec.createSealedRecipient(SECRETS, { landlordId: "A1", settlementType: pay.settlementType, bankCode: pay.settlementBankCode, accountNumber: pay.accountNumber, name: "Landlord Ltd" });
   assert.ok(r.ok);
   const out = await plan.lmm_start.run({ data: { agentId: "A1", tenantId: "1", frequency: "weekly" } });
   assert.ok(out.available);
@@ -94,12 +95,12 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
     assert.strictEqual(JSON.stringify([...db.store]), before);
   });
 
-  await ok("on the 5th, a partly paid invoice is settled and marked PARTIAL; the rest stays on the plan", async () => {
+  await ok("on the due date, a partly paid invoice is settled and marked PARTIAL; the rest stays on the plan", async () => {
     await world({ invoiceTotal: 20000 });
     await payAndConfirm(5000);
     assert.strictEqual(transfers.length, 0);
-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "started");
-    assert.strictEqual(transfers[0].amount, KES(5000 - 95));
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "started");
+    assert.strictEqual(transfers[0].amount, KES(5000 - 90), "bank landlord: Paystack charges KES 80, so the fee is 90");
     await settle.onTransferEvent(SECRETS, "transfer.success", { reference: transfers[0].reference, amount: transfers[0].amount, recipient: { recipient_code: "RCP_test1" } });
     const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.status, inv.amountPaid, inv.arrears], [false, "partial", 5000, 15000]);
     assert.ok(tenantSms().some((m) => /^Dear John, KES 5,000 was sent to your landlord today\. Balance KES 15,000 stays on your plan\./.test(m)), tenantSms().join(" | "));
@@ -125,25 +126,25 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
   await ok("TAMPER: editing the recipient record blocks the transfer and texts 0791286165", async () => {
     await world(); await payAndConfirm(5000);
     db.store.get("lmm_recipients/A1").recipientCode = "RCP_attacker";
-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /SEAL_MISMATCH/.test(a.msg)), JSON.stringify(alerts()));
   });
   await ok("TAMPER: swapping the account on Paystack's side (recipient no longer matches the seal) blocks the transfer", async () => {
     await world(); await payAndConfirm(5000);
     recipients.get("RCP_test1").account_number = "9999999999";
-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /RECIPIENT_MISMATCH/.test(a.msg)));
   });
   await ok("TAMPER: inflating a payment's credited amount in Firestore cannot raise the transfer", async () => {
     await world(); const { reference } = await payAndConfirm(5000);
     const p = db.store.get(`lmm_payments/${reference}`); p.creditMinor = KES(9000); db.store.get("lmm_plans/A1_1").creditedMinor = KES(9000);
-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /PAYMENT_UNVERIFIED|AMOUNT_MISMATCH/.test(a.msg)));
   });
   await ok("TAMPER: raising the plan's credited total without matching payments is caught", async () => {
     await world(); await payAndConfirm(5000);
     db.store.get("lmm_plans/A1_1").creditedMinor = KES(9000);
-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /PLAN_MISMATCH/.test(a.msg)));
   });
   await ok("TAMPER: editing the settlement between locking and sending blocks the send", async () => {
@@ -176,12 +177,65 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
     await world(); await payAndConfirm(5000);
     const day = new Date(Date.now() + 3 * 3_600_000).toISOString().slice(0, 10).replace(/-/g, "");
     db.seed(`lmm_counters/out_${day}`, { outMinor: cfg.LMM.DAILY_OUTFLOW_CAP_MINOR });
-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "held");
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "held");
     assert.strictEqual(transfers.length, 0); assert.ok(alerts().some((a) => /OVER_CAP/.test(a.msg)));
   });
-  await ok("below the KES 300 minimum nothing is sent (the fee would eat it)", async () => {
-    await world(); await payAndConfirm(200);
-    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "fifth"), "below_minimum"); assert.strictEqual(transfers.length, 0);
+  const finish = async () => { await settle.onTransferEvent(SECRETS, "transfer.success", { reference: transfers[0].reference, amount: transfers[0].amount, recipient: { recipient_code: "RCP_test1" } }); };
+  await ok("under KES 300 the TENANT bears the fee: KES 40 sends KES 10, the invoice is credited KES 10 and keeps KES 30 open; the landlord is not charged", async () => {
+    await world({ wallet: true, invoiceTotal: 40 }); await payAndConfirm(40);
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "target"), "waits_for_due", "never early: the tenant could still add to it");
+    assert.strictEqual(transfers.length, 0); assert.strictEqual(alerts().length, 0);
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "started");
+    assert.strictEqual(transfers[0].amount, KES(10)); await finish();
+    const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.status, inv.amountPaid, inv.arrears], [false, "partial", 10, 30]);
+    assert.ok(tenantSms().some((m) => m === "Dear John, KES 10 reached your rent (KES 40 less KES 30 fee). KES 30 still due: pay it via Pay Rent."), tenantSms().join(" | "));
+  });
+  await ok("KES 300 exactly is paid by the landlord (fee 30) and the invoice is credited in full", async () => {
+    await world({ wallet: true, invoiceTotal: 300 }); await payAndConfirm(300);
+    assert.strictEqual(transfers[0].amount, KES(270)); await finish();
+    const inv = db.read("users/A1/invoices/I1"); assert.deepStrictEqual([inv.isPaid, inv.amountPaid], [true, 300]);
+  });
+  await ok("below the least that can be sent (KES 40 to a wallet) nothing is sent and it stays on the plan; a bank landlord's floor is KES 100", async () => {
+    await world({ wallet: true, invoiceTotal: 39 }); await payAndConfirm(39);
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "below_floor"); assert.strictEqual(transfers.length, 0);
+    assert.strictEqual(db.read("lmm_plans/A1_1").creditedMinor, KES(39));
+    await world({ invoiceTotal: 99 }); await payAndConfirm(99);
+    assert.strictEqual(await settle.settlePlan(SECRETS, "A1_1", "due"), "below_floor"); assert.strictEqual(transfers.length, 0);
+  });
+  // ---- the daily sweep, run for real against the fake database
+  const today = () => new Date(Date.now() + 3 * 3_600_000).toISOString().slice(0, 10);
+  const inDays = (n) => new Date(Date.now() + 3 * 3_600_000 + n * 86_400_000).toISOString().slice(0, 10);
+  await ok("sweep: an overdue plan is paid at the next sweep (caught up), not a month later", async () => {
+    await world({ invoiceTotal: 20000, due: inDays(-3) }); await payAndConfirm(5000);
+    await index.lmm_dailySweep.run({}); assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, KES(5000 - 90));
+  });
+  await ok("sweep: a plan whose due date has not come is NOT paid (the 5th no longer decides it)", async () => {
+    await world({ invoiceTotal: 20000, due: inDays(20) }); await payAndConfirm(5000);
+    await index.lmm_dailySweep.run({}); assert.strictEqual(transfers.length, 0);
+    assert.strictEqual((await plan.lmm_getPlan.run({ data: { agentId: "A1", tenantId: "1" } })).plan.settlesOn, inDays(20));
+  });
+  await ok("sweep: due today -> paid today; under KES 300 the tenant bears the fee", async () => {
+    await world({ wallet: true, invoiceTotal: 300, due: today() }); await payAndConfirm(200);
+    await index.lmm_dailySweep.run({}); assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, KES(170));
+  });
+  await ok("sweep: FIVE DAYS BEFORE the due date a tenant under KES 300 is told the fee and what reaches rent - once", async () => {
+    await world({ wallet: true, invoiceTotal: 300, due: inDays(5) }); await payAndConfirm(40);
+    await index.lmm_dailySweep.run({}); await index.lmm_dailySweep.run({});
+    const w = tenantSms().filter((m) => /fee comes off/.test(m)); assert.strictEqual(w.length, 1, tenantSms().join(" | "));
+    assert.match(w[0], /^Dear John, you paid KES 40 on Lipa Mos Mos\. On \d{1,2} \w{3} a KES 30 fee comes off: KES 10 reaches rent\. Pay KES 300\+ to avoid it\.$/);
+    assert.strictEqual(transfers.length, 0, "not paid before the due date");
+  });
+  await ok("sweep: no warning 6+ days out, none at KES 300+, and 'too small' is a different message", async () => {
+    await world({ wallet: true, invoiceTotal: 400, due: inDays(6) }); await payAndConfirm(40); await index.lmm_dailySweep.run({}); assert.ok(!tenantSms().some((m) => /fee comes off/.test(m)));
+    await world({ wallet: true, invoiceTotal: 1000, due: inDays(5) }); await payAndConfirm(300); await index.lmm_dailySweep.run({}); assert.ok(!tenantSms().some((m) => /fee comes off|minimum/.test(m)));
+    await world({ wallet: true, invoiceTotal: 300, due: inDays(4) }); await payAndConfirm(30); await index.lmm_dailySweep.run({});
+    assert.ok(tenantSms().some((m) => /^Dear John, KES 30 is below the KES 40 minimum, so nothing can be sent to your landlord on/.test(m)), tenantSms().join(" | "));
+  });
+  await ok("sweep: due today but below the least that can be sent -> nothing sent, the tenant is told once, the money stays", async () => {
+    await world({ wallet: true, invoiceTotal: 300, due: today() }); await payAndConfirm(30);
+    await index.lmm_dailySweep.run({}); await index.lmm_dailySweep.run({});
+    assert.strictEqual(transfers.length, 0); assert.strictEqual(db.read("lmm_plans/A1_1").creditedMinor, KES(30));
+    assert.strictEqual(tenantSms().filter((m) => /was not sent/.test(m)).length, 1, tenantSms().join(" | "));
   });
   await ok("a failed transfer is retried with a NEW reference (max 3 tries), with alerts", async () => {
     await world(); await payAndConfirm(10000);

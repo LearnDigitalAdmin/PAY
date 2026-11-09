@@ -14,9 +14,11 @@ export const fingerprint = (key: string, bankCode: string, accountNumber: string
 export const sealRecipient = (key: string, r: { landlordId: string; recipientCode: string; type: string; bankCode: string; fp: string }): string =>
   hmac(key, "recipient", [r.landlordId, r.recipientCode, r.type, r.bankCode.toUpperCase(), r.fp]);
 
-/** Everything that decides one settlement: the plan, the recipient, how much and in how many parts. Re-checked right before sending. */
-export const sealSettlement = (key: string, s: { id: string; planId: string; landlordId: string; recipientCode: string; grossMinor: number; sendMinors: number[]; paymentRefs: string[] }): string =>
-  hmac(key, "settlement", [s.id, s.planId, s.landlordId, s.recipientCode, s.grossMinor, s.sendMinors.join(","), [...s.paymentRefs].sort().join(",")]);
+/** Everything that decides one settlement: the plan, the recipient, how much, in how many parts, and what the invoice is credited. Re-checked right before sending. */
+export const sealSettlement = (key: string, s: { id: string; planId: string; landlordId: string; recipientCode: string; grossMinor: number; sendMinors: number[]; paymentRefs: string[]; invoiceMinor?: number }): string =>
+  hmac(key, "settlement", [s.id, s.planId, s.landlordId, s.recipientCode, s.grossMinor, s.sendMinors.join(","), [...s.paymentRefs].sort().join(","),
+    // what the invoice is credited is part of the seal only when the tenant bears the fee (invoiceMinor < gross), so settlements sealed before this existed still verify
+    ...(s.invoiceMinor !== undefined && s.invoiceMinor !== s.grossMinor ? [`inv:${s.invoiceMinor}`] : [])]);
 
 export function sameSeal(a: unknown, b: string): boolean {
   if (typeof a !== "string" || a.length !== b.length) return false;
