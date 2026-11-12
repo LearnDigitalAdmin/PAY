@@ -5,11 +5,11 @@ import { onCall, onRequest, HttpsError, type CallableRequest } from "firebase-fu
 import { REGION, plotDb } from "../mychama/config";
 import { checkSafaricomPhone } from "../phone/safaricom";
 import { BUNDLE_SECRETS, bundleSecret } from "../secretsBundle";
-import { actorFromCallable, getUnlock, readConnections } from "../landlordWatch/actors";
-import { resolveOwner } from "../landlordWatch/data";
+import { actorFromCallable } from "../landlordWatch/actors";
 import { safeEqual } from "../landlordWatch/keys";
 import { paystackPort } from "../landlordWatch/payments";
 import { parseOwnerId } from "../landlordWatch/service";
+import { watchPrincipal } from "./access";
 import { CrError, toBotError, toHttpsError } from "./errors";
 import { createPdfRenderer, htmlToPdfOnce } from "./pdf";
 import * as svc from "./service";
@@ -53,13 +53,9 @@ export async function principalFor(db: Db, req: CallableRequest<Record<string, u
   if (data.channel === "watch") {
     let ownerId: string;
     try { ownerId = parseOwnerId(data.ownerId); } catch (e) { throw new CrError("CR_BAD_REQUEST", e instanceof Error ? e.message : "Enter an owner ID like PYP-0001."); }
-    const ref = await resolveOwner(db, ownerId);
-    if (!ref) throw new CrError("CR_NOT_FOUND", "No property found for that owner ID.");
     const actor = await actorFromCallable(db, req, undefined);
-    if (actor.channel === "cyber") throw new CrError("CR_NOT_ALLOWED", "Reports are not available on CYBER.");
-    if (!(await readConnections(db, actor))[ownerId]) throw new CrError("CR_NOT_ALLOWED", "Connect this property first.");
-    if (!(await getUnlock(db, actor, ref.ownerPhone, now)).unlocked) throw new CrError("CR_NOT_ALLOWED", "Unlock this property with your phone code first.");
-    return { pr: { channel: "watch", actorKey: actor.key, landlordUid: ref.userId, ownerId }, propertyId: ref.propertyId };
+    const { pr, propertyId } = await watchPrincipal(db, actor, ownerId, now);
+    return { pr, propertyId };
   }
   const uid = await resolveLandlordId(db, req.auth);
   return { pr: { channel: "pms", actorKey: `u_${req.auth.uid}`, landlordUid: uid }, propertyId: null };

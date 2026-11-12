@@ -61,7 +61,12 @@ async function releaseFree(db: Db, uid: string, pid: string, period: string): Pr
   });
 }
 
-function present(d: Record<string, any>, extra: Record<string, unknown> = {}) {
+export interface OrderView {
+  orderId: string; channel: string; propertyId: string; month: string; kind: ReportKind; title: string; state: OrderState; priceKes: number; entitled: boolean;
+  createdAt: string | null; readyAt: string | null; error: { code: string; message: string } | null;
+  message?: string; url?: string; urlExpiresAt?: string; fileName?: string; period?: string; freeIncluded?: boolean;
+}
+function present(d: Record<string, any>, extra: Partial<OrderView> = {}): OrderView {
   return {
     orderId: String(d.id), channel: d.channel, propertyId: d.propertyId, month: d.month, kind: d.kind, title: REPORT_TITLE[d.kind as ReportKind],
     state: d.state as OrderState, priceKes: Number(d.priceMinor) / 100, entitled: d.entitled === true, createdAt: iso(d.createdAt), readyAt: iso(d.readyAt),
@@ -136,6 +141,13 @@ export async function checkout(deps: Deps, pr: Principal, p: { orderId: unknown;
       await ref.update({ state: "paid", entitled: true, priceMinor: 0, freeConsumed: true, paidAt: now, error: null });
       return present({ ...o, state: "paid", entitled: true, priceMinor: 0 });
     }
+  }
+  // The order showed KES 0, but the allowance has been used since (another order, the scheduler, or the landlord's own app).
+  // Say so and let the customer decide; nothing is charged until they send a phone number.
+  const hasPhone = p.phone !== undefined && p.phone !== null && String(p.phone).trim() !== "";
+  if (Number(o.priceMinor) === 0 && !hasPhone) {
+    await ref.update({ priceMinor: REPORT_PRICE_MINOR, error: null });
+    return present({ ...o, state: "payment_required", priceMinor: REPORT_PRICE_MINOR, error: null }, { message: "This month's free report has been used. This one costs KES 200." });
   }
   // paid path
   const phone = deps.checkPhone(p.phone);

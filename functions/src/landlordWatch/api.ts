@@ -13,6 +13,7 @@ import { defaultOtpDeps } from "./otp";
 import { htmlToPdf } from "./pdf";
 import { paystackPort, settleTranscriptPayment } from "./payments";
 import * as svc from "./service";
+import { REPORT_ACTIONS } from "../compliance/botActions";
 import type { Ctx, Deps } from "./service";
 import type { Lang } from "./types";
 import { BUNDLE_SECRETS, bundleSecret } from "../secretsBundle";
@@ -59,6 +60,8 @@ export const ACTIONS: Record<string, Handler> = {
   transcriptPay: svc.transcriptPay,
   transcriptStatus: svc.transcriptStatus,
   transcriptList: svc.transcriptList,
+  // compliance reports (MRI working paper, annual summary) on WhatsApp
+  ...REPORT_ACTIONS,
 };
 
 const langOf = (data: unknown): Lang => ((data as { lang?: unknown } | null)?.lang === "sw" ? "sw" : "en");
