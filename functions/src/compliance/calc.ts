@@ -1,5 +1,6 @@
 // Pure report maths. No I/O. Money is integer minor units (cents).
 import { MRI_DUE_DAY, MRI_MAX_ANNUAL_KES, MRI_MIN_ANNUAL_KES, MRI_RATE_PCT, REPORT_VERSION } from "./constants";
+import { freshnessDetail } from "./freshness";
 import type { BillLine, Check, Computed, MonthRow, ReportInput, TenantRow } from "./types";
 
 export const toMinor = (kes: unknown): number => {
@@ -162,6 +163,10 @@ export function computeReport(input: ReportInput): Computed {
   checks.push({ id: "portfolio", label: "Threshold tested on all properties", result: pf ? "pass" : "warn",
     detail: pf ? `Tested on the landlord's ${pf.propertyCount} propert${pf.propertyCount === 1 ? "y" : "ies"}.` : "Only this property's figures were available, so the band was tested on this property alone." });
 
+  if (input.dataAsOf) {
+    checks.push({ id: "data_fresh", label: "Records recently synced", result: input.dataAsOf.level === "fresh" ? "pass" : "warn", detail: freshnessDetail(input.dataAsOf) });
+  }
+
   return {
     schema: 1, version: REPORT_VERSION, kind: input.kind, month, year, property: input.property, landlord: input.landlord,
     rows, totals, grossRent, commission: { ratePct, amount: commission }, finalIncome,
@@ -173,5 +178,6 @@ export function computeReport(input: ReportInput): Computed {
       propertyRoll: activeRoll, propertyYtd, portfolioRoll, portfolioYtd, scope: pf ? "landlord" : "property", status, monthlyEquivalent: Math.round(min / 12),
     },
     monthly, annual, checks, occupancy: { activeTenants, invoiced: rows.filter((r) => r.invoicedRent > 0).length, withoutInvoice },
+    ...(input.dataAsOf ? { dataAsOf: input.dataAsOf } : {}),
   };
 }

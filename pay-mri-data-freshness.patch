@@ -1,0 +1,447 @@
+diff --git a/functions/src/compliance/calc.ts b/functions/src/compliance/calc.ts
+index 0f38150..00dcbe4 100644
+--- a/functions/src/compliance/calc.ts
++++ b/functions/src/compliance/calc.ts
+@@ -1,5 +1,6 @@
+ // Pure report maths. No I/O. Money is integer minor units (cents).
+ import { MRI_DUE_DAY, MRI_MAX_ANNUAL_KES, MRI_MIN_ANNUAL_KES, MRI_RATE_PCT, REPORT_VERSION } from "./constants";
++import { freshnessDetail } from "./freshness";
+ import type { BillLine, Check, Computed, MonthRow, ReportInput, TenantRow } from "./types";
+ 
+ export const toMinor = (kes: unknown): number => {
+@@ -162,6 +163,10 @@ export function computeReport(input: ReportInput): Computed {
+   checks.push({ id: "portfolio", label: "Threshold tested on all properties", result: pf ? "pass" : "warn",
+     detail: pf ? `Tested on the landlord's ${pf.propertyCount} propert${pf.propertyCount === 1 ? "y" : "ies"}.` : "Only this property's figures were available, so the band was tested on this property alone." });
+ 
++  if (input.dataAsOf) {
++    checks.push({ id: "data_fresh", label: "Records recently synced", result: input.dataAsOf.level === "fresh" ? "pass" : "warn", detail: freshnessDetail(input.dataAsOf) });
++  }
++
+   return {
+     schema: 1, version: REPORT_VERSION, kind: input.kind, month, year, property: input.property, landlord: input.landlord,
+     rows, totals, grossRent, commission: { ratePct, amount: commission }, finalIncome,
+@@ -173,5 +178,6 @@ export function computeReport(input: ReportInput): Computed {
+       propertyRoll: activeRoll, propertyYtd, portfolioRoll, portfolioYtd, scope: pf ? "landlord" : "property", status, monthlyEquivalent: Math.round(min / 12),
+     },
+     monthly, annual, checks, occupancy: { activeTenants, invoiced: rows.filter((r) => r.invoicedRent > 0).length, withoutInvoice },
++    ...(input.dataAsOf ? { dataAsOf: input.dataAsOf } : {}),
+   };
+ }
+diff --git a/functions/src/compliance/data.ts b/functions/src/compliance/data.ts
+index 34746ca..239006a 100644
+--- a/functions/src/compliance/data.ts
++++ b/functions/src/compliance/data.ts
+@@ -4,6 +4,7 @@ import type * as admin from "firebase-admin";
+ import { MAX_INPUT_BYTES, MAX_INVOICES, MAX_TENANTS, REPORT_KINDS, type ReportKind } from "./constants";
+ import { isMonth } from "./calc";
+ import { CrError } from "./errors";
++import { classifyFreshness, toMillis } from "./freshness";
+ import type { ReportInput } from "./types";
+ 
+ type Db = admin.firestore.Firestore;
+@@ -55,16 +56,42 @@ export function sanitizeInput(raw: unknown, kind: ReportKind, month: string): Re
+   return input;
+ }
+ 
+-export const hashInput = (input: ReportInput): string => createHash("sha256").update(JSON.stringify(input)).digest("hex");
++/** The fingerprint covers the records only: when they were synced is stated beside it, not inside it. */
++export const hashInput = (input: ReportInput): string => {
++  const { dataAsOf: _dataAsOf, ...records } = input;
++  void _dataAsOf;
++  return createHash("sha256").update(JSON.stringify(records)).digest("hex");
++};
+ 
+ export interface Owned { userId: string; propertyId: string }
+ 
++/**
++ * When did this landlord's app last sync to the cloud (epoch ms), or null if there is no sign it ever did.
++ * The app stamps `lastSyncTime` on the user document on every full upload (every 12 hours while it is open) and on every
++ * record it pushes live, so the newest of those is the best evidence of how current the cloud copy is.
++ */
++export async function loadSyncedAt(db: Db, userId: string): Promise<number | null> {
++  const user = db.collection("users").doc(userId);
++  const newest = async (collection: "invoices" | "tenants"): Promise<number | null> => {
++    try {
++      const snap = await user.collection(collection).orderBy("lastSyncTime", "desc").limit(1).get();
++      return snap.empty ? null : toMillis(snap.docs[0].data().lastSyncTime);
++    } catch (e) {
++      console.warn(`Could not read the newest ${collection} sync time:`, e);   // the user document's own stamp still counts
++      return null;
++    }
++  };
++  const [own, inv, ten] = await Promise.all([user.get().then((s) => toMillis(s.data()?.lastSyncTime)), newest("invoices"), newest("tenants")]);
++  const known = [own, inv, ten].filter((t): t is number => t !== null);
++  return known.length ? Math.max(...known) : null;
++}
++
+ /** Everything for one property from the landlord's synced records (cloud sync is a paid-plan feature, so this is a Business+ / Watch / Desk path). */
+-export async function loadInputFromFirestore(db: Db, o: Owned, kind: ReportKind, month: string): Promise<ReportInput> {
++export async function loadInputFromFirestore(db: Db, o: Owned, kind: ReportKind, month: string, nowMs: number = Date.now()): Promise<ReportInput> {
+   const user = db.collection("users").doc(o.userId);
+   const pid = idFilter(o.propertyId);
+   const year = month.slice(0, 4);
+-  const [uSnap, pSnap] = await Promise.all([user.get(), user.collection("properties").doc(o.propertyId).get()]);
++  const [uSnap, pSnap, syncedAt] = await Promise.all([user.get(), user.collection("properties").doc(o.propertyId).get(), loadSyncedAt(db, o.userId)]);
+   const u = uSnap.data(), p = pSnap.data();
+   if (!u || !p) throw new CrError("CR_NOT_FOUND", "Property not found.");
+ 
+@@ -120,6 +147,7 @@ export async function loadInputFromFirestore(db: Db, o: Owned, kind: ReportKind,
+     },
+     tenants, invoices, statementItems,
+     portfolio: { propertyCount: Math.max(1, propsSnap.size), annualRentRoll: roll, ytdReceived: ytd },
++    dataAsOf: classifyFreshness(syncedAt, nowMs),
+   };
+   if (tenants.length === 0 && invoices.length === 0) throw new CrError("CR_NO_DATA", "There are no synced tenant or invoice records for this property. Cloud sync must be on for a report to be made from the account.");
+   return input;
+diff --git a/functions/src/compliance/freshness.ts b/functions/src/compliance/freshness.ts
+new file mode 100644
+index 0000000..670f7c2
+--- /dev/null
++++ b/functions/src/compliance/freshness.ts
+@@ -0,0 +1,86 @@
++// How current are the landlord's synced records? Pure (no imports), so it can be tested on its own:
++//   node --experimental-strip-types --test tests/compliance/freshness.test.mts
++// Rules (set by the product owner):
++//   age <= 3 days            fresh    - report made normally
++//   3 days < age <= 7 days   stale    - report made, with a warning in the PDF and an SMS to the landlord
++//   age > 7 days, or unknown expired/unknown - the scheduler does NOT make the report; the landlord gets an SMS instead
++export const DATA_STALE_AFTER_MS = 3 * 86_400_000;
++export const DATA_SKIP_AFTER_MS = 7 * 86_400_000;
++
++export type FreshnessLevel = "fresh" | "stale" | "expired" | "unknown";
++export interface DataAsOf { syncedAt: number | null; level: FreshnessLevel; ageDays: number | null }
++
++const DAY_MS = 86_400_000;
++const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
++
++/** Firestore Timestamp, Date, epoch milliseconds or ISO string -> epoch milliseconds. Anything else -> null. */
++export function toMillis(v: unknown): number | null {
++  if (v === null || v === undefined) return null;
++  if (typeof v === "number") return Number.isFinite(v) && v > 0 ? v : null;
++  if (v instanceof Date) { const t = v.getTime(); return Number.isFinite(t) ? t : null; }
++  if (typeof v === "string") { const t = Date.parse(v); return Number.isFinite(t) ? t : null; }
++  if (typeof v === "object") {
++    const o = v as { toMillis?: () => number; seconds?: number; _seconds?: number; nanoseconds?: number; _nanoseconds?: number };
++    if (typeof o.toMillis === "function") { const t = o.toMillis(); return Number.isFinite(t) ? t : null; }
++    const s = o.seconds ?? o._seconds;
++    if (typeof s === "number" && Number.isFinite(s)) return s * 1000 + Math.floor(Number(o.nanoseconds ?? o._nanoseconds ?? 0) / 1e6);
++  }
++  return null;
++}
++
++export function classifyFreshness(syncedAt: number | null, nowMs: number): DataAsOf {
++  if (syncedAt === null || !Number.isFinite(syncedAt)) return { syncedAt: null, level: "unknown", ageDays: null };
++  const age = Math.max(0, nowMs - syncedAt);                   // a clock a little ahead of ours is not "negative age"
++  const level: FreshnessLevel = age > DATA_SKIP_AFTER_MS ? "expired" : age > DATA_STALE_AFTER_MS ? "stale" : "fresh";
++  return { syncedAt, level, ageDays: Math.floor(age / DAY_MS) };
++}
++
++export type AutoAction = "generate" | "generate_warn" | "wait" | "skip";
++/**
++ * What the scheduler does for one property whose rent is due to be reported.
++ * Over a week old (or never synced): wait for the landlord to sync until the forced day, then skip for good.
++ */
++export function autoAction(level: FreshnessLevel, day: number, forceDay: number): AutoAction {
++  if (level === "fresh") return "generate";
++  if (level === "stale") return "generate_warn";
++  return day < forceDay ? "wait" : "skip";
++}
++
++/** Nairobi calendar date (UTC+3, no DST) as YYYY-MM-DD. */
++export const nairobiDate = (ms: number): string => new Date(ms + 3 * 3_600_000).toISOString().slice(0, 10);
++const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
++
++/** Wording for the PDF (banner + check row). null when the records are fresh. */
++export function freshnessMessage(d: DataAsOf): { title: string; text: string; severe: boolean } | null {
++  if (d.level === "fresh") return null;
++  if (d.level === "unknown" || d.syncedAt === null || d.ageDays === null) {
++    return { title: "Records may be out of date.", severe: true,
++      text: "We could not confirm when this landlord's records were last synced to the cloud. Open Plot Yangu online to sync, then check every figure against your own records before you file." };
++  }
++  const when = `${nairobiDate(d.syncedAt)} (${plural(d.ageDays, "day")} ago)`;
++  if (d.level === "stale") {
++    return { title: "Records are a few days old.", severe: false,
++      text: `This report was made from records last synced on ${when}. Rent or payments recorded since then are not in it. Sync the app and check the figures before you file.` };
++  }
++  return { title: "Records are out of date.", severe: true,
++    text: `This report was made from records last synced on ${when}. It may be missing recent rent and payments. Sync the app and make the report again before you file.` };
++}
++
++/** One-line version for the compliance checks table. */
++export function freshnessDetail(d: DataAsOf): string {
++  if (d.level === "fresh" && d.syncedAt !== null && d.ageDays !== null) return `Records last synced on ${nairobiDate(d.syncedAt)} (${plural(d.ageDays, "day")} ago).`;
++  return freshnessMessage(d)?.text ?? "";
++}
++
++export const monthLabel = (m: string): string => `${MONTHS[Number(m.slice(5, 7)) - 1] ?? m} ${m.slice(0, 4)}`;
++
++/** SMS to the landlord. "warned": the report was made from stale records. "skipped": it was not made. */
++export function staleNoticeText(p: { outcome: "warned" | "skipped"; level: FreshnessLevel; ageDays: number | null; property: string; month: string }): string {
++  const prop = p.property.trim().slice(0, 24) || "your property";
++  const age = p.ageDays === null ? "" : ` ${plural(p.ageDays, "day")} ago`;
++  if (p.outcome === "warned") {
++    return `Plot Yangu: your ${monthLabel(p.month)} MRI report for ${prop} is ready, but your records were last synced${age || " at an unknown time"}. Open the app online to sync, then check the figures before you file by the 20th.`;
++  }
++  const why = p.level === "unknown" ? "your records have not synced to the cloud" : `your records were last synced${age}`;
++  return `Plot Yangu: we did not make your ${monthLabel(p.month)} MRI report for ${prop} because ${why}. Open the app online to sync, then order it under Compliance reports (your free report is kept). Due by the 20th.`;
++}
+diff --git a/functions/src/compliance/html.ts b/functions/src/compliance/html.ts
+index fc5df3a..6401011 100644
+--- a/functions/src/compliance/html.ts
++++ b/functions/src/compliance/html.ts
+@@ -1,6 +1,7 @@
+ // One template for every report: same layout, same section order, same wording. Paged by the PDF engine (table headers repeat,
+ // rows never split, the footer carries page numbers).
+ import { MRI_MAX_ANNUAL_KES, MRI_MIN_ANNUAL_KES, MRI_RATE_PCT, REPORT_TITLE } from "./constants";
++import { freshnessMessage, nairobiDate } from "./freshness";
+ import type { Computed } from "./types";
+ 
+ const esc = (s: unknown): string => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+@@ -48,6 +49,14 @@ function statusBlock(c: Computed): string {
+   return `<div class="note ok"><b>MRI applies.</b> Annual gross rent is within KES ${MRI_MIN_ANNUAL_KES.toLocaleString("en-US")} to KES ${MRI_MAX_ANNUAL_KES.toLocaleString("en-US")}. Pay ${MRI_RATE_PCT}% of the gross rent received, no deductions, by the 20th of the following month (${longDate(c.mri.dueDate)} for this return).</div>`;
+ }
+ 
++/** A notice under the summary when the records the report was made from are not current. Nothing for fresh records or the app's own data. */
++function freshnessBlock(c: Computed): string {
++  const m = c.dataAsOf ? freshnessMessage(c.dataAsOf) : null;
++  if (!m) return "";
++  return `<div class="note${m.severe ? " bad" : ""}"><b>${esc(m.title)}</b> ${esc(m.text)}</div>`;
++}
++const syncedLine = (c: Computed): string => (c.dataAsOf?.syncedAt ? ` &middot; records last synced ${esc(longDate(nairobiDate(c.dataAsOf.syncedAt)))}` : "");
++
+ export function renderReportHtml(c: Computed, meta: Meta): string {
+   const p = c.property, l = c.landlord, t = c.threshold;
+   const periodLabel = c.kind === "annual_summary" ? `January to ${monthName(c.month)}` : monthName(c.month);
+@@ -65,7 +74,7 @@ export function renderReportHtml(c: Computed, meta: Meta): string {
+     <div class="card"><div class="k">MRI base (gross rent)</div><div class="v">${kes(sm.gross)}</div></div>
+     <div class="card hi"><div class="k">MRI at ${MRI_RATE_PCT}%</div><div class="v">${c.mri.applies ? kes(sm.tax) : "Not applicable"}</div></div>
+     <div class="card"><div class="k">${sm.dueLabel}</div><div class="v">${esc(longDate(sm.due))}</div></div>
+-  </div>${statusBlock(c)}`;
++  </div>${statusBlock(c)}${freshnessBlock(c)}`;
+ 
+   const worksheet = `
+   <table><thead><tr><th>Step</th><th class="r">Amount</th></tr></thead><tbody>
+@@ -125,7 +134,7 @@ export function renderReportHtml(c: Computed, meta: Meta): string {
+   </ol>
+   <p class="small mu">Plot Yangu is not connected to KRA and does not file or pay anything on your behalf. This report is prepared from the rent, invoice and payment records kept in Plot Yangu. Check it against your bank and M-Pesa statements before you file. Penalties and interest can apply to late filing or payment; see KRA for current rules.</p>
+   <div class="sign"><div>Landlord / agent signature &amp; date</div><div>KRA PIN: ${esc(l.kraPin || "______________________")}</div></div>
+-  <p class="small mu hash">Report ${esc(meta.reportId)} &middot; ${REPORT_TITLE[c.kind]} &middot; version ${esc(c.version)} &middot; source ${esc(meta.source)} &middot; record fingerprint (SHA-256) ${esc(meta.dataHash)}</p>`);
++  <p class="small mu hash">Report ${esc(meta.reportId)} &middot; ${REPORT_TITLE[c.kind]} &middot; version ${esc(c.version)} &middot; source ${esc(meta.source)}${syncedLine(c)} &middot; record fingerprint (SHA-256) ${esc(meta.dataHash)}</p>`);
+ 
+   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${esc(REPORT_TITLE[c.kind])} - ${esc(p.name)}</title><style>${CSS}</style></head><body>
+   <div class="head"><div><div class="brand">PLOT YANGU &middot; COMPLIANCE REPORT</div><div class="title">${esc(REPORT_TITLE[c.kind])}</div>
+diff --git a/functions/src/compliance/scheduler.ts b/functions/src/compliance/scheduler.ts
+index 1cd61ca..fb1b8f8 100644
+--- a/functions/src/compliance/scheduler.ts
++++ b/functions/src/compliance/scheduler.ts
+@@ -4,13 +4,20 @@
+ //   3. make the free monthly MRI report for each property of those landlords, as soon as every invoice's rent for the
+ //      return month is paid, or on the 15th at the latest. It only ever uses the free allowance: it never charges anyone,
+ //      and a property whose allowance is already used is skipped.
++//      The records must be current: synced within 3 days = made normally; 3 to 7 days = made with a warning in the PDF and an
++//      SMS; over 7 days (or never synced) = not made, the landlord gets an SMS, and the free allowance is kept. A property
++//      that is over 7 days old before the 15th is held back until the 15th in case the landlord syncs in the meantime.
+ // The work list (complianceAuto) holds only landlords still waiting, so a daily run does not rescan every user.
+ import * as admin from "firebase-admin";
+ import { onSchedule } from "firebase-functions/v2/scheduler";
+ import { BUNDLE_SECRETS } from "../secretsBundle";
+ import { randomHex } from "../landlordWatch/keys";
++import { sendHpSms } from "../hpSms";
++import { checkSafaricomPhone } from "../phone/safaricom";
+ import { MRI_DUE_DAY, FREE_TIERS } from "./constants";
+ import { createPdfRenderer, defaultDeps } from "./api";
++import { loadSyncedAt } from "./data";
++import { autoAction, classifyFreshness, staleNoticeText, type DataAsOf } from "./freshness";
+ import { nairobiDay, nairobiMonth, previousMonth } from "./pricing";
+ import { reportsCol } from "./payments";
+ import { generateOrder, type Deps } from "./service";
+@@ -18,6 +25,7 @@ import { generateOrder, type Deps } from "./service";
+ export const AUTO_FORCE_DAY = 15;          // generate on this day even if some rent is still unpaid
+ const SEED_PAGE = 300, PENDING_PAGE = 25, MAX_REPORTS_PER_RUN = 12, TIME_BUDGET_MS = 6 * 60_000;
+ const idFilter = (v: string): string | number => (/^\d+$/.test(v) ? Number(v) : v);
++type Notice = "warned" | "skipped";
+ 
+ export interface RunSummary { target: string; swept: number; seeded: number; landlords: number; generated: number; skipped: number; failed: number }
+ 
+@@ -88,6 +96,19 @@ async function processLandlord(
+   const user = db.collection("users").doc(uid);
+   const u = (await user.get()).data();
+   const props = (work.props ?? {}) as Record<string, string>;
++  const notified = (work.notified ?? {}) as Record<string, string>;
++  let syncedAt: number | null | undefined;                          // read once per landlord, only when a report is about to be made
++
++  /** One SMS per property per outcome per month. Recorded only after it was sent, so a failed send is tried again on the next run. */
++  const tell = async (pid: string, propertyName: string, outcome: Notice, fresh: DataAsOf): Promise<void> => {
++    if (notified[pid] === outcome || notified[pid] === "no_phone") return;
++    const phone = checkSafaricomPhone(u?.phone);
++    if (!phone.ok) { notified[pid] = "no_phone"; await workRef.update({ [`notified.${pid}`]: "no_phone" }); return; }
++    const sent = await sendHpSms({ mobile: phone.msisdn, message: staleNoticeText({ outcome, level: fresh.level, ageDays: fresh.ageDays, property: propertyName, month: ctx.target }) });
++    if (!sent.success) { console.error(`Stale-records SMS not sent for ${uid}/${pid}:`, sent.error); return; }
++    notified[pid] = outcome;
++    await workRef.update({ [`notified.${pid}`]: outcome });
++  };
+   if (!u || !FREE_TIERS.includes(String(u.tier ?? "").toLowerCase()) || u.complianceAuto === false) { await workRef.update({ state: "done", reason: "not_eligible" }); return; }
+   const properties = await user.collection("properties").get();
+   let open = 0;
+@@ -105,6 +126,18 @@ async function processLandlord(
+     if (!dueForAuto(ctx.day, settled)) { open++; continue; }
+     if (invoices.empty) { await workRef.update({ [`props.${p.id}`]: "skipped_no_invoices" }); out.skipped++; continue; }
+ 
++    // are the synced records current? (decided before the free allowance is touched, so a skip costs the landlord nothing)
++    if (syncedAt === undefined) syncedAt = await loadSyncedAt(db, uid);
++    const fresh = classifyFreshness(syncedAt, ctx.nowMs);
++    const action = autoAction(fresh.level, ctx.day, AUTO_FORCE_DAY);
++    if (action === "wait" || action === "skip") {
++      await tell(p.id, String(p.data().name ?? ""), "skipped", fresh);
++      if (action === "wait") { open++; continue; }
++      await workRef.update({ [`props.${p.id}`]: "skipped_stale", [`stale.${p.id}`]: { level: fresh.level, syncedAt: fresh.syncedAt } });
++      out.skipped++;
++      continue;
++    }
++
+     // the free allowance, atomically; if it is gone, the landlord already has (or chose to buy) this month's report
+     const qRef = db.collection("complianceQuota").doc(`${uid}_${p.id}_${ctx.period}`);
+     const got = await db.runTransaction(async (tx) => {
+@@ -118,10 +151,19 @@ async function processLandlord(
+     const id = randomHex(8);
+     await reportsCol(db).doc(id).set({
+       id, channel: "auto", actorKey: `auto_${uid}`, uid, ownerId: null, propertyId: p.id, month: ctx.target, kind: "mri_monthly", state: "paid", entitled: true,
+-      freeConsumed: true, priceMinor: 0, tier: String(u.tier), period: ctx.period, createdAt: ctx.nowMs, paidAt: ctx.nowMs, auto: { settled },
++      freeConsumed: true, priceMinor: 0, tier: String(u.tier), period: ctx.period, createdAt: ctx.nowMs, paidAt: ctx.nowMs,
++      auto: { settled, dataLevel: fresh.level, dataSyncedAt: fresh.syncedAt },
+     });
+-    try { await generateOrder(deps, id, render); await workRef.update({ [`props.${p.id}`]: "generated", [`reports.${p.id}`]: id }); out.generated++; }
+-    catch (e) { console.error(`Auto report ${id} failed:`, e); await workRef.update({ [`props.${p.id}`]: "failed" }); out.failed++; }
++    let made = false;
++    try {
++      await generateOrder(deps, id, render);
++      await workRef.update({ [`props.${p.id}`]: "generated", [`reports.${p.id}`]: id });
++      out.generated++;
++      made = true;
++    } catch (e) { console.error(`Auto report ${id} failed:`, e); await workRef.update({ [`props.${p.id}`]: "failed" }); out.failed++; }
++    if (made && action === "generate_warn") {
++      try { await tell(p.id, String(p.data().name ?? ""), "warned", fresh); } catch (e) { console.error(`Stale-records notice failed for ${uid}/${p.id}:`, e); }   // the report is already made; never undo it
++    }
+   }
+   if (open === 0) await workRef.update({ state: "done", finishedAt: Date.now() });
+ }
+diff --git a/functions/src/compliance/service.ts b/functions/src/compliance/service.ts
+index d2034d2..9c1b513 100644
+--- a/functions/src/compliance/service.ts
++++ b/functions/src/compliance/service.ts
+@@ -171,7 +171,7 @@ export async function checkout(deps: Deps, pr: Principal, p: { orderId: unknown;
+ // -------------------------------------------------------------------------------------------------------------------- generate
+ async function inputFor(deps: Deps, o: Record<string, any>): Promise<ReportInput> {
+   if (o.input) return o.input as ReportInput;
+-  return loadInputFromFirestore(deps.db, { userId: o.uid, propertyId: o.propertyId }, o.kind, o.month);
++  return loadInputFromFirestore(deps.db, { userId: o.uid, propertyId: o.propertyId }, o.kind, o.month, deps.now().getTime());
+ }
+ 
+ /** Makes the PDF for an entitled order. Locked so two callers never make it twice. Never called for an order that is not entitled. */
+diff --git a/functions/src/compliance/types.ts b/functions/src/compliance/types.ts
+index 9194be8..afb1beb 100644
+--- a/functions/src/compliance/types.ts
++++ b/functions/src/compliance/types.ts
+@@ -1,4 +1,5 @@
+ import type { ReportKind } from "./constants";
++import type { DataAsOf } from "./freshness";
+ 
+ /** Everything the report needs, from either source (the PMS app, or the landlord's synced Firestore data). KES, 2 decimals. */
+ export interface ReportInput {
+@@ -14,6 +15,8 @@ export interface ReportInput {
+   statementItems: { month: string; description: string; amount: number }[];
+   /** All the landlord's properties (the MRI band is tested on the landlord's total, not on one property). */
+   portfolio?: { propertyCount: number; annualRentRoll: number; ytdReceived: number };
++  /** Set only when the records were read from the landlord's synced cloud data: when it was last synced. Never taken from the app, and not part of the record fingerprint. */
++  dataAsOf?: DataAsOf;
+ }
+ 
+ export type CheckResult = "pass" | "fail" | "warn" | "info";
+@@ -52,4 +55,5 @@ export interface Computed {
+   annual: { gross: number; commission: number; finalIncome: number; mriTax: number } | null;
+   checks: Check[];
+   occupancy: { activeTenants: number; invoiced: number; withoutInvoice: number };
++  dataAsOf?: DataAsOf;
+ }
+diff --git a/tests/compliance/freshness.test.mts b/tests/compliance/freshness.test.mts
+new file mode 100644
+index 0000000..fc17f8d
+--- /dev/null
++++ b/tests/compliance/freshness.test.mts
+@@ -0,0 +1,76 @@
++// Run:  node --experimental-strip-types --test tests/compliance/freshness.test.mts
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  DATA_SKIP_AFTER_MS, DATA_STALE_AFTER_MS, autoAction, classifyFreshness, freshnessDetail, freshnessMessage, monthLabel, nairobiDate, staleNoticeText, toMillis,
++} from '../../functions/src/compliance/freshness.ts';
++
++const DAY = 86_400_000;
++const NOW = Date.UTC(2026, 10, 14, 9, 0, 0);
++
++test('thresholds are 3 and 7 days', () => {
++  assert.equal(DATA_STALE_AFTER_MS, 3 * DAY);
++  assert.equal(DATA_SKIP_AFTER_MS, 7 * DAY);
++});
++
++test('classifyFreshness: boundaries', () => {
++  assert.equal(classifyFreshness(NOW, NOW).level, 'fresh');
++  assert.equal(classifyFreshness(NOW - 3 * DAY, NOW).level, 'fresh');          // exactly 3 days is still fresh
++  assert.equal(classifyFreshness(NOW - 3 * DAY - 1, NOW).level, 'stale');
++  assert.equal(classifyFreshness(NOW - 7 * DAY, NOW).level, 'stale');          // exactly 7 days is still a warning, not a skip
++  assert.equal(classifyFreshness(NOW - 7 * DAY - 1, NOW).level, 'expired');
++  assert.deepEqual(classifyFreshness(null, NOW), { syncedAt: null, level: 'unknown', ageDays: null });
++  assert.equal(classifyFreshness(NOW + 5 * 60_000, NOW).level, 'fresh');       // clock a little ahead
++  assert.equal(classifyFreshness(NOW - 5 * DAY, NOW).ageDays, 5);
++});
++
++test('autoAction: what the scheduler does', () => {
++  assert.equal(autoAction('fresh', 5, 15), 'generate');
++  assert.equal(autoAction('stale', 5, 15), 'generate_warn');
++  assert.equal(autoAction('expired', 5, 15), 'wait');
++  assert.equal(autoAction('unknown', 14, 15), 'wait');
++  assert.equal(autoAction('expired', 15, 15), 'skip');
++  assert.equal(autoAction('unknown', 20, 15), 'skip');
++  assert.equal(autoAction('stale', 20, 15), 'generate_warn');
++});
++
++test('toMillis reads every shape the sync stamp can take', () => {
++  assert.equal(toMillis(1_700_000_000_000), 1_700_000_000_000);
++  assert.equal(toMillis(new Date(NOW)), NOW);
++  assert.equal(toMillis('2026-11-14T09:00:00.000Z'), NOW);
++  assert.equal(toMillis({ toMillis: () => NOW }), NOW);
++  assert.equal(toMillis({ seconds: 1_700_000_000, nanoseconds: 500_000_000 }), 1_700_000_000_500);
++  assert.equal(toMillis({ _seconds: 1_700_000_000 }), 1_700_000_000_000);
++  for (const bad of [null, undefined, 0, -5, NaN, 'soon', {}, [], true]) assert.equal(toMillis(bad), null);
++});
++
++test('PDF wording', () => {
++  assert.equal(freshnessMessage(classifyFreshness(NOW - DAY, NOW)), null);
++  const stale = freshnessMessage(classifyFreshness(NOW - 5 * DAY, NOW))!;
++  assert.equal(stale.severe, false);
++  assert.match(stale.text, /2026-11-09 \(5 days ago\)/);
++  const expired = freshnessMessage(classifyFreshness(NOW - 9 * DAY, NOW))!;
++  assert.equal(expired.severe, true);
++  assert.match(expired.text, /make the report again/);
++  const unknown = freshnessMessage(classifyFreshness(null, NOW))!;
++  assert.equal(unknown.severe, true);
++  assert.match(freshnessDetail(classifyFreshness(NOW - DAY, NOW)), /1 day ago/);
++});
++
++test('nairobiDate uses UTC+3', () => {
++  assert.equal(nairobiDate(Date.UTC(2026, 10, 14, 22, 0, 0)), '2026-11-15');
++  assert.equal(monthLabel('2026-10'), 'October 2026');
++});
++
++test('SMS wording', () => {
++  const warned = staleNoticeText({ outcome: 'warned', level: 'stale', ageDays: 5, property: 'Sunrise Apartments', month: '2026-10' });
++  assert.match(warned, /October 2026 MRI report for Sunrise Apartments is ready/);
++  assert.match(warned, /5 days ago/);
++  const skipped = staleNoticeText({ outcome: 'skipped', level: 'expired', ageDays: 9, property: 'Sunrise Apartments', month: '2026-10' });
++  assert.match(skipped, /did not make/);
++  assert.match(skipped, /free report is kept/);
++  const never = staleNoticeText({ outcome: 'skipped', level: 'unknown', ageDays: null, property: '', month: '2026-10' });
++  assert.match(never, /have not synced/);
++  assert.match(never, /your property/);
++  assert.ok(warned.length <= 306 && skipped.length <= 306);                    // at most two SMS segments
++});

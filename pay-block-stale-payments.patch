@@ -1,0 +1,170 @@
+diff --git a/functions/src/compliance/botActions.ts b/functions/src/compliance/botActions.ts
+index 593d78e..7d4b2a6 100644
+--- a/functions/src/compliance/botActions.ts
++++ b/functions/src/compliance/botActions.ts
+@@ -16,7 +16,7 @@ type Db = admin.firestore.Firestore;
+ type BotCtx = { deps: CrDeps; actor: Actor; lang: "en" | "sw" };
+ 
+ const CODE: Record<CrCode, LwCode> = {
+-  CR_BAD_REQUEST: "LW_BAD_MONTH", CR_NOT_FOUND: "LW_NOT_FOUND", CR_NO_DATA: "LW_REPORT_NO_DATA", CR_TOO_LARGE: "LW_UNAVAILABLE",
++  CR_BAD_REQUEST: "LW_BAD_MONTH", CR_NOT_FOUND: "LW_NOT_FOUND", CR_NO_DATA: "LW_REPORT_NO_DATA", CR_STALE_DATA: "LW_REPORT_STALE", CR_TOO_LARGE: "LW_UNAVAILABLE",
+   CR_PAYMENT_FAILED: "LW_PAYMENT_FAILED", CR_UNAVAILABLE: "LW_UNAVAILABLE",
+   CR_NOT_ALLOWED: "LW_NOT_ALLOWED",
+ };
+diff --git a/functions/src/compliance/data.ts b/functions/src/compliance/data.ts
+index 239006a..46cf349 100644
+--- a/functions/src/compliance/data.ts
++++ b/functions/src/compliance/data.ts
+@@ -4,7 +4,7 @@ import type * as admin from "firebase-admin";
+ import { MAX_INPUT_BYTES, MAX_INVOICES, MAX_TENANTS, REPORT_KINDS, type ReportKind } from "./constants";
+ import { isMonth } from "./calc";
+ import { CrError } from "./errors";
+-import { classifyFreshness, toMillis } from "./freshness";
++import { classifyFreshness, isBlocked, staleBlockMessage, toMillis, type DataAsOf } from "./freshness";
+ import type { ReportInput } from "./types";
+ 
+ type Db = admin.firestore.Firestore;
+@@ -87,6 +87,16 @@ export async function loadSyncedAt(db: Db, userId: string): Promise<number | nul
+ }
+ 
+ /** Everything for one property from the landlord's synced records (cloud sync is a paid-plan feature, so this is a Business+ / Watch / Desk path). */
++/** Refuses a report (and so its payment) on records over 7 days old or never synced. */
++export function assertRecordsCurrent(d: DataAsOf | undefined): void {
++  if (d && isBlocked(d)) throw new CrError("CR_STALE_DATA", staleBlockMessage(d));
++}
++
++/** The cheap form of the same check, for the steps that must not read the whole property (order, checkout). */
++export async function assertSyncedRecently(db: Db, userId: string, nowMs: number): Promise<void> {
++  assertRecordsCurrent(classifyFreshness(await loadSyncedAt(db, userId), nowMs));
++}
++
+ export async function loadInputFromFirestore(db: Db, o: Owned, kind: ReportKind, month: string, nowMs: number = Date.now()): Promise<ReportInput> {
+   const user = db.collection("users").doc(o.userId);
+   const pid = idFilter(o.propertyId);
+diff --git a/functions/src/compliance/errors.ts b/functions/src/compliance/errors.ts
+index 2a6bbc0..5cf38b0 100644
+--- a/functions/src/compliance/errors.ts
++++ b/functions/src/compliance/errors.ts
+@@ -1,13 +1,13 @@
+ import { HttpsError, type FunctionsErrorCode } from "firebase-functions/v2/https";
+ 
+ export type CrCode =
+-  | "CR_BAD_REQUEST" | "CR_NOT_FOUND" | "CR_NOT_ALLOWED" | "CR_NO_DATA" | "CR_TOO_LARGE" | "CR_PAYMENT_FAILED" | "CR_UNAVAILABLE";
++  | "CR_BAD_REQUEST" | "CR_NOT_FOUND" | "CR_NOT_ALLOWED" | "CR_NO_DATA" | "CR_STALE_DATA" | "CR_TOO_LARGE" | "CR_PAYMENT_FAILED" | "CR_UNAVAILABLE";
+ 
+ export class CrError extends Error {
+   constructor(public readonly code: CrCode, message: string) { super(message); this.name = "CrError"; }
+ }
+ const HTTPS: Record<CrCode, FunctionsErrorCode> = {
+-  CR_BAD_REQUEST: "invalid-argument", CR_NOT_FOUND: "not-found", CR_NOT_ALLOWED: "permission-denied", CR_NO_DATA: "failed-precondition",
++  CR_BAD_REQUEST: "invalid-argument", CR_NOT_FOUND: "not-found", CR_NOT_ALLOWED: "permission-denied", CR_NO_DATA: "failed-precondition", CR_STALE_DATA: "failed-precondition",
+   CR_TOO_LARGE: "invalid-argument", CR_PAYMENT_FAILED: "unavailable", CR_UNAVAILABLE: "internal",
+ };
+ export function toHttpsError(e: unknown): HttpsError {
+diff --git a/functions/src/compliance/freshness.ts b/functions/src/compliance/freshness.ts
+index 670f7c2..d228a65 100644
+--- a/functions/src/compliance/freshness.ts
++++ b/functions/src/compliance/freshness.ts
+@@ -66,6 +66,17 @@ export function freshnessMessage(d: DataAsOf): { title: string; text: string; se
+     text: `This report was made from records last synced on ${when}. It may be missing recent rent and payments. Sync the app and make the report again before you file.` };
+ }
+ 
++/** True when records this old (or never synced) may not be reported on or paid for: over 7 days, or no sign of a sync. */
++export const isBlocked = (d: DataAsOf): boolean => d.level === "expired" || d.level === "unknown";
++
++/** Why a report cannot be ordered or paid for. Shown to the landlord or the desk agent. */
++export function staleBlockMessage(d: DataAsOf): string {
++  if (d.syncedAt === null || d.ageDays === null) {
++    return "This landlord's records have not synced to the cloud, so a report cannot be made or paid for yet. Open Plot Yangu online so it syncs, then try again.";
++  }
++  return `This landlord's records were last synced on ${nairobiDate(d.syncedAt)} (${plural(d.ageDays, "day")} ago), which is too old for a report. Open Plot Yangu online so it syncs, then try again.`;
++}
++
+ /** One-line version for the compliance checks table. */
+ export function freshnessDetail(d: DataAsOf): string {
+   if (d.level === "fresh" && d.syncedAt !== null && d.ageDays !== null) return `Records last synced on ${nairobiDate(d.syncedAt)} (${plural(d.ageDays, "day")} ago).`;
+diff --git a/functions/src/compliance/service.ts b/functions/src/compliance/service.ts
+index 9c1b513..c5c3994 100644
+--- a/functions/src/compliance/service.ts
++++ b/functions/src/compliance/service.ts
+@@ -8,7 +8,7 @@ import {
+   FREE_REPORTS_PER_PROPERTY_PER_MONTH, LIST_LIMIT, ORDER_TTL_MS, PAY_COOLDOWN_MS, REPORT_KINDS, REPORT_LOCK_MS, REPORT_PRICE_KES, REPORT_PRICE_MINOR,
+   REPORT_REUSE_MS, REPORT_TITLE, SIGNED_URL_TTL_MS, type ReportKind,
+ } from "./constants";
+-import { hashInput, loadInputFromFirestore, parseKind, parseMonth, sanitizeInput } from "./data";
++import { assertRecordsCurrent, assertSyncedRecently, hashInput, loadInputFromFirestore, parseKind, parseMonth, sanitizeInput } from "./data";
+ import { CrError } from "./errors";
+ import { footerText, renderReportHtml } from "./html";
+ import { type Channel, isFreeTier, nairobiMonth, priceMinor } from "./pricing";
+@@ -99,8 +99,9 @@ export async function createOrder(deps: Deps, pr: Principal, p: { propertyId: un
+     if (input.property.id !== propertyId) throw new CrError("CR_BAD_REQUEST", "The records do not match the chosen property.");
+     dataHash = hashInput(input);
+   } else {
+-    // Read it now, before anyone pays: a report can only be made from records that are synced to the account.
+-    await loadInputFromFirestore(deps.db, { userId: pr.landlordUid, propertyId }, kind, month);
++    // Read it now, before anyone pays: a report can only be made from records that are synced to the account, and recently (7 days).
++    await assertSyncedRecently(deps.db, pr.landlordUid, now.getTime());
++    await loadInputFromFirestore(deps.db, { userId: pr.landlordUid, propertyId }, kind, month, now.getTime());
+   }
+   const q = await quote(deps, pr, { propertyId });
+   const id = randomHex(8);
+@@ -130,6 +131,9 @@ export async function checkout(deps: Deps, pr: Principal, p: { orderId: unknown;
+   if (o.state === "generating" || o.state === "ready") return present(o);
+   if (now - Number(o.createdAt) > ORDER_TTL_MS && o.state !== "payment_pending") throw new CrError("CR_NOT_FOUND", "This order expired. Please start again.");
+ 
++  // Time has passed since the order was made: the records may have gone stale. Nothing is charged, and no allowance used, for a report that will be refused.
++  if (!o.input) await assertSyncedRecently(deps.db, o.uid, now);
++
+   const tier = await tierOf(deps.db, o.uid);
+   const used = await freeUsed(deps.db, o.uid, o.propertyId, o.period);
+   const price = priceMinor({ channel: o.channel, tier, freeUsed: used });
+@@ -276,7 +280,8 @@ export async function deskPreview(deps: Deps, p: { uid: string; propertyId?: unk
+   if (!p.propertyId) return { properties, ready: false };
+   const kind = parseKind(p.kind ?? REPORT_KINDS[0]);
+   const month = isMonth(p.month) ? p.month : parseMonth(p.month, deps.now());
+-  const input = await loadInputFromFirestore(deps.db, { userId: p.uid, propertyId: String(p.propertyId) }, kind, month);   // throws CR_NO_DATA when nothing is synced
++  const input = await loadInputFromFirestore(deps.db, { userId: p.uid, propertyId: String(p.propertyId) }, kind, month, deps.now().getTime());   // throws CR_NO_DATA when nothing is synced
++  assertRecordsCurrent(input.dataAsOf);                                                                                                           // throws CR_STALE_DATA: nobody pays for a report on records over 7 days old
+   const c = computeReport(input);
+   return { properties, ready: true, property: input.property.name, tenants: input.tenants.filter((t) => t.active).length, grossRent: c.grossRent / 100 };
+ }
+diff --git a/functions/src/landlordWatch/errors.ts b/functions/src/landlordWatch/errors.ts
+index 80c8021..8469249 100644
+--- a/functions/src/landlordWatch/errors.ts
++++ b/functions/src/landlordWatch/errors.ts
+@@ -3,7 +3,7 @@ import { HttpsError, type FunctionsErrorCode } from "firebase-functions/v2/https
+ export type LwCode =
+   | "LW_BAD_OWNER_ID" | "LW_NOT_FOUND" | "LW_RATE_LIMITED" | "LW_NO_PHONE_ON_FILE" | "LW_OTP_COOLDOWN" | "LW_OTP_WRONG"
+   | "LW_OTP_EXPIRED" | "LW_OTP_LOCKED" | "LW_SMS_FAILED" | "LW_LOCKED" | "LW_CONNECTION_LIMIT" | "LW_BAD_MONTH"
+-  | "LW_PAYMENT_FAILED" | "LW_NOT_ALLOWED" | "LW_UNAVAILABLE" | "LW_REPORT_NO_DATA";
++  | "LW_PAYMENT_FAILED" | "LW_NOT_ALLOWED" | "LW_UNAVAILABLE" | "LW_REPORT_NO_DATA" | "LW_REPORT_STALE";
+ 
+ export interface LwExtra { retryAfterSec?: number; attemptsLeft?: number }
+ 
+@@ -20,6 +20,7 @@ const HTTPS_CODE: Record<LwCode, FunctionsErrorCode> = {
+   LW_OTP_EXPIRED: "deadline-exceeded", LW_OTP_LOCKED: "permission-denied", LW_SMS_FAILED: "unavailable",
+   LW_LOCKED: "failed-precondition", LW_CONNECTION_LIMIT: "resource-exhausted", LW_BAD_MONTH: "invalid-argument",
+   LW_PAYMENT_FAILED: "unavailable", LW_NOT_ALLOWED: "permission-denied", LW_UNAVAILABLE: "internal", LW_REPORT_NO_DATA: "failed-precondition",
++  LW_REPORT_STALE: "failed-precondition",
+ };
+ 
+ /** Callable transport: HttpsError whose details carry the LW code. */
+diff --git a/tests/compliance/freshness.test.mts b/tests/compliance/freshness.test.mts
+index fc17f8d..2740964 100644
+--- a/tests/compliance/freshness.test.mts
++++ b/tests/compliance/freshness.test.mts
+@@ -74,3 +74,14 @@ test('SMS wording', () => {
+   assert.match(never, /your property/);
+   assert.ok(warned.length <= 306 && skipped.length <= 306);                    // at most two SMS segments
+ });
++
++test('blocked: over 7 days or never synced; the message says why', async () => {
++  const { isBlocked, staleBlockMessage } = await import('../../functions/src/compliance/freshness.ts');
++  assert.equal(isBlocked(classifyFreshness(NOW - 2 * DAY, NOW)), false);
++  assert.equal(isBlocked(classifyFreshness(NOW - 5 * DAY, NOW)), false);       // a stale report may still be ordered; the PDF carries the warning
++  assert.equal(isBlocked(classifyFreshness(NOW - 7 * DAY, NOW)), false);
++  assert.equal(isBlocked(classifyFreshness(NOW - 7 * DAY - 1, NOW)), true);
++  assert.equal(isBlocked(classifyFreshness(null, NOW)), true);
++  assert.match(staleBlockMessage(classifyFreshness(NOW - 9 * DAY, NOW)), /2026-11-05 \(9 days ago\).*too old.*syncs/);
++  assert.match(staleBlockMessage(classifyFreshness(null, NOW)), /have not synced/);
++});

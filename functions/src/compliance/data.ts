@@ -4,6 +4,7 @@ import type * as admin from "firebase-admin";
 import { MAX_INPUT_BYTES, MAX_INVOICES, MAX_TENANTS, REPORT_KINDS, type ReportKind } from "./constants";
 import { isMonth } from "./calc";
 import { CrError } from "./errors";
+import { classifyFreshness, isBlocked, staleBlockMessage, toMillis, type DataAsOf } from "./freshness";
 import type { ReportInput } from "./types";
 
 type Db = admin.firestore.Firestore;
@@ -55,16 +56,52 @@ export function sanitizeInput(raw: unknown, kind: ReportKind, month: string): Re
   return input;
 }
 
-export const hashInput = (input: ReportInput): string => createHash("sha256").update(JSON.stringify(input)).digest("hex");
+/** The fingerprint covers the records only: when they were synced is stated beside it, not inside it. */
+export const hashInput = (input: ReportInput): string => {
+  const { dataAsOf: _dataAsOf, ...records } = input;
+  void _dataAsOf;
+  return createHash("sha256").update(JSON.stringify(records)).digest("hex");
+};
 
 export interface Owned { userId: string; propertyId: string }
 
+/**
+ * When did this landlord's app last sync to the cloud (epoch ms), or null if there is no sign it ever did.
+ * The app stamps `lastSyncTime` on the user document on every full upload (every 12 hours while it is open) and on every
+ * record it pushes live, so the newest of those is the best evidence of how current the cloud copy is.
+ */
+export async function loadSyncedAt(db: Db, userId: string): Promise<number | null> {
+  const user = db.collection("users").doc(userId);
+  const newest = async (collection: "invoices" | "tenants"): Promise<number | null> => {
+    try {
+      const snap = await user.collection(collection).orderBy("lastSyncTime", "desc").limit(1).get();
+      return snap.empty ? null : toMillis(snap.docs[0].data().lastSyncTime);
+    } catch (e) {
+      console.warn(`Could not read the newest ${collection} sync time:`, e);   // the user document's own stamp still counts
+      return null;
+    }
+  };
+  const [own, inv, ten] = await Promise.all([user.get().then((s) => toMillis(s.data()?.lastSyncTime)), newest("invoices"), newest("tenants")]);
+  const known = [own, inv, ten].filter((t): t is number => t !== null);
+  return known.length ? Math.max(...known) : null;
+}
+
 /** Everything for one property from the landlord's synced records (cloud sync is a paid-plan feature, so this is a Business+ / Watch / Desk path). */
-export async function loadInputFromFirestore(db: Db, o: Owned, kind: ReportKind, month: string): Promise<ReportInput> {
+/** Refuses a report (and so its payment) on records over 7 days old or never synced. */
+export function assertRecordsCurrent(d: DataAsOf | undefined): void {
+  if (d && isBlocked(d)) throw new CrError("CR_STALE_DATA", staleBlockMessage(d));
+}
+
+/** The cheap form of the same check, for the steps that must not read the whole property (order, checkout). */
+export async function assertSyncedRecently(db: Db, userId: string, nowMs: number): Promise<void> {
+  assertRecordsCurrent(classifyFreshness(await loadSyncedAt(db, userId), nowMs));
+}
+
+export async function loadInputFromFirestore(db: Db, o: Owned, kind: ReportKind, month: string, nowMs: number = Date.now()): Promise<ReportInput> {
   const user = db.collection("users").doc(o.userId);
   const pid = idFilter(o.propertyId);
   const year = month.slice(0, 4);
-  const [uSnap, pSnap] = await Promise.all([user.get(), user.collection("properties").doc(o.propertyId).get()]);
+  const [uSnap, pSnap, syncedAt] = await Promise.all([user.get(), user.collection("properties").doc(o.propertyId).get(), loadSyncedAt(db, o.userId)]);
   const u = uSnap.data(), p = pSnap.data();
   if (!u || !p) throw new CrError("CR_NOT_FOUND", "Property not found.");
 
@@ -120,6 +157,7 @@ export async function loadInputFromFirestore(db: Db, o: Owned, kind: ReportKind,
     },
     tenants, invoices, statementItems,
     portfolio: { propertyCount: Math.max(1, propsSnap.size), annualRentRoll: roll, ytdReceived: ytd },
+    dataAsOf: classifyFreshness(syncedAt, nowMs),
   };
   if (tenants.length === 0 && invoices.length === 0) throw new CrError("CR_NO_DATA", "There are no synced tenant or invoice records for this property. Cloud sync must be on for a report to be made from the account.");
   return input;

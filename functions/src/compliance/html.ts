@@ -1,6 +1,7 @@
 // One template for every report: same layout, same section order, same wording. Paged by the PDF engine (table headers repeat,
 // rows never split, the footer carries page numbers).
 import { MRI_MAX_ANNUAL_KES, MRI_MIN_ANNUAL_KES, MRI_RATE_PCT, REPORT_TITLE } from "./constants";
+import { freshnessMessage, nairobiDate } from "./freshness";
 import type { Computed } from "./types";
 
 const esc = (s: unknown): string => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
@@ -48,6 +49,14 @@ function statusBlock(c: Computed): string {
   return `<div class="note ok"><b>MRI applies.</b> Annual gross rent is within KES ${MRI_MIN_ANNUAL_KES.toLocaleString("en-US")} to KES ${MRI_MAX_ANNUAL_KES.toLocaleString("en-US")}. Pay ${MRI_RATE_PCT}% of the gross rent received, no deductions, by the 20th of the following month (${longDate(c.mri.dueDate)} for this return).</div>`;
 }
 
+/** A notice under the summary when the records the report was made from are not current. Nothing for fresh records or the app's own data. */
+function freshnessBlock(c: Computed): string {
+  const m = c.dataAsOf ? freshnessMessage(c.dataAsOf) : null;
+  if (!m) return "";
+  return `<div class="note${m.severe ? " bad" : ""}"><b>${esc(m.title)}</b> ${esc(m.text)}</div>`;
+}
+const syncedLine = (c: Computed): string => (c.dataAsOf?.syncedAt ? ` &middot; records last synced ${esc(longDate(nairobiDate(c.dataAsOf.syncedAt)))}` : "");
+
 export function renderReportHtml(c: Computed, meta: Meta): string {
   const p = c.property, l = c.landlord, t = c.threshold;
   const periodLabel = c.kind === "annual_summary" ? `January to ${monthName(c.month)}` : monthName(c.month);
@@ -65,7 +74,7 @@ export function renderReportHtml(c: Computed, meta: Meta): string {
     <div class="card"><div class="k">MRI base (gross rent)</div><div class="v">${kes(sm.gross)}</div></div>
     <div class="card hi"><div class="k">MRI at ${MRI_RATE_PCT}%</div><div class="v">${c.mri.applies ? kes(sm.tax) : "Not applicable"}</div></div>
     <div class="card"><div class="k">${sm.dueLabel}</div><div class="v">${esc(longDate(sm.due))}</div></div>
-  </div>${statusBlock(c)}`;
+  </div>${statusBlock(c)}${freshnessBlock(c)}`;
 
   const worksheet = `
   <table><thead><tr><th>Step</th><th class="r">Amount</th></tr></thead><tbody>
@@ -125,7 +134,7 @@ export function renderReportHtml(c: Computed, meta: Meta): string {
   </ol>
   <p class="small mu">Plot Yangu is not connected to KRA and does not file or pay anything on your behalf. This report is prepared from the rent, invoice and payment records kept in Plot Yangu. Check it against your bank and M-Pesa statements before you file. Penalties and interest can apply to late filing or payment; see KRA for current rules.</p>
   <div class="sign"><div>Landlord / agent signature &amp; date</div><div>KRA PIN: ${esc(l.kraPin || "______________________")}</div></div>
-  <p class="small mu hash">Report ${esc(meta.reportId)} &middot; ${REPORT_TITLE[c.kind]} &middot; version ${esc(c.version)} &middot; source ${esc(meta.source)} &middot; record fingerprint (SHA-256) ${esc(meta.dataHash)}</p>`);
+  <p class="small mu hash">Report ${esc(meta.reportId)} &middot; ${REPORT_TITLE[c.kind]} &middot; version ${esc(c.version)} &middot; source ${esc(meta.source)}${syncedLine(c)} &middot; record fingerprint (SHA-256) ${esc(meta.dataHash)}</p>`);
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${esc(REPORT_TITLE[c.kind])} - ${esc(p.name)}</title><style>${CSS}</style></head><body>
   <div class="head"><div><div class="brand">PLOT YANGU &middot; COMPLIANCE REPORT</div><div class="title">${esc(REPORT_TITLE[c.kind])}</div>

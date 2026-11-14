@@ -1,4 +1,5 @@
 import type { ReportKind } from "./constants";
+import type { DataAsOf } from "./freshness";
 
 /** Everything the report needs, from either source (the PMS app, or the landlord's synced Firestore data). KES, 2 decimals. */
 export interface ReportInput {
@@ -14,6 +15,8 @@ export interface ReportInput {
   statementItems: { month: string; description: string; amount: number }[];
   /** All the landlord's properties (the MRI band is tested on the landlord's total, not on one property). */
   portfolio?: { propertyCount: number; annualRentRoll: number; ytdReceived: number };
+  /** Set only when the records were read from the landlord's synced cloud data: when it was last synced. Never taken from the app, and not part of the record fingerprint. */
+  dataAsOf?: DataAsOf;
 }
 
 export type CheckResult = "pass" | "fail" | "warn" | "info";
@@ -52,4 +55,5 @@ export interface Computed {
   annual: { gross: number; commission: number; finalIncome: number; mriTax: number } | null;
   checks: Check[];
   occupancy: { activeTenants: number; invoiced: number; withoutInvoice: number };
+  dataAsOf?: DataAsOf;
 }

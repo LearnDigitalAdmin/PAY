@@ -3,7 +3,7 @@ import { HttpsError, type FunctionsErrorCode } from "firebase-functions/v2/https
 export type LwCode =
   | "LW_BAD_OWNER_ID" | "LW_NOT_FOUND" | "LW_RATE_LIMITED" | "LW_NO_PHONE_ON_FILE" | "LW_OTP_COOLDOWN" | "LW_OTP_WRONG"
   | "LW_OTP_EXPIRED" | "LW_OTP_LOCKED" | "LW_SMS_FAILED" | "LW_LOCKED" | "LW_CONNECTION_LIMIT" | "LW_BAD_MONTH"
-  | "LW_PAYMENT_FAILED" | "LW_NOT_ALLOWED" | "LW_UNAVAILABLE" | "LW_REPORT_NO_DATA";
+  | "LW_PAYMENT_FAILED" | "LW_NOT_ALLOWED" | "LW_UNAVAILABLE" | "LW_REPORT_NO_DATA" | "LW_REPORT_STALE";
 
 export interface LwExtra { retryAfterSec?: number; attemptsLeft?: number }
 
@@ -20,6 +20,7 @@ const HTTPS_CODE: Record<LwCode, FunctionsErrorCode> = {
   LW_OTP_EXPIRED: "deadline-exceeded", LW_OTP_LOCKED: "permission-denied", LW_SMS_FAILED: "unavailable",
   LW_LOCKED: "failed-precondition", LW_CONNECTION_LIMIT: "resource-exhausted", LW_BAD_MONTH: "invalid-argument",
   LW_PAYMENT_FAILED: "unavailable", LW_NOT_ALLOWED: "permission-denied", LW_UNAVAILABLE: "internal", LW_REPORT_NO_DATA: "failed-precondition",
+  LW_REPORT_STALE: "failed-precondition",
 };
 
 /** Callable transport: HttpsError whose details carry the LW code. */

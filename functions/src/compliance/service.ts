@@ -8,7 +8,7 @@ import {
   FREE_REPORTS_PER_PROPERTY_PER_MONTH, LIST_LIMIT, ORDER_TTL_MS, PAY_COOLDOWN_MS, REPORT_KINDS, REPORT_LOCK_MS, REPORT_PRICE_KES, REPORT_PRICE_MINOR,
   REPORT_REUSE_MS, REPORT_TITLE, SIGNED_URL_TTL_MS, type ReportKind,
 } from "./constants";
-import { hashInput, loadInputFromFirestore, parseKind, parseMonth, sanitizeInput } from "./data";
+import { assertRecordsCurrent, assertSyncedRecently, hashInput, loadInputFromFirestore, parseKind, parseMonth, sanitizeInput } from "./data";
 import { CrError } from "./errors";
 import { footerText, renderReportHtml } from "./html";
 import { type Channel, isFreeTier, nairobiMonth, priceMinor } from "./pricing";
@@ -99,8 +99,9 @@ export async function createOrder(deps: Deps, pr: Principal, p: { propertyId: un
     if (input.property.id !== propertyId) throw new CrError("CR_BAD_REQUEST", "The records do not match the chosen property.");
     dataHash = hashInput(input);
   } else {
-    // Read it now, before anyone pays: a report can only be made from records that are synced to the account.
-    await loadInputFromFirestore(deps.db, { userId: pr.landlordUid, propertyId }, kind, month);
+    // Read it now, before anyone pays: a report can only be made from records that are synced to the account, and recently (7 days).
+    await assertSyncedRecently(deps.db, pr.landlordUid, now.getTime());
+    await loadInputFromFirestore(deps.db, { userId: pr.landlordUid, propertyId }, kind, month, now.getTime());
   }
   const q = await quote(deps, pr, { propertyId });
   const id = randomHex(8);
@@ -129,6 +130,9 @@ export async function checkout(deps: Deps, pr: Principal, p: { orderId: unknown;
   if (o.entitled === true) return present(o);
   if (o.state === "generating" || o.state === "ready") return present(o);
   if (now - Number(o.createdAt) > ORDER_TTL_MS && o.state !== "payment_pending") throw new CrError("CR_NOT_FOUND", "This order expired. Please start again.");
+
+  // Time has passed since the order was made: the records may have gone stale. Nothing is charged, and no allowance used, for a report that will be refused.
+  if (!o.input) await assertSyncedRecently(deps.db, o.uid, now);
 
   const tier = await tierOf(deps.db, o.uid);
   const used = await freeUsed(deps.db, o.uid, o.propertyId, o.period);
@@ -171,7 +175,7 @@ export async function checkout(deps: Deps, pr: Principal, p: { orderId: unknown;
 // -------------------------------------------------------------------------------------------------------------------- generate
 async function inputFor(deps: Deps, o: Record<string, any>): Promise<ReportInput> {
   if (o.input) return o.input as ReportInput;
-  return loadInputFromFirestore(deps.db, { userId: o.uid, propertyId: o.propertyId }, o.kind, o.month);
+  return loadInputFromFirestore(deps.db, { userId: o.uid, propertyId: o.propertyId }, o.kind, o.month, deps.now().getTime());
 }
 
 /** Makes the PDF for an entitled order. Locked so two callers never make it twice. Never called for an order that is not entitled. */
@@ -276,7 +280,8 @@ export async function deskPreview(deps: Deps, p: { uid: string; propertyId?: unk
   if (!p.propertyId) return { properties, ready: false };
   const kind = parseKind(p.kind ?? REPORT_KINDS[0]);
   const month = isMonth(p.month) ? p.month : parseMonth(p.month, deps.now());
-  const input = await loadInputFromFirestore(deps.db, { userId: p.uid, propertyId: String(p.propertyId) }, kind, month);   // throws CR_NO_DATA when nothing is synced
+  const input = await loadInputFromFirestore(deps.db, { userId: p.uid, propertyId: String(p.propertyId) }, kind, month, deps.now().getTime());   // throws CR_NO_DATA when nothing is synced
+  assertRecordsCurrent(input.dataAsOf);                                                                                                           // throws CR_STALE_DATA: nobody pays for a report on records over 7 days old
   const c = computeReport(input);
   return { properties, ready: true, property: input.property.name, tenants: input.tenants.filter((t) => t.active).length, grossRent: c.grossRent / 100 };
 }
