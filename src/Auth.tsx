@@ -132,7 +132,8 @@ const Auth: React.FC = () => {
       if (result.role !== 'tenant') {
         throw new Error(result.message || 'We could not load your tenant profile. Please try again.');
       }
-      const from = location.state?.from || '/tenant';
+      // New: through the Lipa Mdogo Mdogo gate, which sends legacy-only tenants to /tenant exactly as before.
+      const from = location.state?.from || '/lmmx';
       navigate(from);
 
     } catch (err: any) {

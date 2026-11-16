@@ -151,7 +151,7 @@ export async function sendSettlement(s: Secrets, sid: string): Promise<void> {
     if (c.status === "success" || c.status === "sent") continue;
     try {
       const res = await axios.post(`${PAYSTACK_API_BASE}/transfer`, {
-        source: "balance", amount: c.sendMinor, recipient: st.recipientCode, reference: c.reference, currency: "KES", reason: "Rent via Lipa Mos Mos",
+        source: "balance", amount: c.sendMinor, recipient: st.recipientCode, reference: c.reference, currency: "KES", reason: "Rent via Lipa Mdogo Mdogo",
       }, { headers: hdr(s), timeout: 30_000 });
       const status = String(res.data?.data?.status ?? "");
       if (status === "otp") { await alertOps("OTP_REQUIRED", `Paystack wants an OTP for ${sid}. Turn off transfer confirmation in Paystack settings.`); return; }

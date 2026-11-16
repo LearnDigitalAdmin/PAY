@@ -1,0 +1,1760 @@
+diff --git a/package.json b/package.json
+index 954d55f..f94c6df 100644
+--- a/package.json
++++ b/package.json
+@@ -5,6 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "check:mychama-contract": "node tools/check-mychama-contract.mjs",
++    "check:lmmx-contract": "node tools/check-lmmx-contract.mjs",
+     "dev": "vite",
+     "build": "tsc -b && vite build",
+     "lint": "eslint .",
+diff --git a/src/AgentView.tsx b/src/AgentView.tsx
+index 9f9ecd9..aced38b 100644
+--- a/src/AgentView.tsx
++++ b/src/AgentView.tsx
+@@ -43,7 +43,7 @@ const AgentView: React.FC = () => {
+   const [showPaymentModal, setShowPaymentModal] = useState(false);
+   const [showTerminal, setShowTerminal] = useState(false);
+   const [showPaymentSettings, setShowPaymentSettings] = useState(false);
+-  // Lipa Mos Mos (tenants pay rent a little at a time; the landlord is paid by transfer to this same account)
++  // Lipa Mdogo Mdogo (tenants pay rent a little at a time; the landlord is paid by transfer to this same account)
+   const [lmm, setLmm] = useState<{ status: string; reason?: string | null; last4?: string } | null>(null);
+   const [lmmBusy, setLmmBusy] = useState(false);
+   const [lmmMsg, setLmmMsg] = useState('');
+@@ -165,8 +165,8 @@ const AgentView: React.FC = () => {
+     try {
+       await httpsCallable(functions, 'lmm_setupRecipient')({ settlementType: info.settlementType || '', bankCode: info.settlementBankCode || '', accountNumber: info.accountNumber || '', name: info.businessName || '' });
+       const r: any = await httpsCallable(functions, 'lmm_recipientStatus')({});
+-      setLmm(r.data); setLmmMsg('Lipa Mos Mos is on for your payout account.');
+-    } catch (e: any) { setLmmMsg(e?.message || 'Could not turn on Lipa Mos Mos'); } finally { setLmmBusy(false); }
++      setLmm(r.data); setLmmMsg('Lipa Mdogo Mdogo is on for your payout account.');
++    } catch (e: any) { setLmmMsg(e?.message || 'Could not turn on Lipa Mdogo Mdogo'); } finally { setLmmBusy(false); }
+   };
+ 
+   useEffect(() => {
+@@ -538,7 +538,7 @@ const AgentView: React.FC = () => {
+                       Settlement Bank: {agentData.paymentInfo.settlementBank.toUpperCase()}
+                     </p>
+                     <div className="mt-3 pt-3 border-t border-green-200">
+-                      <p className="text-green-900 font-semibold text-sm">Lipa Mos Mos</p>
++                      <p className="text-green-900 font-semibold text-sm">Lipa Mdogo Mdogo</p>
+                       {lmm?.status === 'active' ? (
+                         <p className="text-green-700 text-sm">On. Tenants can pay rent a little at a time and you are paid by transfer to the account ending {lmm.last4}.</p>
+                       ) : lmm?.status === 'unsupported' ? (
+@@ -547,7 +547,7 @@ const AgentView: React.FC = () => {
+                         <p className="text-green-700 text-sm">Let tenants pay rent a little at a time. You are paid by transfer when it is covered, or on the 5th.</p>
+                       )}
+                       {lmm?.status !== 'active' && lmm?.status !== 'unsupported' && (
+-                        <button type="button" onClick={enableLmm} disabled={lmmBusy} className="mt-2 px-3 py-1.5 rounded-lg bg-green-600 text-white text-sm font-semibold disabled:opacity-50">{lmmBusy ? 'Please wait...' : 'Turn on Lipa Mos Mos'}</button>
++                        <button type="button" onClick={enableLmm} disabled={lmmBusy} className="mt-2 px-3 py-1.5 rounded-lg bg-green-600 text-white text-sm font-semibold disabled:opacity-50">{lmmBusy ? 'Please wait...' : 'Turn on Lipa Mdogo Mdogo'}</button>
+                       )}
+                       {lmmMsg && <p className="text-sm mt-1 text-green-800 break-words">{lmmMsg}</p>}
+                     </div>
+diff --git a/src/App.tsx b/src/App.tsx
+index 3003901..b952c58 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -12,6 +12,8 @@ import Contact from './Contact';
+ import { Loader2 } from 'lucide-react';
+ import Welcome from './Welcome';
+ import FAQPage from './Faq';
++import LmmxGate from './lmmx/LmmxGate';
++import LmmxApp from './lmmx/LmmxApp';
+ 
+ // Protected Route Component — role comes from the verified session (Firebase Auth + server claims),
+ // not from localStorage.
+@@ -101,6 +103,11 @@ const App: React.FC = () => {
+           }
+         />
+ 
++        {/* Lipa Mdogo Mdogo (standalone tenants): the gate links phone + ID, the app is the dashboard */}
++        <Route path="/lmmx" element={<ProtectedRoute requiredRole="tenant"><LmmxGate /></ProtectedRoute>} />
++        <Route path="/lmmx/app" element={<ProtectedRoute requiredRole="tenant"><LmmxApp /></ProtectedRoute>} />
++        {import.meta.env.VITE_LMMX_MOCK === 'true' && <Route path="/lmmx/demo" element={<LmmxApp demo />} />}
++
+         {/* 404 Route */}
+         <Route path="*" element={<Navigate to="/" replace />} />
+       </Routes>
+diff --git a/src/Auth.tsx b/src/Auth.tsx
+index 6c383c4..c37ade1 100644
+--- a/src/Auth.tsx
++++ b/src/Auth.tsx
+@@ -132,7 +132,8 @@ const Auth: React.FC = () => {
+       if (result.role !== 'tenant') {
+         throw new Error(result.message || 'We could not load your tenant profile. Please try again.');
+       }
+-      const from = location.state?.from || '/tenant';
++      // New: through the Lipa Mdogo Mdogo gate, which sends legacy-only tenants to /tenant exactly as before.
++      const from = location.state?.from || '/lmmx';
+       navigate(from);
+ 
+     } catch (err: any) {
+diff --git a/src/LipaMosMos.tsx b/src/LipaMosMos.tsx
+index 9787fd1..49ab80d 100644
+--- a/src/LipaMosMos.tsx
++++ b/src/LipaMosMos.tsx
+@@ -27,7 +27,7 @@ const call = <T,>(name: string, data: unknown) => httpsCallable<unknown, T>(func
+ 
+ interface Props { agentId: string; tenantId: number | string; phone?: string; onPaid?: () => void }
+ 
+-/** Lipa Mos Mos: pay rent a little at a time. Money waits safely until the target or the invoice due date, then the landlord is paid. */
++/** Lipa Mdogo Mdogo: pay rent a little at a time. Money waits safely until the target or the invoice due date, then the landlord is paid. */
+ export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onPaid }: Props) {
+   const [res, setRes] = useState<Res | null>(null);
+   const [freq, setFreq] = useState<Frequency>('weekly');
+@@ -39,12 +39,12 @@ export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onP
+ 
+   const load = useCallback(async () => {
+     try { const r = await call<Res>('lmm_getPlan', ids); setRes(r); if (r.plan?.frequency) setFreq(r.plan.frequency); }
+-    catch (e: any) { setRes({ available: false, reason: e?.message || 'Could not load Lipa Mos Mos' }); }
++    catch (e: any) { setRes({ available: false, reason: e?.message || 'Could not load Lipa Mdogo Mdogo' }); }
+   }, [ids]);
+   useEffect(() => { void load(); }, [load]);
+ 
+-  if (!res) return <div className="bg-white rounded-xl shadow-md p-6 text-sm text-gray-500">Loading Lipa Mos Mos...</div>;
+-  if (!res.available) return <div className="bg-white rounded-xl shadow-md p-6"><p className="font-semibold text-gray-900">Lipa Mos Mos</p><p className="text-sm text-gray-600 mt-1">{res.reason}</p></div>;
++  if (!res) return <div className="bg-white rounded-xl shadow-md p-6 text-sm text-gray-500">Loading Lipa Mdogo Mdogo...</div>;
++  if (!res.available) return <div className="bg-white rounded-xl shadow-md p-6"><p className="font-semibold text-gray-900">Lipa Mdogo Mdogo</p><p className="text-sm text-gray-600 mt-1">{res.reason}</p></div>;
+ 
+   const plan = res.plan;
+   const suggested = (plan?.suggestedMinor ?? res.suggestedMinor ?? 0) / 100;
+@@ -70,7 +70,7 @@ export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onP
+     <div className="bg-white rounded-xl shadow-md p-6 mb-8">
+       <div className="flex items-start justify-between gap-3">
+         <div>
+-          <h3 className="text-lg font-bold text-gray-900">Lipa Mos Mos</h3>
++          <h3 className="text-lg font-bold text-gray-900">Lipa Mdogo Mdogo</h3>
+           <p className="text-sm text-gray-600 mt-1">Pay your rent a little at a time. Your landlord is paid when it is fully covered, or on the due date with whatever you have paid.</p>
+         </div>
+       </div>
+diff --git a/src/TenantView.tsx b/src/TenantView.tsx
+index 1b6607f..77b8717 100644
+--- a/src/TenantView.tsx
++++ b/src/TenantView.tsx
+@@ -360,7 +360,7 @@ const TenantView: React.FC = () => {
+           billsDue={splitInvoiceOutstanding(invoices).billsDue}
+         />
+ 
+-        {/* Lipa Mos Mos: pay rent a little at a time (shown while something is owed) */}
++        {/* Lipa Mdogo Mdogo: pay rent a little at a time (shown while something is owed) */}
+         {(() => {
+           const open = invoices.find((inv) => !inv.isPaid);
+           return open ? <LipaMosMos agentId={open.agentUserId} tenantId={open.tenantId} phone={tenantData?.phone || ''} onPaid={handlePaymentSuccess} /> : null;
+diff --git a/src/lmmx/CodeBox.tsx b/src/lmmx/CodeBox.tsx
+new file mode 100644
+index 0000000..9fd7a37
+--- /dev/null
++++ b/src/lmmx/CodeBox.tsx
+@@ -0,0 +1,68 @@
++// One box for every 4-digit code: "LMM4683", "lmm 4683" or just "4683" (setup, a change) and "LMC7391" / "7391" (cancel a change).
++import { useState } from 'react';
++import { parseLmmxCode } from './contract';
++import { LmmxApiError, errorMessage } from './api';
++import { ERROR_FALLBACK, ERROR_TEXT, S } from './strings';
++import { Alert, Btn, Field, inputClass } from './ui';
++
++export type CodeKind = 'otp' | 'cancel';
++
++export function normaliseCode(raw: string, kind: CodeKind): { code: string } | { error: 'bad' | 'kind' } {
++  const parsed = parseLmmxCode(raw);
++  if (parsed) return parsed.kind === kind ? { code: parsed.code } : { error: 'kind' };
++  const m = /^\s*(\d{4})\s*$/.exec(raw);
++  return m ? { code: m[1] } : { error: 'bad' };
++}
++
++interface Props {
++  title: string;
++  kind: CodeKind;
++  placeholder: string;
++  button: string;
++  tone?: 'primary' | 'danger';
++  /** Does the call with the normalised 4 digits and returns the success text. Throws on failure. */
++  submit: (code4: string) => Promise<string>;
++  onDone?: () => void;
++}
++
++export default function CodeBox({ title, kind, placeholder, button, tone = 'primary', submit, onDone }: Props) {
++  const [raw, setRaw] = useState('');
++  const [busy, setBusy] = useState(false);
++  const [note, setNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
++  const [locked, setLocked] = useState(false);
++
++  const go = async () => {
++    const n = normaliseCode(raw, kind);
++    if ('error' in n) { setNote({ kind: 'err', text: n.error === 'kind' ? S.codeWrongKind : S.codeBad }); return; }
++    setBusy(true); setNote(null);
++    try {
++      const text = await submit(n.code);
++      setNote({ kind: 'ok', text }); setRaw('');
++      onDone?.();
++    } catch (e) {
++      let text = errorMessage(e, ERROR_TEXT, ERROR_FALLBACK);
++      if (e instanceof LmmxApiError) {
++        if (e.lmmx === 'LMMX_E_OTP_LOCKED') setLocked(true);
++        if (e.lmmx === 'LMMX_E_OTP_INVALID' && typeof e.attemptsLeft === 'number') text += ` ${S.codeAttemptsLeft(e.attemptsLeft)}`;
++      }
++      setNote({ kind: 'err', text });
++    } finally { setBusy(false); }
++  };
++
++  return (
++    <div className="mt-4 border-t border-gray-100 pt-4">
++      <h3 className="font-semibold text-gray-900">{title}</h3>
++      <div className="mt-2 flex gap-2 items-end">
++        <div className="flex-1">
++          <Field label={S.codeLabel}>
++            <input className={inputClass} inputMode="text" autoComplete="one-time-code" value={raw} placeholder={placeholder} maxLength={12} disabled={busy || locked}
++              onChange={(e) => setRaw(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !busy && !locked) void go(); }} />
++          </Field>
++        </div>
++        <Btn tone={tone} onClick={go} disabled={busy || locked || !raw.trim()}>{busy ? S.linking : button}</Btn>
++      </div>
++      <p className="mt-2 text-xs text-gray-500">{S.codeShareWarning} {S.whatsappHint}</p>
++      {note && <div className="mt-2"><Alert kind={note.kind}>{note.text}</Alert></div>}
++    </div>
++  );
++}
+diff --git a/src/lmmx/Dashboard.tsx b/src/lmmx/Dashboard.tsx
+new file mode 100644
+index 0000000..ff39cb8
+--- /dev/null
++++ b/src/lmmx/Dashboard.tsx
+@@ -0,0 +1,86 @@
++// Home tab: rent, dates, progress, who the landlord is paid to, and the states that need attention (setup, frozen, a pending change).
++import { channelLabel, kes, otpText, shortDate, cancelText, type TenantSummaryOut } from './contract';
++import { lmmx } from './api';
++import CodeBox from './CodeBox';
++import { S } from './strings';
++import { Alert, Card, Row, Title, when } from './ui';
++
++interface Props { s: TenantSummaryOut; onChanged: () => void }
++
++export default function Dashboard({ s, onChanged }: Props) {
++  const c = s.cycle;
++  const pc = s.pendingChange;
++  const actionable = pc && (pc.status === 'awaiting_tenant_otp' || pc.status === 'cooling_off' || pc.status === 'deferred');
++
++  return (
++    <div className="grid gap-4">
++      {s.frozen && (
++        <Card><Alert kind="warn"><strong>{S.frozenTitle}</strong><br />{S.frozenBody(s.supportPhone)}</Alert></Card>
++      )}
++
++      {s.awaitingSetup && !s.frozen && (
++        <Card>
++          <Title>{S.awaitingTitle}</Title>
++          <p className="mt-1 text-sm text-gray-700">{S.awaitingBody}</p>
++          <p className="mt-2 text-sm text-gray-900">{s.awaitingSetup.summary}</p>
++          <p className="mt-1 text-xs text-gray-500">{S.awaitingExpires(when(s.awaitingSetup.otpExpiresAt))}</p>
++          <CodeBox title={S.codeSetupTitle} kind="otp" placeholder={S.codePlaceholder} button={S.codeConfirm}
++            submit={async (code) => { await lmmx('lmmx_tenant_confirmSetup', { otp: otpText(code) }); return S.codeSetupDone; }} onDone={onChanged} />
++        </Card>
++      )}
++
++      {!s.awaitingSetup && (
++        <Card>
++          <Title>{S.hello(s.firstName)}</Title>
++          <dl className="mt-2 divide-y divide-gray-100">
++            <Row label={S.rentLabel}>{kes(s.rentMinor)}</Row>
++            {c ? (
++              <>
++                <Row label={S.balanceLabel}>{c.remainingMinor > 0 ? kes(c.remainingMinor) : S.paidAll}</Row>
++                <Row label={S.dueLabel}>{shortDate(c.dueDate)}</Row>
++                <Row label={S.payByLabel}>{shortDate(c.payByDate)}</Row>
++              </>
++            ) : <Row label={S.dueLabel}>{S.dueDayLine(s.dueDay)}</Row>}
++            <Row label={S.frequencyLabel}>{S.frequencies[s.frequency]}</Row>
++          </dl>
++          {c ? (
++            <div className="mt-3">
++              <div className="h-3 w-full rounded-full bg-gray-200 overflow-hidden" role="progressbar" aria-label={S.progressAria} aria-valuenow={c.pct} aria-valuemin={0} aria-valuemax={100}>
++                <div className="h-full bg-green-600 transition-all" style={{ width: `${c.pct}%` }} />
++              </div>
++              <p className="mt-1 text-xs text-gray-600">{S.progress(kes(c.creditedMinor), kes(c.rentMinor), c.pct)}</p>
++              <p className="mt-2 text-xs text-gray-600">{S.payByHelp}</p>
++            </div>
++          ) : <p className="mt-3 text-sm text-gray-600">{S.noCycle}</p>}
++        </Card>
++      )}
++
++      <Card>
++        <Title>{S.recipientTitle}</Title>
++        <dl className="mt-2 divide-y divide-gray-100">
++          <Row label={channelLabel(s.recipient.channel)}>{s.recipient.accountNumber}</Row>
++          <Row label={S.recipientNameLabel}>{s.recipient.resolvedNameMasked}</Row>
++        </dl>
++        {(s.recipient.status === 'needs_review' || s.recipient.nameMatch === 'mismatch') && <div className="mt-3"><Alert kind="info">{S.recipientReview}</Alert></div>}
++      </Card>
++
++      {pc && (
++        <Card>
++          <Title>{S.pendingTitle}</Title>
++          <p className="mt-1 text-sm text-gray-900">{pc.summary}</p>
++          <p className="mt-1 text-sm text-gray-700">{S.pendingStatus[pc.status] ?? pc.status}</p>
++          {pc.coolingOffUntil && pc.status === 'cooling_off' && <p className="mt-1 text-xs text-gray-600">{S.pendingCooling(when(pc.coolingOffUntil))}</p>}
++          {pc.applyAfter && (pc.status === 'cooling_off' || pc.status === 'deferred') && <p className="mt-1 text-xs text-gray-600">{S.pendingStarts(when(pc.applyAfter))}</p>}
++          {pc.status === 'awaiting_tenant_otp' && (
++            <CodeBox title={S.codeChangeTitle} kind="otp" placeholder={S.codePlaceholder} button={S.codeConfirm}
++              submit={async (code) => { const r = await lmmx('lmmx_tenant_confirmChange', { changeId: pc.changeId, otp: otpText(code) }); return r.applyAfter ? `${S.codeChangeDone} ${S.codeChangeStarts(when(r.applyAfter))}` : S.codeChangeDone; }} onDone={onChanged} />
++          )}
++          {actionable && (
++            <CodeBox title={S.codeCancelTitle} kind="cancel" placeholder={S.codeCancelPlaceholder} button={S.codeCancel} tone="danger"
++              submit={async (code) => { await lmmx('lmmx_tenant_cancelChange', { changeId: pc.changeId, cancelCode: cancelText(code) }); return S.codeCancelDone; }} onDone={onChanged} />
++          )}
++        </Card>
++      )}
++    </div>
++  );
++}
+diff --git a/src/lmmx/HistoryPanel.tsx b/src/lmmx/HistoryPanel.tsx
+new file mode 100644
+index 0000000..6bdb96f
+--- /dev/null
++++ b/src/lmmx/HistoryPanel.tsx
+@@ -0,0 +1,45 @@
++import { useCallback, useEffect, useState } from 'react';
++import { kes, type InstalmentView } from './contract';
++import { errorMessage, lmmx } from './api';
++import { ERROR_FALLBACK, ERROR_TEXT, S } from './strings';
++import { Alert, Btn, Card, Spinner, Title, when } from './ui';
++
++export default function HistoryPanel({ reloadKey }: { reloadKey: number }) {
++  const [items, setItems] = useState<InstalmentView[] | null>(null);
++  const [next, setNext] = useState<string | undefined>();
++  const [busy, setBusy] = useState(false);
++  const [err, setErr] = useState('');
++
++  const load = useCallback(async (cursor?: string) => {
++    setBusy(true); setErr('');
++    try {
++      const r = await lmmx('lmmx_tenant_history', cursor ? { cursor } : {});
++      setItems((prev) => (cursor && prev ? [...prev, ...r.items] : r.items));
++      setNext(r.nextCursor);
++    } catch (e) { setErr(errorMessage(e, ERROR_TEXT, ERROR_FALLBACK)); } finally { setBusy(false); }
++  }, []);
++  useEffect(() => { void load(); }, [load, reloadKey]);
++
++  return (
++    <Card>
++      <Title>{S.historyTitle}</Title>
++      {err && <div className="mt-3"><Alert kind="err">{err}</Alert></div>}
++      {!items && !err && <Spinner label={S.loading} />}
++      {items && items.length === 0 && <p className="mt-3 text-sm text-gray-600">{S.historyEmpty}</p>}
++      {items && items.length > 0 && (
++        <ul className="mt-2 divide-y divide-gray-100">
++          {items.map((i) => (
++            <li key={i.paymentId} className="py-3 flex justify-between gap-3">
++              <div>
++                <p className="font-semibold text-gray-900">{S.historyCredit(kes(i.creditMinor))}</p>
++                <p className="text-xs text-gray-600">{when(i.at)} · {S.historyFees(kes(i.feesMinor))} · {S.historyPaid(kes(i.chargeMinor))}</p>
++              </div>
++              <span className={`self-start text-xs font-semibold rounded-full px-2 py-1 ${i.status === 'success' ? 'bg-green-100 text-green-800' : i.status === 'failed' ? 'bg-red-100 text-red-800' : 'bg-gray-100 text-gray-700'}`}>{S.historyStatus[i.status] ?? i.status}</span>
++            </li>
++          ))}
++        </ul>
++      )}
++      {next && <div className="mt-3"><Btn tone="ghost" onClick={() => void load(next)} disabled={busy}>{busy ? S.loading : S.historyMore}</Btn></div>}
++    </Card>
++  );
++}
+diff --git a/src/lmmx/LmmxApp.tsx b/src/lmmx/LmmxApp.tsx
+new file mode 100644
+index 0000000..8ba479b
+--- /dev/null
++++ b/src/lmmx/LmmxApp.tsx
+@@ -0,0 +1,91 @@
++// The standalone Lipa Mdogo Mdogo app for a tenant: Home, Pay, History, Settings. Reached after `lmmx_tenant_link` (see LmmxGate).
++import { useCallback, useEffect, useState } from 'react';
++import { useNavigate } from 'react-router-dom';
++import { AuthService, auth } from '../Firebase';
++import type { TenantSummaryOut } from './contract';
++import { LmmxApiError, errorMessage, isMock, lmmx } from './api';
++import { SCENARIOS, setMockFail, setMockScenario, mockScenario } from './mock';
++import { recalledKinds } from './route';
++import Dashboard from './Dashboard';
++import HistoryPanel from './HistoryPanel';
++import PayPanel from './PayPanel';
++import SettingsPanel from './SettingsPanel';
++import { ERROR_TEXT, S } from './strings';
++import { Alert, Btn, Card, Spinner } from './ui';
++
++type Tab = 'home' | 'pay' | 'history' | 'settings';
++const TABS: Tab[] = ['home', 'pay', 'history', 'settings'];
++
++export default function LmmxApp({ demo = false }: { demo?: boolean }) {
++  const navigate = useNavigate();
++  const [s, setS] = useState<TenantSummaryOut | null>(null);
++  const [err, setErr] = useState('');
++  const [tab, setTab] = useState<Tab>('home');
++  const [tick, setTick] = useState(0);
++
++  const load = useCallback(async () => {
++    try { setS(await lmmx('lmmx_tenant_summary', {})); setErr(''); }
++    catch (e) {
++      // Not linked (or not a standalone tenant): back to the link step instead of a dead end.
++      if (!demo && e instanceof LmmxApiError && (e.lmmx === 'LMMX_E_NOT_FOUND' || e.lmmx === 'LMMX_E_NEEDS_REAUTH')) { navigate('/lmmx', { replace: true }); return; }
++      setErr(errorMessage(e, ERROR_TEXT, S.loadFailed));
++    }
++  }, [navigate, demo]);
++  useEffect(() => { void load(); }, [load]);
++  const changed = useCallback(() => { void load(); setTick((t) => t + 1); }, [load]);
++
++  const signOut = async () => { try { await AuthService.signOut(); } finally { navigate('/'); } };
++  const hasLegacy = recalledKinds().includes('legacy');
++  const defaultPhone = auth.currentUser?.phoneNumber ? `0${auth.currentUser.phoneNumber.replace(/^\+254/, '')}` : '';
++
++  return (
++    <main className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100 pb-10">
++      <header className="bg-white shadow-sm">
++        <div className="max-w-xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
++          <div><h1 className="text-lg font-bold text-gray-900">{S.brand}</h1><p className="text-xs text-gray-600">{S.tagline}</p></div>
++          {!demo && <Btn tone="ghost" onClick={signOut}>{S.signOut}</Btn>}
++        </div>
++        <nav className="max-w-xl mx-auto px-2 flex" aria-label={S.brand}>
++          {TABS.map((t) => (
++            <button key={t} type="button" onClick={() => setTab(t)} aria-current={tab === t ? 'page' : undefined}
++              className={`flex-1 min-h-11 px-2 py-2 text-sm font-semibold border-b-4 ${tab === t ? 'border-green-600 text-green-800' : 'border-transparent text-gray-600'}`}>{S.tabs[t]}</button>
++          ))}
++        </nav>
++      </header>
++
++      <div className="max-w-xl mx-auto px-4 mt-4 grid gap-4">
++        {isMock() && <Alert kind="info">{S.mockBanner}</Alert>}
++        {isMock() && <MockTools />}
++        {err && <Card><Alert kind="err">{err}</Alert><div className="mt-3"><Btn tone="ghost" onClick={() => void load()}>{S.retry}</Btn></div></Card>}
++        {!s && !err && <Card><Spinner label={S.loading} /></Card>}
++        {s && tab === 'home' && <Dashboard s={s} onChanged={changed} />}
++        {s && tab === 'pay' && <PayPanel s={s} defaultPhone={defaultPhone} onPaid={changed} />}
++        {s && tab === 'history' && <HistoryPanel reloadKey={tick} />}
++        {s && tab === 'settings' && <SettingsPanel s={s} onChanged={changed} />}
++        {s && <p className="text-center text-xs text-gray-600">{S.support(s.supportPhone)}</p>}
++        {!demo && hasLegacy && <button type="button" onClick={() => navigate('/tenant')} className="text-sm text-gray-700 underline min-h-11">{S.switchToInvoice}</button>}
++      </div>
++    </main>
++  );
++}
++
++/** Demo-only controls: pick a scenario or force the next call to fail with any error code. Only rendered with VITE_LMMX_MOCK=true. */
++function MockTools() {
++  const [sc, setSc] = useState(mockScenario());
++  const codes = Object.keys(ERROR_TEXT) as Parameters<typeof setMockFail>[0][];
++  return (
++    <details className="rounded-lg border border-gray-300 bg-white p-3 text-sm">
++      <summary className="font-semibold cursor-pointer">Demo tools</summary>
++      <label className="block mt-2">Scenario
++        <select className="mt-1 w-full border rounded p-2" value={sc} onChange={(e) => { const v = e.target.value as typeof sc; setSc(v); setMockScenario(v); location.reload(); }}>
++          {SCENARIOS.map((x) => <option key={x}>{x}</option>)}
++        </select>
++      </label>
++      <label className="block mt-2">Fail the next call with
++        <select className="mt-1 w-full border rounded p-2" defaultValue="" onChange={(e) => setMockFail((e.target.value || null) as Parameters<typeof setMockFail>[0])}>
++          <option value="">(none)</option>{codes.map((c) => <option key={c}>{c}</option>)}
++        </select>
++      </label>
++    </details>
++  );
++}
+diff --git a/src/lmmx/LmmxGate.tsx b/src/lmmx/LmmxGate.tsx
+new file mode 100644
+index 0000000..88686d3
+--- /dev/null
++++ b/src/lmmx/LmmxGate.tsx
+@@ -0,0 +1,106 @@
++// After a tenant signs in: find out which accounts match this phone + ID (`lmmx_tenant_link`) and send them to the right place.
++//   only Lipa Mdogo Mdogo -> /lmmx/app      only the Plot Yangu invoice -> /tenant (exactly as before)      both -> a chooser
++// A tenant who already has a rent-invoice profile is checked quietly with the ID on that profile; if anything goes wrong
++// they land on /tenant as they always did, so the existing sign-in cannot be broken by this step.
++import { useEffect, useRef, useState } from 'react';
++import { useNavigate } from 'react-router-dom';
++import { doc, getDoc } from 'firebase/firestore';
++import { db } from '../Firebase';
++import { useSession } from '../session/session';
++import { validIdNumber, type IdType } from './contract';
++import { LmmxApiError, lmmx } from './api';
++import { decideDestination, rememberKinds, type Kind } from './route';
++import { S } from './strings';
++import { Alert, Btn, Card, Field, Spinner, Title, inputClass } from './ui';
++
++export default function LmmxGate() {
++  const navigate = useNavigate();
++  const session = useSession();
++  const [stage, setStage] = useState<'checking' | 'form' | 'choose'>('checking');
++  const [idType, setIdType] = useState<IdType>('national_id');
++  const [idNumber, setIdNumber] = useState('');
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState('');
++  const started = useRef(false);
++
++  const go = (kinds: readonly Kind[], quiet: boolean) => {
++    rememberKinds(kinds);
++    const d = decideDestination(kinds);
++    if (d === 'lmm') navigate('/lmmx/app', { replace: true });
++    else if (d === 'legacy') navigate('/tenant', { replace: true });
++    else if (d === 'choose') setStage('choose');
++    else if (quiet) navigate('/tenant', { replace: true });
++    else { setError(S.linkFailed); setBusy(false); }
++  };
++
++  useEffect(() => {
++    if (started.current || !session.user) return;
++    started.current = true;
++    (async () => {
++      try {
++        const snap = await getDoc(doc(db, 'tenants', session.user!.uid));
++        if (!snap.exists()) { setStage('form'); return; }          // a new person: ask for the ID
++        const id = String(snap.data().idNumber ?? '').trim();
++        if (!validIdNumber('national_id', id)) { navigate('/tenant', { replace: true }); return; }
++        const out = await lmmx('lmmx_tenant_link', { idType: 'national_id', idNumber: id });
++        go(out.kinds, true);
++      } catch { navigate('/tenant', { replace: true }); }
++    })();
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [session.user]);
++
++  const submit = async () => {
++    const id = idNumber.trim();
++    if (!validIdNumber(idType, id)) { setError(S.idInvalid); return; }
++    setBusy(true); setError('');
++    try {
++      const out = await lmmx('lmmx_tenant_link', { idType, idNumber: id });
++      go(out.kinds, false);
++    } catch (e) {
++      // One generic failure for a wrong phone and a wrong ID: never say which one did not match.
++      setError(e instanceof LmmxApiError && e.lmmx === 'LMMX_E_RATE' ? S.linkRate : e instanceof LmmxApiError && e.network ? S.linkNetwork : S.linkFailed);
++      setBusy(false);
++    }
++  };
++
++  const shell = (children: React.ReactNode) => <main className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100 p-4 flex items-start sm:items-center justify-center"><div className="w-full max-w-md">{children}</div></main>;
++
++  if (stage === 'checking') return shell(<Card><Spinner label={S.checking} /></Card>);
++
++  if (stage === 'choose') {
++    return shell(
++      <Card>
++        <Title>{S.chooserTitle}</Title>
++        <div className="mt-4 grid gap-3">
++          <button type="button" onClick={() => navigate('/tenant', { replace: true })} className="text-left min-h-11 rounded-xl border-2 border-gray-200 p-4 hover:border-green-600 focus:outline-none focus:ring-2 focus:ring-green-600">
++            <span className="block font-bold text-gray-900">{S.chooserLegacyTitle}</span><span className="block text-sm text-gray-600">{S.chooserLegacyBody}</span>
++          </button>
++          <button type="button" onClick={() => navigate('/lmmx/app', { replace: true })} className="text-left min-h-11 rounded-xl border-2 border-gray-200 p-4 hover:border-green-600 focus:outline-none focus:ring-2 focus:ring-green-600">
++            <span className="block font-bold text-gray-900">{S.chooserLmmTitle}</span><span className="block text-sm text-gray-600">{S.chooserLmmBody}</span>
++          </button>
++        </div>
++      </Card>
++    );
++  }
++
++  return shell(
++    <Card>
++      <Title>{S.linkTitle}</Title>
++      <p className="mt-1 text-sm text-gray-600">{S.linkIntro}</p>
++      <div className="mt-4 grid gap-3">
++        <Field label={S.idTypeLabel}>
++          <select className={inputClass} value={idType} onChange={(e) => setIdType(e.target.value as IdType)} disabled={busy}>
++            {(Object.keys(S.idTypes) as IdType[]).map((t) => <option key={t} value={t}>{S.idTypes[t]}</option>)}
++          </select>
++        </Field>
++        <Field label={S.idNumberLabel} hint={S.idNumberHint(idType)}>
++          <input className={inputClass} value={idNumber} autoComplete="off" inputMode={idType === 'passport' ? 'text' : 'numeric'} maxLength={9} disabled={busy}
++            onChange={(e) => { setIdNumber(e.target.value); setError(''); }} onKeyDown={(e) => { if (e.key === 'Enter' && !busy) void submit(); }} />
++        </Field>
++        {error && <Alert kind="err">{error}</Alert>}
++        <Btn onClick={submit} disabled={busy || !idNumber.trim()}>{busy ? S.linking : S.linkButton}</Btn>
++        <button type="button" onClick={() => navigate('/tenant', { replace: true })} className="text-sm text-gray-600 underline min-h-11">{S.linkSkip}</button>
++      </div>
++    </Card>
++  );
++}
+diff --git a/src/lmmx/PayPanel.tsx b/src/lmmx/PayPanel.tsx
+new file mode 100644
+index 0000000..4ff0ab9
+--- /dev/null
++++ b/src/lmmx/PayPanel.tsx
+@@ -0,0 +1,157 @@
++// Pay tab: amount -> live server quote (rent / fees / you pay) -> M-PESA number -> STK prompt -> wait for the SERVER to show the
++// credit. The screen never says "received" until `lmmx_tenant_summary` shows the credit (or history shows the failure).
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { LMMX, kes, normalizeKePhone, quoteInstalment, type TenantQuoteOut, type TenantSummaryOut } from './contract';
++import { LmmxApiError, errorMessage, lmmx } from './api';
++import { ERROR_FALLBACK, ERROR_TEXT, S } from './strings';
++import { Alert, Btn, Card, Field, Spinner, Title, inputClass } from './ui';
++
++type Stage = 'form' | 'sending' | 'waiting' | 'success' | 'failed' | 'timeout';
++const POLL_MS = 4000;
++const GIVE_UP_MS = 120_000;
++const localPhone = (e164: string) => (e164.startsWith('+254') ? `0${e164.slice(4)}` : e164);
++
++export default function PayPanel({ s, defaultPhone, onPaid }: { s: TenantSummaryOut; defaultPhone: string; onPaid: () => void }) {
++  const remaining = s.cycle?.remainingMinor ?? 0;
++  const [amount, setAmount] = useState('');
++  const [phone, setPhone] = useState(defaultPhone);
++  const [quote, setQuote] = useState<TenantQuoteOut | null>(null);
++  const [quoting, setQuoting] = useState(false);
++  const [note, setNote] = useState<{ kind: 'err' | 'info'; text: string } | null>(null);
++  const [stage, setStage] = useState<Stage>('form');
++  const paid = useRef<{ baseline: number; credit: number; since: number; charge: number; phone: string } | null>(null);
++  const seq = useRef(0);
++
++  const n = amount === '' ? NaN : Number(amount);
++  const minor = n * 100;
++  const maxKes = LMMX.MAX_CREDIT_MINOR / 100;
++  const isLast = Number.isInteger(n) && minor === remaining;       // the last instalment may be smaller than the minimum
++  // The server decides what may be paid (LMMX_E_AMOUNT); here only the shape and the contract's limits are checked.
++  const valid = Number.isInteger(n) && n <= maxKes && (minor >= LMMX.MIN_CREDIT_MINOR || isLast) && minor > 0;
++  const phoneE164 = normalizeKePhone(phone);
++  const blocked = !!s.frozen || s.status !== 'active';
++
++  // Instant preview from the contract's fee engine, until the server's exact quote arrives.
++  const preview = useMemo(() => (valid ? quoteInstalment({ creditMinor: minor, rentMinor: s.rentMinor, channel: s.recipient.channel, remainingRentMinor: remaining || undefined }) : null), [valid, minor, s.rentMinor, s.recipient.channel, remaining]);
++
++  // Live quote, debounced; a newer keystroke makes an older answer harmless.
++  useEffect(() => {
++    setQuote(null);
++    if (!valid || blocked || stage !== 'form') return;
++    const mine = ++seq.current;
++    setQuoting(true);
++    const t = setTimeout(async () => {
++      try {
++        const q = await lmmx('lmmx_tenant_quote', { creditMinor: minor });
++        if (mine === seq.current) { setQuote(q); setNote(null); }
++      } catch (e) { if (mine === seq.current) setNote({ kind: 'err', text: errorMessage(e, ERROR_TEXT, S.quoteFailed) }); }
++      finally { if (mine === seq.current) setQuoting(false); }
++    }, 500);
++    return () => { clearTimeout(t); };
++  }, [valid, minor, blocked, stage]);
++
++  const lines = quote ?? preview;
++  const exact = !!quote;
++
++  const pay = async () => {
++    if (!valid || !phoneE164 || !quote) return;
++    if (quote.expiresAt <= Date.now()) {
++      try { setQuote(await lmmx('lmmx_tenant_quote', { creditMinor: minor })); setNote({ kind: 'info', text: S.quoteExpired }); }
++      catch (e) { setNote({ kind: 'err', text: errorMessage(e, ERROR_TEXT, S.quoteFailed) }); }
++      return;
++    }
++    setStage('sending'); setNote(null);
++    try {
++      await lmmx('lmmx_tenant_pay', { quoteId: quote.quoteId, payerPhone: phoneE164 });
++      paid.current = { baseline: s.cycle?.creditedMinor ?? 0, credit: quote.creditMinor, since: Date.now(), charge: quote.chargeMinor, phone: phoneE164 };
++      setStage('waiting');
++    } catch (e) {
++      setStage('form');
++      if (e instanceof LmmxApiError && e.lmmx === 'LMMX_E_QUOTE') {
++        try { setQuote(await lmmx('lmmx_tenant_quote', { creditMinor: minor })); } catch { /* the error below is enough */ }
++      }
++      setNote({ kind: 'err', text: errorMessage(e, ERROR_TEXT, ERROR_FALLBACK) });
++    }
++  };
++
++  // While waiting: ask the server (summary, and history for a decline) until it shows the outcome. No guessing.
++  const check = useCallback(async (): Promise<boolean> => {
++    const p = paid.current; if (!p) return true;
++    try {
++      const [sum, hist] = await Promise.all([lmmx('lmmx_tenant_summary', {}), lmmx('lmmx_tenant_history', {})]);
++      if ((sum.cycle?.creditedMinor ?? 0) >= p.baseline + p.credit) { setStage('success'); onPaid(); return true; }
++      if (hist.items.some((i) => i.status === 'failed' && i.at >= p.since - 5000 && i.chargeMinor === p.charge)) { setStage('failed'); return true; }
++    } catch { /* keep waiting; the next check tries again */ }
++    return false;
++  }, [onPaid]);
++
++  useEffect(() => {
++    if (stage !== 'waiting') return;
++    const p = paid.current;
++    const id = setInterval(async () => {
++      if (await check()) { clearInterval(id); return; }
++      if (p && Date.now() - p.since > GIVE_UP_MS) { clearInterval(id); setStage('timeout'); }
++    }, POLL_MS);
++    return () => clearInterval(id);
++  }, [stage, check]);
++
++  const reset = () => { paid.current = null; setAmount(''); setQuote(null); setNote(null); setStage('form'); };
++
++  if (stage === 'sending') return <Card><Spinner label={S.paying} /></Card>;
++
++  if (stage === 'waiting' || stage === 'timeout') {
++    const p = paid.current;
++    return (
++      <Card>
++        <Title>{stage === 'waiting' ? S.waitingTitle : S.timeoutTitle}</Title>
++        {stage === 'waiting' && p && <p className="mt-2 text-sm text-gray-800">{S.waitingBody(localPhone(p.phone), kes(p.charge))}</p>}
++        {stage === 'waiting' ? <div className="mt-3"><Spinner label={S.waitingNote} /></div> : <p className="mt-2 text-sm text-gray-800">{S.timeoutBody}</p>}
++        <div className="mt-4 flex flex-wrap gap-3">
++          <Btn tone="ghost" onClick={() => void check()}>{S.checkNow}</Btn>
++          {stage === 'waiting' && <Btn tone="ghost" onClick={() => setStage('failed')}>{S.didNotGetPrompt}</Btn>}
++          {stage === 'timeout' && <Btn tone="ghost" onClick={reset}>{S.done}</Btn>}
++        </div>
++      </Card>
++    );
++  }
++  if (stage === 'success') {
++    return <Card><Alert kind="ok"><strong>{S.successTitle}</strong><br />{S.successBody(kes(paid.current?.credit ?? 0))}</Alert><div className="mt-4"><Btn onClick={reset}>{S.done}</Btn></div></Card>;
++  }
++  if (stage === 'failed') {
++    return <Card><Alert kind="err"><strong>{S.failedTitle}</strong><br />{S.failedBody}</Alert><div className="mt-4"><Btn onClick={reset}>{S.payAgain}</Btn></div></Card>;
++  }
++
++  const quick = Array.from(new Set([s.suggestedCreditMinor, s.suggestedCreditMinor * 2, remaining])).filter((q) => q >= LMMX.MIN_CREDIT_MINOR && q <= remaining && q % 100 === 0).slice(0, 3);
++
++  return (
++    <Card>
++      <Title>{S.payTitle}</Title>
++      {blocked && <div className="mt-3"><Alert kind="warn">{s.frozen ? S.frozenBody(s.supportPhone) : ERROR_TEXT.LMMX_E_STATE}</Alert></div>}
++      <div className="mt-3 grid gap-3">
++        <Field label={S.amountLabel} hint={`${S.amountHint(kes(LMMX.MIN_CREDIT_MINOR), kes(LMMX.MAX_CREDIT_MINOR))} ${S.amountLastSmaller}`} error={amount !== '' && !valid ? S.amountInvalid : undefined}>
++          <input className={inputClass} inputMode="numeric" value={amount} placeholder={s.suggestedCreditMinor ? String(Math.ceil(s.suggestedCreditMinor / 100)) : '500'} disabled={blocked}
++            onChange={(e) => setAmount(e.target.value.replace(/\D/g, '').slice(0, 7))} />
++        </Field>
++        {quick.length > 0 && (
++          <div role="group" aria-label={S.quickLabel} className="flex flex-wrap gap-2">
++            {quick.map((q) => <Btn key={q} tone="ghost" disabled={blocked} onClick={() => setAmount(String(q / 100))}>{q === remaining && q !== s.suggestedCreditMinor ? `${S.quickFull} ${kes(q)}` : kes(q)}</Btn>)}
++          </div>
++        )}
++        <Field label={S.phoneLabel} hint={S.phoneHint} error={phone !== '' && !phoneE164 ? S.phoneInvalid : undefined}>
++          <input className={inputClass} inputMode="tel" autoComplete="tel" value={phone} placeholder="0712 345 678" disabled={blocked} onChange={(e) => setPhone(e.target.value)} />
++        </Field>
++
++        {lines && (
++          <dl className="rounded-lg bg-gray-50 p-3 text-sm" aria-live="polite">
++            <div className="flex justify-between py-1"><dt className="text-gray-600">{S.linesGoes}</dt><dd className="font-semibold">{kes(lines.creditMinor)}</dd></div>
++            <div className="flex justify-between py-1"><dt className="text-gray-600">{S.linesFees}</dt><dd className="font-semibold">{kes(lines.feesMinor)}</dd></div>
++            <div className="flex justify-between py-1 border-t border-gray-200 mt-1 pt-2"><dt className="font-semibold text-gray-900">{S.linesPay}</dt><dd className="font-bold text-gray-900">{kes(lines.chargeMinor)}</dd></div>
++            <p className="mt-1 text-xs text-gray-500">{exact ? '' : quoting ? S.quoting : S.estimate}</p>
++          </dl>
++        )}
++        {note && <Alert kind={note.kind}>{note.text}</Alert>}
++        <Btn onClick={pay} disabled={blocked || !valid || !phoneE164 || !quote || quoting}>{quote ? S.payButton(kes(quote.chargeMinor)) : S.payButton(valid ? kes(minor) : '')}</Btn>
++      </div>
++    </Card>
++  );
++}
+diff --git a/src/lmmx/SettingsPanel.tsx b/src/lmmx/SettingsPanel.tsx
+new file mode 100644
+index 0000000..929741a
+--- /dev/null
++++ b/src/lmmx/SettingsPanel.tsx
+@@ -0,0 +1,74 @@
++// Settings tab: change the due day (next cycle, with the lock rules explained) and how often / how much the tenant plans to pay.
++import { useState } from 'react';
++import { LMMX, isValidCredit, shortDate, type Frequency, type TenantSummaryOut } from './contract';
++import { LmmxApiError, errorMessage, lmmx } from './api';
++import { ERROR_FALLBACK, ERROR_TEXT, S } from './strings';
++import { Alert, Btn, Card, Field, Title, inputClass } from './ui';
++
++export default function SettingsPanel({ s, onChanged }: { s: TenantSummaryOut; onChanged: () => void }) {
++  const [day, setDay] = useState(String(s.dueDay));
++  const [dayBusy, setDayBusy] = useState(false);
++  const [dayNote, setDayNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
++  const [freq, setFreq] = useState<Frequency>(s.frequency);
++  const [sugg, setSugg] = useState(String(s.suggestedCreditMinor / 100));
++  const [planBusy, setPlanBusy] = useState(false);
++  const [planNote, setPlanNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
++  const frozen = !!s.frozen || s.status !== 'active';
++
++  const saveDay = async () => {
++    const d = Number(day);
++    if (!Number.isInteger(d) || d < LMMX.DUE_DAY_MIN || d > LMMX.DUE_DAY_MAX) { setDayNote({ kind: 'err', text: S.dueDayLabel }); return; }
++    setDayBusy(true); setDayNote(null);
++    try {
++      const r = await lmmx('lmmx_tenant_setDueDay', { dueDay: d });
++      setDayNote({ kind: 'ok', text: S.dueDaySaved(shortDate(r.effectiveFromCycleDate)) }); onChanged();
++    } catch (e) {
++      // LMMX_E_STATE = already changed this cycle, or inside the lock window before the due date
++      setDayNote({ kind: 'err', text: e instanceof LmmxApiError && e.lmmx === 'LMMX_E_STATE' ? S.dueDayState : errorMessage(e, ERROR_TEXT, ERROR_FALLBACK) });
++    } finally { setDayBusy(false); }
++  };
++
++  const savePlan = async () => {
++    const n = sugg.trim() === '' ? undefined : Number(sugg);
++    const minor = n === undefined ? undefined : n * 100;
++    if (minor !== undefined && !isValidCredit(minor)) { setPlanNote({ kind: 'err', text: S.amountInvalid }); return; }
++    setPlanBusy(true); setPlanNote(null);
++    try { await lmmx('lmmx_tenant_setPlan', minor === undefined ? { frequency: freq } : { frequency: freq, suggestedCreditMinor: minor }); setPlanNote({ kind: 'ok', text: S.planSaved }); onChanged(); }
++    catch (e) { setPlanNote({ kind: 'err', text: errorMessage(e, ERROR_TEXT, ERROR_FALLBACK) }); } finally { setPlanBusy(false); }
++  };
++
++  return (
++    <div className="grid gap-4">
++      <Card>
++        <Title>{S.dueDayTitle}</Title>
++        <p className="mt-1 text-sm text-gray-600">{S.dueDayHelp}</p>
++        <div className="mt-3 flex gap-2 items-end">
++          <div className="flex-1"><Field label={S.dueDayLabel}>
++            <select className={inputClass} value={day} onChange={(e) => setDay(e.target.value)} disabled={dayBusy || frozen}>
++              {Array.from({ length: LMMX.DUE_DAY_MAX }, (_, i) => i + 1).map((d) => <option key={d} value={d}>{d}</option>)}
++            </select>
++          </Field></div>
++          <Btn onClick={saveDay} disabled={dayBusy || frozen || Number(day) === s.dueDay}>{dayBusy ? S.linking : S.dueDaySave}</Btn>
++        </div>
++        {dayNote && <div className="mt-3"><Alert kind={dayNote.kind}>{dayNote.text}</Alert></div>}
++      </Card>
++
++      <Card>
++        <Title>{S.planTitle}</Title>
++        <p className="mt-1 text-sm text-gray-600">{S.planHelp}</p>
++        <div className="mt-3 grid gap-3">
++          <Field label={S.frequencyLabel}>
++            <select className={inputClass} value={freq} onChange={(e) => setFreq(e.target.value as Frequency)} disabled={planBusy || frozen}>
++              {(Object.keys(S.frequencies) as Frequency[]).map((f) => <option key={f} value={f}>{S.frequencies[f]}</option>)}
++            </select>
++          </Field>
++          <Field label={S.suggestedLabel}>
++            <input className={inputClass} inputMode="numeric" value={sugg} onChange={(e) => setSugg(e.target.value.replace(/\D/g, ''))} disabled={planBusy || frozen} />
++          </Field>
++          <Btn onClick={savePlan} disabled={planBusy || frozen}>{planBusy ? S.linking : S.planSave}</Btn>
++          {planNote && <Alert kind={planNote.kind}>{planNote.text}</Alert>}
++        </div>
++      </Card>
++    </div>
++  );
++}
+diff --git a/src/lmmx/api.ts b/src/lmmx/api.ts
+new file mode 100644
+index 0000000..e44fa3f
+--- /dev/null
++++ b/src/lmmx/api.ts
+@@ -0,0 +1,45 @@
++// Typed wrapper over the lmmx_tenant_* callables (contract section 4). With VITE_LMMX_MOCK=true every op is answered from
++// mock.ts, so the whole app can be tried without CORE. Errors carry PAY's `details.lmmx` code as `.lmmx`.
++import { httpsCallable } from 'firebase/functions';
++import { functions } from '../Firebase';
++import type { LmmxCallableMap, LmmxErrorCode } from './contract';
++import { mockCall } from './mock';
++
++export type TenantOp = Extract<keyof LmmxCallableMap, `lmmx_tenant_${string}`>;
++export const isMock = (): boolean => import.meta.env.VITE_LMMX_MOCK === 'true';
++
++export class LmmxApiError extends Error {
++  lmmx?: LmmxErrorCode;
++  /** Optional extras PAY may add to `details` (not in the contract): tries left on a wrong code. */
++  attemptsLeft?: number;
++  /** True when no answer came back at all (offline, timeout), as opposed to PAY refusing. */
++  network: boolean;
++  constructor(message: string, lmmx?: LmmxErrorCode, attemptsLeft?: number, network = false) {
++    super(message);
++    this.name = 'LmmxApiError';
++    this.lmmx = lmmx;
++    this.attemptsLeft = attemptsLeft;
++    this.network = network;
++  }
++}
++
++export async function lmmx<K extends TenantOp>(op: K, data: LmmxCallableMap[K]['in']): Promise<LmmxCallableMap[K]['out']> {
++  if (isMock()) return (await mockCall(op, data as Record<string, unknown>)) as LmmxCallableMap[K]['out'];
++  try {
++    const res = await httpsCallable<LmmxCallableMap[K]['in'], LmmxCallableMap[K]['out']>(functions, op)(data);
++    return res.data;
++  } catch (e) {
++    const err = e as { code?: string; message?: string; details?: { lmmx?: LmmxErrorCode; attemptsLeft?: number } };
++    const network = !err.details?.lmmx && (err.code === 'functions/unavailable' || err.code === 'functions/deadline-exceeded' || !err.code);
++    throw new LmmxApiError(err.message || 'Request failed', err.details?.lmmx, err.details?.attemptsLeft, network);
++  }
++}
++
++/** The text a tenant should read for any failure. */
++export function errorMessage(e: unknown, table: Partial<Record<LmmxErrorCode, string>>, fallback: string): string {
++  if (e instanceof LmmxApiError) {
++    if (e.lmmx && table[e.lmmx]) return table[e.lmmx] as string;
++    if (e.network) return 'We could not reach the server. Check your internet and try again.';
++  }
++  return fallback;
++}
+diff --git a/src/lmmx/contract.ts b/src/lmmx/contract.ts
+new file mode 100644
+index 0000000..1cbf8b4
+--- /dev/null
++++ b/src/lmmx/contract.ts
+@@ -0,0 +1,453 @@
++/**
++ * LMMX CONTRACT v1  (Lipa Mdogo Mdogo, standalone tenants)  -  single source of truth
++ *
++ * SELF-CONTAINED: no imports. Types, plain constants and small PURE helpers only. It is copied VERBATIM (byte-identical) to:
++ *   PAY   functions/src/lmmx/contract.ts      <- canonical copy, owned by CORE
++ *   PAY   src/lmmx/contract.ts                (tenant web UI)
++ *   DESK  src/desk/api/lmmxContract.ts        (desk web UI)
++ *   DESK  functions/src/types/lmmx.contract.ts (WhatsApp bot)
++ * Nobody edits their copy. A change goes to CORE as a Contract Change Request (see LMM_CONTRACT.md section 15).
++ *
++ * All money is integer MINOR units (KES x 100). Instalment credits are WHOLE SHILLINGS (multiples of 100). Timestamps are epoch ms.
++ * Dates are Africa/Nairobi calendar days "YYYY-MM-DD". User-facing brand: "Lipa Mdogo Mdogo". Internal names keep "lmm"/"lmmx".
++ */
++
++export const LMMX_CONTRACT_VERSION = 1;
++export const LMMX_REGION = "africa-south1";           // every lmmx_* callable
++export const LMMX_BRAND = "Lipa Mdogo Mdogo";
++export const LMMX_TOP_DESK = "COG-0000";
++export const LMMX_BOT_PHONE_E164 = "+254101716473";   // WhatsApp bot 0101716473
++export const LMMX_BOT_LINK = "https://wa.me/254101716473";
++export const LMMX_LANDLORD_URL = "https://plot.samuhia.co.ke/";
++export const LMMX_PAYMENT_REF_PREFIX = "LMX_";         // Paystack charge references (legacy LMM uses "LMM_")
++export const LMMX_TRANSFER_REF_PREFIX = "lmx-";        // Paystack transfer references (legacy LMM uses "lmm-")
++
++// ------------------------------------------------------------------------------------------------------------- money rules
++export const LMMX = {
++  MIN_CREDIT_MINOR: 1_000,              // KES 10 per instalment
++  MAX_CREDIT_MINOR: 15_000_000,         // KES 150,000 per instalment
++  RENT_MIN_MINOR: 100_000,              // KES 1,000
++  RENT_MAX_MINOR: 15_000_000,           // KES 150,000 (Paystack's M-PESA wallet limit per transfer)
++  /** Paystack's card/M-PESA collection fee. Transfers are NOT part of it. */
++  COLLECTION_BPS: 150,
++  /** What a transfer really costs us: Paystack's listed cost x 1.2 (assumed excise), rounded up to a shilling, plus KES 5. Confirm on a real Paystack statement. */
++  TRANSFER_UPLIFT_BPS: 12_000,
++  TRANSFER_BUFFER_MINOR: 500,
++  /** Service fee, by instalment credit (minor units): bps of the credit. Larger instalments are cheaper. */
++  SERVICE_BANDS: [
++    { fromMinor: 1_000, bps: 600 },     // KES 10 - 99
++    { fromMinor: 10_000, bps: 400 },    // KES 100 - 499
++    { fromMinor: 50_000, bps: 300 },    // KES 500 - 1,999
++    { fromMinor: 200_000, bps: 200 },   // KES 2,000 - 4,999
++    { fromMinor: 500_000, bps: 150 },   // KES 5,000 and above
++  ] as const,
++  /** The desk keeps this share of the service fee, paid at once through the Paystack flat split. The platform keeps the rest. */
++  DESK_SHARE_BPS: 6_000,
++  /** KES 25 to the desk when a tenant's cycle is fully credited by its due date (needs at least 2 instalments). Paid as a top-desk payable. */
++  COMPLETION_BONUS_MINOR: 2_500,
++  DUE_DAY_DEFAULT: 5, DUE_DAY_MIN: 1, DUE_DAY_MAX: 28,
++  DUE_DAY_CHANGES_PER_CYCLE: 1, DUE_DAY_LOCK_DAYS_BEFORE_DUE: 5,
++  /** The first cycle's due date is the next dueDay that is at least this many days away. */
++  FIRST_DUE_MIN_DAYS: 7,
++  WARN_DAYS_BEFORE_DUE: 5,
++  // security
++  OTP_PREFIX: "LMM", OTP_DIGITS: 4, OTP_TTL_MS: 30 * 60_000, OTP_MAX_ATTEMPTS: 5, OTP_SETUP_TOTAL_ATTEMPTS_MAX: 10,
++  OTP_LOCK_MS: 3_600_000, OTP_RESEND_MAX_PER_HOUR: 3,
++  CANCEL_PREFIX: "LMC",
++  SETUP_EXPIRY_MS: 72 * 3_600_000,
++  CHANGE_COOLING_OFF_MS: 48 * 3_600_000,
++  CHANGE_DEFER_DAYS_BEFORE_DUE: 3,
++  FIRST_PAYOUT_MIN_RECIPIENT_AGE_MS: 48 * 3_600_000,
++  LANDLORD_NOTICE_MIN_BEFORE_PAYOUT_MS: 24 * 3_600_000,
++  DESK_NEW_TENANTS_PER_DAY: 15,
++  DESK_RECIPIENT_CHECKS_PER_DAY: 20,
++  RECIPIENT_TENANTS_BEFORE_REVIEW: 3,
++  SMS_MAX_CHARS: 280,
++} as const;
++
++// ------------------------------------------------------------------------------------------------------------- enums
++export type Channel = "phone" | "till" | "bank";          // M-PESA phone, M-PESA till, bank (paybill is NOT supported)
++export const CHANNELS: readonly Channel[] = ["phone", "till", "bank"];
++/** Paystack transfer-recipient type for each channel (identical to PAY's existing lmm/recipient.ts). */
++export const PAYSTACK_TYPE: Record<Channel, "mobile_money" | "mobile_money_business" | "kepss"> = { phone: "mobile_money", till: "mobile_money_business", bank: "kepss" };
++export const PAYSTACK_BANK_CODE: Partial<Record<Channel, string>> = { phone: "MPESA", till: "MPTILL" };
++export type IdType = "national_id" | "alien_id" | "passport";
++export type Frequency = "daily" | "weekly" | "biweekly";
++export const FREQUENCIES: readonly Frequency[] = ["daily", "weekly", "biweekly"];
++export type TenantStatus = "draft" | "awaiting_confirmation" | "active" | "paused" | "frozen" | "closed" | "migrated";
++export type CycleStatus = "open" | "funded" | "partial_settled" | "settled" | "closed" | "refunded";
++export type RecipientStatus = "pending" | "verified" | "needs_review" | "frozen" | "retired";
++export type NameMatch = "matched" | "mismatch" | "unavailable";
++export type ChangeKind = "recipient" | "rent";
++export type ChangeStatus = "awaiting_tenant_otp" | "cooling_off" | "deferred" | "applied" | "cancelled" | "expired" | "rejected";
++export type LeadStage = "new" | "to_contact" | "contacted" | "interested" | "follow_up" | "not_interested" | "closed_won" | "closed_lost";
++export const LEAD_STAGES: readonly LeadStage[] = ["new", "to_contact", "contacted", "interested", "follow_up", "not_interested", "closed_won", "closed_lost"];
++export type AuditAction =
++  | "tenant_created" | "setup_otp_sent" | "setup_otp_failed" | "setup_confirmed" | "setup_expired" | "recipient_checked" | "recipient_created" | "recipient_reused"
++  | "recipient_review_decided" | "change_requested" | "change_otp_failed" | "change_confirmed" | "change_cancelled" | "change_applied" | "tenant_link" | "due_day_changed"
++  | "plan_changed" | "payment_credited" | "payment_rejected" | "settlement_started" | "settlement_paid" | "settlement_failed" | "refund" | "freeze" | "unfreeze"
++  | "reassign" | "reveal" | "top_update" | "landlord_matched" | "tamper_detected" | "rate_limited" | "signature_failed" | "audit_verified" | "lead_updated" | "bonus_accrued";
++
++export type LmmxErrorCode =
++  | "LMMX_E_AUTH" | "LMMX_E_FORBIDDEN" | "LMMX_E_SIG" | "LMMX_E_RATE" | "LMMX_E_VALIDATION" | "LMMX_E_DUPLICATE" | "LMMX_E_NOT_FOUND" | "LMMX_E_OTP_INVALID"
++  | "LMMX_E_OTP_LOCKED" | "LMMX_E_OTP_EXPIRED" | "LMMX_E_REVIEW_REQUIRED" | "LMMX_E_FROZEN" | "LMMX_E_DISABLED" | "LMMX_E_AMOUNT" | "LMMX_E_QUOTE" | "LMMX_E_STATE"
++  | "LMMX_E_TAMPER" | "LMMX_E_RECIPIENT_BLOCKED" | "LMMX_E_NEEDS_REAUTH" | "LMMX_E_DESK_NOT_READY" | "LMMX_E_INTERNAL";
++/** CORE throws Firebase HttpsError(code, message, { lmmx: LmmxErrorCode }). `details.lmmx` is what UIs switch on; `message` is safe to show. */
++
++// ------------------------------------------------------------------------------------------------------------- pure helpers
++/** "07.. / 01.. / 7.. / 1.. / 254.. / +254.." -> "+2547XXXXXXXX" or "+2541XXXXXXXX"; null when it is not a Kenyan mobile. */
++export function normalizeKePhone(raw: unknown): string | null {
++  const d = String(raw ?? "").replace(/[^\d+]/g, "").replace(/^\+/, "");
++  let n: string;
++  if (/^254[17]\d{8}$/.test(d)) n = d;
++  else if (/^0[17]\d{8}$/.test(d)) n = "254" + d.slice(1);
++  else if (/^[17]\d{8}$/.test(d)) n = "254" + d;
++  else return null;
++  return "+" + n;
++}
++export const maskPhone = (e164: string): string => (e164.length >= 6 ? `${e164.slice(0, 4)}*****${e164.slice(-3)}` : "***");
++export const maskId = (id: string): string => (id.length <= 4 ? "****" : `${id.slice(0, 2)}${"*".repeat(Math.max(2, id.length - 4))}${id.slice(-2)}`);
++export const maskName = (full: string): string => {
++  const p = full.trim().split(/\s+/).filter(Boolean);
++  return p.length === 0 ? "" : p.length === 1 ? p[0] : `${p[0]} ${p[p.length - 1].charAt(0).toUpperCase()}.`;
++};
++export const last3 = (acct: string): string => String(acct).replace(/\s+/g, "").slice(-3);
++export const channelLabel = (c: Channel): string => (c === "phone" ? "M-PESA" : c === "till" ? "TILL" : "BANK");
++export const kes = (minor: number): string => {
++  const v = minor / 100;
++  return `KES ${Number.isInteger(v) ? v.toLocaleString("en-KE") : v.toLocaleString("en-KE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
++};
++
++/** Valid ID number shapes (the server also validates): national / alien ID 6-9 digits, passport 6-9 letters or digits. */
++export function validIdNumber(type: IdType, v: string): boolean {
++  const s = v.trim();
++  return type === "passport" ? /^[A-Za-z0-9]{6,9}$/.test(s) : /^\d{6,9}$/.test(s);
++}
++
++// ---- OTP text. The SMS, the bot and the desk UI all use exactly this shape: "LMM4683" (setup / change) and "LMC7391" (cancel a change).
++export const otpText = (code4: string): string => `${LMMX.OTP_PREFIX}${code4}`;
++export const cancelText = (code4: string): string => `${LMMX.CANCEL_PREFIX}${code4}`;
++/** Recognises a message that is only an LMMX code (case and spaces forgiven). Anything else returns null. */
++export function parseLmmxCode(text: unknown): { kind: "otp" | "cancel"; code: string } | null {
++  const m = /^\s*(LMM|LMC)\s?-?(\d{4})\s*$/i.exec(String(text ?? ""));
++  return m ? { kind: m[1].toUpperCase() === "LMM" ? "otp" : "cancel", code: m[2] } : null;
++}
++export const botConfirmLink = (code4: string): string => `${LMMX_BOT_LINK}?text=${otpText(code4)}`;
++
++// ---- dates (Africa/Nairobi, no DST)
++const EAT = 3 * 3_600_000, DAY = 86_400_000;
++export const eatDate = (now: number): string => new Date(now + EAT).toISOString().slice(0, 10);
++export const clampDueDay = (d: number): number => Math.min(LMMX.DUE_DAY_MAX, Math.max(LMMX.DUE_DAY_MIN, Math.trunc(d)));
++const pad = (n: number) => String(n).padStart(2, "0");
++const dayDiff = (a: string, b: string) => Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / DAY);
++/** Next date with this day-of-month that is at least `minDays` after `todayIso`. */
++export function nextDueDate(todayIso: string, dueDay: number, minDays = 0): string {
++  let y = Number(todayIso.slice(0, 4)), m = Number(todayIso.slice(5, 7));
++  for (let i = 0; i < 14; i++) {
++    const iso = `${y}-${pad(m)}-${pad(clampDueDay(dueDay))}`;
++    if (dayDiff(iso, todayIso) >= minDays) return iso;
++    m += 1; if (m > 12) { m = 1; y += 1; }
++  }
++  throw new RangeError("no due date found");
++}
++export const firstDueDate = (todayIso: string, dueDay: number): string => nextDueDate(todayIso, dueDay, LMMX.FIRST_DUE_MIN_DAYS);
++export const daysUntil = (iso: string, todayIso: string): number => dayDiff(iso, todayIso);
++export const shortDate = (iso: string): string => {
++  const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
++  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
++  return m ? `${Number(m[3])} ${MON[Number(m[2]) - 1]}` : iso;
++};
++
++// ---- the fee engine (CORE recomputes every number; UIs use these for previews and MUST show what CORE returns on a real quote)
++/** What Paystack lists for one transfer, by channel and amount sent (identical to PAY lmm/config.ts PAYSTACK_TRANSFER_COST). */
++export const PAYSTACK_TRANSFER_COST: Record<Channel, readonly { upToMinor: number; costMinor: number }[]> = {
++  phone: [{ upToMinor: 150_000, costMinor: 2_000 }, { upToMinor: 2_000_000, costMinor: 4_000 }, { upToMinor: 15_000_000, costMinor: 6_000 }],
++  till: [{ upToMinor: 150_000, costMinor: 4_000 }, { upToMinor: 1_000_000, costMinor: 8_000 }, { upToMinor: 4_000_000, costMinor: 14_000 }, { upToMinor: 99_900_000, costMinor: 18_000 }],
++  bank: [{ upToMinor: 1_000_000, costMinor: 8_000 }, { upToMinor: 5_000_000, costMinor: 12_000 }, { upToMinor: 99_999_900, costMinor: 14_000 }],
++};
++const ceilDiv = (a: number, b: number): number => Math.ceil(a / b);
++const wholeShilling = (minor: number): number => Math.ceil(minor / 100) * 100;
++export function transferCostMinor(amountMinor: number, channel: Channel): number {
++  const t = PAYSTACK_TRANSFER_COST[channel].find((x) => amountMinor <= x.upToMinor);
++  if (!t) throw new RangeError("amount is above the transfer limit");
++  return t.costMinor;
++}
++/** F: what one payout of `amountMinor` must reserve from the tenant (cost x 1.2, whole shilling, + KES 5). */
++export const transferReserveMinor = (amountMinor: number, channel: Channel): number =>
++  wholeShilling(ceilDiv(transferCostMinor(amountMinor, channel) * LMMX.TRANSFER_UPLIFT_BPS, 10_000)) + LMMX.TRANSFER_BUFFER_MINOR;
++export function serviceBps(creditMinor: number): number {
++  let bps: number = LMMX.SERVICE_BANDS[0].bps;
++  for (const b of LMMX.SERVICE_BANDS) if (creditMinor >= b.fromMinor) bps = b.bps;
++  return bps;
++}
++export function isValidCredit(creditMinor: unknown): creditMinor is number {
++  return typeof creditMinor === "number" && Number.isSafeInteger(creditMinor) && creditMinor % 100 === 0 && creditMinor >= LMMX.MIN_CREDIT_MINOR && creditMinor <= LMMX.MAX_CREDIT_MINOR;
++}
++export interface QuoteInput {
++  creditMinor: number;                 // x: what reaches the rent
++  rentMinor: number;                   // R: the cycle's rent (for a top-up leg: the remaining rent that leg will pay out)
++  channel: Channel;
++  reserveCollectedMinor?: number;      // transfer reserve already collected for this payout leg (default 0)
++  remainingRentMinor?: number;         // rent still owed before this instalment (default = rentMinor); equals creditMinor on the last instalment
++}
++export interface Quote {
++  creditMinor: number; transferReserveMinor: number; serviceFeeMinor: number; collectionAllowanceMinor: number;
++  chargeMinor: number;                 // g: what the tenant pays (whole shilling)
++  feesMinor: number;                   // g - x
++  deskShareMinor: number; platformShareMinor: number;
++}
++/**
++ * T = ceil(x*F/R), but the last instalment of a payout leg takes whatever is left of F, so the leg's total is exactly F and the landlord is paid EXACTLY the credits.
++ * S = ceil(x*bps/10000).  g = whole shilling of ceil((x+T+S) / (1 - 1.5%)).  Desk = floor(S*60%).
++ */
++export function quoteInstalment(i: QuoteInput): Quote {
++  if (!Number.isSafeInteger(i.rentMinor) || i.rentMinor <= 0) throw new RangeError("rent must be a positive integer");
++  const remaining = i.remainingRentMinor ?? i.rentMinor;
++  const last = i.creditMinor >= remaining;
++  // The FINAL instalment of a leg may be below the KES 10 minimum (whole shillings, at least KES 1) so a tenant is never stuck with a crumb.
++  const okCredit = isValidCredit(i.creditMinor) || (last && Number.isSafeInteger(i.creditMinor) && i.creditMinor % 100 === 0 && i.creditMinor >= 100 && i.creditMinor <= LMMX.MAX_CREDIT_MINOR);
++  if (!okCredit) throw new RangeError("credit must be whole shillings between the minimum and maximum instalment");
++  const F = transferReserveMinor(i.rentMinor, i.channel);
++  const collected = i.reserveCollectedMinor ?? 0;
++  const T = last ? Math.max(0, F - collected) : Math.min(ceilDiv(i.creditMinor * F, i.rentMinor), Math.max(0, F - collected));
++  const S = ceilDiv(i.creditMinor * serviceBps(i.creditMinor), 10_000);
++  const raw = ceilDiv((i.creditMinor + T + S) * 10_000, 10_000 - LMMX.COLLECTION_BPS);
++  const g = wholeShilling(raw);
++  const desk = Math.floor((S * LMMX.DESK_SHARE_BPS) / 10_000);
++  return { creditMinor: i.creditMinor, transferReserveMinor: T, serviceFeeMinor: S, collectionAllowanceMinor: g - i.creditMinor - T - S, chargeMinor: g, feesMinor: g - i.creditMinor, deskShareMinor: desk, platformShareMinor: S - desk };
++}
++/** The invariant CORE checks on every payment: after Paystack's collection fee, the charge still covers credit + reserve + service. */
++export const quoteCoversCosts = (q: Quote): boolean => q.chargeMinor - ceilDiv(q.chargeMinor * LMMX.COLLECTION_BPS, 10_000) >= q.creditMinor + q.transferReserveMinor + q.serviceFeeMinor;
++
++export interface EarningsRow { creditMinor: number; chargeMinor: number; feesMinor: number; feePct: number; deskShareMinor: number }
++/** What a desk earns per instalment size, for the earnings table on the tenant screen. */
++export function earningsTable(rentMinor: number, channel: Channel, sizes: readonly number[] = [10_000, 50_000, 100_000, 250_000, 500_000]): EarningsRow[] {
++  return sizes.filter((x) => x <= rentMinor).concat(rentMinor).filter((v, i, a) => a.indexOf(v) === i).map((x) => {
++    const q = quoteInstalment({ creditMinor: x, rentMinor, channel });
++    return { creditMinor: x, chargeMinor: q.chargeMinor, feesMinor: q.feesMinor, feePct: Math.round((q.feesMinor * 10_000) / x) / 100, deskShareMinor: q.deskShareMinor };
++  });
++}
++/** Whole-cycle projection if the tenant pays in equal instalments of `creditMinor` (last one takes the remainder). Includes the completion bonus when there are 2+ instalments. */
++export function cycleProjection(rentMinor: number, channel: Channel, creditMinor: number): { instalments: number; tenantPaysMinor: number; feesMinor: number; deskMinor: number; deskBonusMinor: number } {
++  let left = rentMinor, collected = 0, paid = 0, desk = 0, n = 0;
++  while (left > 0) {
++    let x = Math.min(creditMinor, left);
++    if (left - x > 0 && left - x < LMMX.MIN_CREDIT_MINOR) x = left;   // never leave a crumb below the minimum: fold it into this instalment
++    const q = quoteInstalment({ creditMinor: x, rentMinor, channel, reserveCollectedMinor: collected, remainingRentMinor: left });
++    collected += q.transferReserveMinor; paid += q.chargeMinor; desk += q.deskShareMinor; left -= x; n += 1;
++  }
++  return { instalments: n, tenantPaysMinor: paid, feesMinor: paid - rentMinor, deskMinor: desk, deskBonusMinor: n >= 2 ? LMMX.COMPLETION_BONUS_MINOR : 0 };
++}
++
++// ------------------------------------------------------------------------------------------------------------- SMS texts (GSM-7 only, 280 max)
++const GSM = /[^\x20-\x7E]/g;
++export const fitSms = (t: string): string => { const c = t.replace(GSM, "").replace(/\s+/g, " ").trim(); return c.length <= LMMX.SMS_MAX_CHARS ? c : c.slice(0, LMMX.SMS_MAX_CHARS).trimEnd(); };
++/** User-supplied words placed in an SMS: letters, digits, space and a few safe marks only; no links; cut to `max`. */
++export const smsSafe = (s: string, max = 24): string => s.replace(/https?:\/\/\S+|www\.\S+/gi, "").replace(/[^A-Za-z0-9 .,'&-]/g, "").replace(/\s+/g, " ").trim().slice(0, max);
++export const lmmxText = {
++  /** M1 to the TENANT when a desk creates the setup. Carries the OTP and the one-tap WhatsApp link. */
++  setup: (p: { rentMinor: number; landlordName: string; channel: Channel; acct: string; dueDay: number; deskCode: string; code4: string }) =>
++    fitSms(`${LMMX_BRAND}: pay rent ${kes(p.rentMinor)} to ${smsSafe(p.landlordName)} (${channelLabel(p.channel)} ...${last3(p.acct)}) by day ${p.dueDay} monthly. Desk ${p.deskCode}. Code ${otpText(p.code4)} valid 30 min. Tap to confirm: ${botConfirmLink(p.code4)} or give the code to your desk.`),
++  /** M2 to the TENANT when setup completes. */
++  active: (p: { rentMinor: number; dueDay: number; supportPhone: string }) =>
++    fitSms(`${LMMX_BRAND} is ready. Rent ${kes(p.rentMinor)}, due day ${p.dueDay}. Pay any amount from KES 10 anytime; your landlord gets the full rent on the due date. Pay or check: ${LMMX_BOT_LINK} Help: ${p.supportPhone}`),
++  /** M3 to the LANDLORD when setup completes. */
++  landlord: (p: { tenantFirstName: string; rentMinor: number; dueDay: number; supportPhone: string }) =>
++    fitSms(`Samuhia: ${smsSafe(p.tenantFirstName, 16)} will pay you ${kes(p.rentMinor)} rent monthly via ${LMMX_BRAND}, in small amounts, sent in full on day ${p.dueDay}. Not right? Call ${p.supportPhone}. Collect rent free: ${LMMX_LANDLORD_URL}`),
++  /** M4 to the TENANT for a change that needs their OTP. */
++  change: (p: { deskCode: string; summary: string; code4: string }) =>
++    fitSms(`${LMMX_BRAND}: desk ${p.deskCode} asks to change ${smsSafe(p.summary, 80)}. Code ${otpText(p.code4)} valid 30 min. Share it only if you agree. Confirm: ${botConfirmLink(p.code4)}`),
++  /** M5 to the TENANT after they confirm a change that waits out the cooling-off. */
++  changeConfirmed: (p: { applyDate: string; cancel4: string }) =>
++    fitSms(`${LMMX_BRAND}: change confirmed, it starts ${shortDate(p.applyDate)}. To cancel before then send ${cancelText(p.cancel4)} to ${LMMX_BOT_LINK} or tell the PAY app.`),
++  /** M6 to the OLD and the NEW landlord contact on a payout-account change. */
++  landlordChange: (p: { tenantFirstName: string; applyDate: string; supportPhone: string; kind: "old" | "new"; rentMinor: number; dueDay: number }) =>
++    p.kind === "old"
++      ? fitSms(`Samuhia: rent from ${smsSafe(p.tenantFirstName, 16)} will go to a different account from ${shortDate(p.applyDate)}. Not right? Call ${p.supportPhone}.`)
++      : fitSms(`Samuhia: ${smsSafe(p.tenantFirstName, 16)} will pay you ${kes(p.rentMinor)} rent monthly from ${shortDate(p.applyDate)} via ${LMMX_BRAND}, sent in full on day ${p.dueDay}. Not right? Call ${p.supportPhone}. ${LMMX_LANDLORD_URL}`),
++};
++
++// ------------------------------------------------------------------------------------------------------------- shared shapes
++export interface RecipientInput {
++  channel: Channel; bankCode?: string;            // bankCode only for channel "bank" (from the existing listKenyaBanks callable)
++  accountNumber: string; accountName: string;     // the name the landlord is registered under
++  contactName: string; contactPhone: string;      // landlord or agency contact; gets the landlord SMS
++  reuseToken?: string;                            // from lmmx_desk_checkRecipient; only when the tenant confirmed it is the same landlord
++}
++export interface TenantProfileInput {
++  fullName: string; phone: string; idType: IdType; idNumber: string;
++  email?: string; unitNumber?: string; propertyName?: string;
++}
++export interface MoneyView { minor: number }
++export interface PendingChangeView { changeId: string; kind: ChangeKind; status: ChangeStatus; summary: string; coolingOffUntil?: number; applyAfter?: number; initiatedBy: "desk" | "top" | "tenant" }
++export interface CycleView {
++  cycleId: string; status: CycleStatus; dueDate: string; payByDate: string; rentMinor: number; creditedMinor: number; remainingMinor: number; settledMinor: number; pct: number;
++}
++export interface InstalmentView { paymentId: string; at: number; creditMinor: number; chargeMinor: number; feesMinor: number; deskShareMinor?: number; status: "success" | "failed" | "refunded" }
++export interface RecipientView { channel: Channel; accountNumber: string; resolvedNameMasked: string; nameMatch: NameMatch; status: RecipientStatus }
++export interface DeskTenantRow {
++  tenantId: string; nameMasked: string; phoneMasked: string; status: TenantStatus; rentMinor: number; dueDay: number; deskCode: string;
++  creditedMinor: number; remainingMinor: number; createdAt: number; awaitingSince?: number;
++}
++
++// ------------------------------------------------------------------------------------------------------------- DESK callables (Firebase Auth = desk agent; CORE reads desk_agents/{uid})
++export interface DeskCheckRecipientIn { channel: Channel; bankCode?: string; accountNumber: string; enteredName: string }
++/** Only the account number and booleans. Never another recipient's name, contact, tenants, desks or counts. */
++export interface DeskCheckRecipientOut { exists: boolean; accountNumber: string; nameMatchesEntered: boolean; reusable: boolean; reuseToken?: string }
++export interface DeskCreateTenantIn { profile: TenantProfileInput; rentMinor: number; dueDay?: number; frequency?: Frequency; recipient: RecipientInput; idempotencyKey: string }
++export interface DeskCreateTenantOut { tenantId: string; status: "awaiting_confirmation" | "draft"; nameMatch: NameMatch; needsReview: boolean; expiresAt: number; resolvedNameMasked: string }
++export interface DeskSetupStatusIn { tenantId: string }
++/** What the desk screen shows: "Waiting for verification" (awaiting, with a countdown) or an OTP box; active when done. */
++export interface DeskSetupStatusOut { tenantId: string; status: TenantStatus; otpExpiresAt?: number; attemptsLeft?: number; locked?: boolean; resendsLeft?: number; needsReview?: boolean }
++export interface DeskConfirmSetupIn { tenantId: string; otp: string }          // otp: "LMM4683" or "4683"
++export interface DeskConfirmSetupOut { tenantId: string; status: "active" }
++export interface DeskResendOtpIn { tenantId: string }
++export interface DeskResendOtpOut { otpExpiresAt: number; resendsLeft: number }
++export interface DeskListTenantsIn { q?: string; status?: TenantStatus; cursor?: string; limit?: number }   // top desk sees every desk's tenants; a desk only its own
++export interface DeskListTenantsOut { tenants: DeskTenantRow[]; nextCursor?: string }
++export interface DeskGetTenantIn { tenantId: string }
++export interface DeskGetTenantOut {
++  tenantId: string; status: TenantStatus; deskCode: string; nameMasked: string; phoneMasked: string; idMasked: string; unitNumber?: string; propertyName?: string;
++  rentMinor: number; dueDay: number; frequency: Frequency; recipient: RecipientView; cycle?: CycleView; recent: InstalmentView[];
++  earningsTable: EarningsRow[]; projection: { frequency: Frequency; instalments: number; tenantPaysMinor: number; deskMinor: number; deskBonusMinor: number };
++  pendingChange?: PendingChangeView; frozen?: boolean; createdAt: number;
++}
++export interface DeskRequestChangeIn { tenantId: string; kind: ChangeKind; rentMinor?: number; recipient?: RecipientInput; idempotencyKey: string }
++export interface DeskRequestChangeOut { changeId: string; status: ChangeStatus; requiresTenantOtp: boolean; coolingOffUntil?: number; applyAfter?: number; otpExpiresAt?: number }
++export interface DeskConfirmChangeIn { changeId: string; otp: string }
++export interface DeskConfirmChangeOut { changeId: string; status: ChangeStatus; applyAfter?: number }
++export interface DeskCancelChangeIn { changeId: string }
++export interface DeskCancelChangeOut { ok: boolean }
++export interface DeskEarningsIn { from: number; to: number }
++export interface DeskEarningsOut { instalments: number; deskShareMinor: number; completionBonusMinor: number; landlordBonusMinor: number; byTenant: { tenantId: string; nameMasked: string; deskShareMinor: number }[] }
++export interface DeskPreviewIn { rentMinor: number; channel: Channel; creditMinor?: number }
++export interface DeskPreviewOut { table: EarningsRow[]; projection: Record<Frequency, { instalments: number; tenantPaysMinor: number; deskMinor: number; deskBonusMinor: number }> }
++export interface PipelineRow { leadIdMasked: string; landlordLabel: string; tenants: number; monthlyRentMinor: number; stage: LeadStage; onPms: boolean; conversionNote: string }
++export interface DeskPipelineIn { cursor?: string }
++export interface DeskPipelineOut { landlords: PipelineRow[]; nextCursor?: string }
++
++// ------------------------------------------------------------------------------------------------------------- TOP DESK callables (COG-0000 only: verified @samuhia.co.ke, sign-in within 15 minutes, a written reason on every change)
++export interface TopReviewRow { recipientId: string; channel: Channel; accountNumber: string; reason: "name_mismatch" | "shared_recipient" | "other"; tenants: number; desks: number; createdAt: number }
++export interface TopReviewQueueOut { items: TopReviewRow[] }
++export interface TopReviewDecisionIn { recipientId: string; decision: "approve" | "reject"; reason: string }
++export interface TopFreezeIn { scope: "tenant" | "recipient" | "desk"; id: string; reason: string }
++export interface TopUnfreezeIn { scope: "tenant" | "recipient" | "desk"; id: string; reason: string }
++export interface TopReassignIn { tenantId: string; toDeskCode: string; reason: string }
++export interface TopRevealIn { tenantId: string; fields: ("phone" | "id" | "landlordContact" | "landlordName")[]; reason: string }
++export interface TopRevealOut { values: Partial<Record<"phone" | "id" | "landlordContact" | "landlordName", string>> }
++/** A change started by COG-0000 applies at once: no tenant OTP, no cooling-off. The tenant and both landlord contacts are told by SMS. */
++export interface TopUpdateTenantIn { tenantId: string; rentMinor?: number; recipient?: RecipientInput; dueDay?: number; reason: string }
++export interface AuditRow { seq: number; ts: number; action: AuditAction; actor: { type: "desk" | "top" | "tenant" | "system" | "bot"; deskCode?: string }; tenantId?: string; summary: string; hash: string }
++export interface TopAuditListIn { tenantId?: string; action?: AuditAction; deskCode?: string; from?: number; to?: number; cursor?: number; limit?: number }
++export interface TopAuditListOut { rows: AuditRow[]; nextCursor?: number }
++export interface TopAuditVerifyIn { fromSeq?: number; toSeq?: number }
++export interface TopAuditVerifyOut { ok: boolean; checked: number; brokenAtSeq?: number }
++export interface LeadRow { leadId: string; landlordLabel: string; tenants: number; monthlyRentMinor: number; deskCodes: string[]; stage: LeadStage; nextFollowUpAt?: number; onPms: boolean; updatedAt: number }
++export interface TopLeadsListIn { stage?: LeadStage; q?: string; cursor?: string; limit?: number }
++export interface TopLeadsListOut { leads: LeadRow[]; nextCursor?: string }
++export interface TopLeadGetIn { leadId: string }
++export interface TopLeadGetOut extends LeadRow { contactName: string; contactPhone: string; notes: { ts: number; by: string; text: string }[] }
++export interface TopLeadUpdateIn { leadId: string; stage?: LeadStage; note?: string; nextFollowUpAt?: number | null }
++export interface TopStatsOut { tenants: Record<TenantStatus, number>; creditedThisMonthMinor: number; settledThisMonthMinor: number; payoutsPaused: boolean; standaloneEnabled: boolean; openAlerts: number; reviewQueue: number }
++
++// ------------------------------------------------------------------------------------------------------------- TENANT callables (Firebase Auth = the tenant, phone-verified via sendLoginOtp/verifyLoginOtp)
++export interface TenantLinkIn { idType: IdType; idNumber: string }
++/** Same generic failure whether the phone or the ID was wrong. `kinds` says which accounts matched the verified phone AND the ID. */
++export interface TenantLinkOut { kinds: ("lmm" | "legacy")[] }
++export interface TenantSummaryOut {
++  status: TenantStatus; firstName: string; rentMinor: number; dueDay: number; frequency: Frequency; cycle?: CycleView; recipient: RecipientView;
++  suggestedCreditMinor: number; pendingChange?: PendingChangeView; awaitingSetup?: { otpExpiresAt: number; summary: string }; frozen?: boolean; supportPhone: string;
++}
++export interface TenantHistoryIn { cursor?: string }
++export interface TenantHistoryOut { items: InstalmentView[]; nextCursor?: string }
++export interface TenantQuoteIn { creditMinor: number }
++export interface TenantQuoteOut { quoteId: string; expiresAt: number; creditMinor: number; transferReserveMinor: number; serviceFeeMinor: number; collectionAllowanceMinor: number; chargeMinor: number; feesMinor: number; payByDate: string; remainingAfterMinor: number }
++export interface TenantPayIn { quoteId: string; payerPhone: string }
++export interface TenantPayOut { reference: string; displayText: string; chargeMinor: number }
++export interface TenantSetDueDayIn { dueDay: number }
++export interface TenantSetDueDayOut { dueDay: number; effectiveFromCycleDate: string }
++export interface TenantSetPlanIn { frequency: Frequency; suggestedCreditMinor?: number }
++export interface TenantConfirmSetupIn { otp: string }
++export interface TenantConfirmChangeIn { changeId: string; otp: string }
++export interface TenantCancelChangeIn { changeId: string; cancelCode: string }
++
++// ------------------------------------------------------------------------------------------------------------- BOT callables (the WhatsApp bot in DESK/functions)
++/** Every bot call carries { ..., ts, nonce, sig }: sig = hex HMAC-SHA256(key LMMX_BOT_KEY from app-secrets-bundle, `${op}|${ts}|${nonce}|${canonicalJson(payload without sig)}`), ts within 5 minutes. canonicalJson = JSON with keys sorted. */
++export interface BotAuth { ts: number; nonce: string; sig: string }
++/** JSON with object keys sorted at every level, no spaces. Both sides must produce the identical string. */
++export function canonicalJson(v: unknown): string {
++  if (v === null || typeof v !== "object") return JSON.stringify(v === undefined ? null : v);
++  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
++  const o = v as Record<string, unknown>;
++  return "{" + Object.keys(o).filter((k) => o[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(o[k])).join(",") + "}";
++}
++/** The exact string the bot signs: `${op}|${ts}|${nonce}|${canonicalJson(payload without ts, nonce, sig)}`. sig = lowercase hex HMAC-SHA256 of it with LMMX_BOT_KEY. */
++export function botSigMessage(op: string, ts: number, nonce: string, payload: Record<string, unknown>): string {
++  const { ts: _t, nonce: _n, sig: _s, ...rest } = payload as Record<string, unknown>;
++  void _t; void _n; void _s;
++  return `${op}|${ts}|${nonce}|${canonicalJson(rest)}`;
++}
++export const BOT_SIG_MAX_AGE_MS = 5 * 60_000;
++export type BotKind = "standalone" | "legacy" | "none";
++export interface BotLookupIn extends BotAuth { phone: string; idNumber: string }   // phone = the WhatsApp sender in E.164
++/** `none` and a phone/ID mismatch return the identical shape (no enumeration). */
++export interface BotLookupOut { kind: BotKind; standalone?: { firstName: string; rentMinor: number; remainingMinor: number; dueDate: string; payByDate: string; suggestedCreditMinor: number; frozen?: boolean; awaitingSetup?: boolean } }
++export interface BotQuoteIn extends BotAuth { phone: string; idNumber: string; creditMinor: number }
++export interface BotQuoteOut extends TenantQuoteOut {}
++export interface BotPayIn extends BotAuth { phone: string; idNumber: string; quoteId: string; payerPhone: string }
++export interface BotPayOut extends TenantPayOut {}
++/** A message that is only LMM#### or LMC#### is sent here, from ANY bot state. The sender's WhatsApp number must equal the tenant's phone on file. */
++export interface BotConfirmCodeIn extends BotAuth { phone: string; text: string }
++export interface BotConfirmCodeOut { result: "setup_confirmed" | "change_confirmed" | "change_cancelled" | "invalid" | "expired" | "locked" | "not_found"; summary?: string }
++export interface BotJoinInfoIn extends BotAuth { _?: never }
++export interface BotJoinInfoOut { supportPhones: string[]; text: string }
++
++// ------------------------------------------------------------------------------------------------------------- callable map
++export interface LmmxCallableMap {
++  lmmx_desk_checkRecipient: { in: DeskCheckRecipientIn; out: DeskCheckRecipientOut };
++  lmmx_desk_createTenant: { in: DeskCreateTenantIn; out: DeskCreateTenantOut };
++  lmmx_desk_setupStatus: { in: DeskSetupStatusIn; out: DeskSetupStatusOut };
++  lmmx_desk_confirmSetup: { in: DeskConfirmSetupIn; out: DeskConfirmSetupOut };
++  lmmx_desk_resendOtp: { in: DeskResendOtpIn; out: DeskResendOtpOut };
++  lmmx_desk_listTenants: { in: DeskListTenantsIn; out: DeskListTenantsOut };
++  lmmx_desk_getTenant: { in: DeskGetTenantIn; out: DeskGetTenantOut };
++  lmmx_desk_requestChange: { in: DeskRequestChangeIn; out: DeskRequestChangeOut };
++  lmmx_desk_confirmChange: { in: DeskConfirmChangeIn; out: DeskConfirmChangeOut };
++  lmmx_desk_cancelChange: { in: DeskCancelChangeIn; out: DeskCancelChangeOut };
++  lmmx_desk_earnings: { in: DeskEarningsIn; out: DeskEarningsOut };
++  lmmx_desk_preview: { in: DeskPreviewIn; out: DeskPreviewOut };
++  lmmx_desk_pipeline: { in: DeskPipelineIn; out: DeskPipelineOut };
++  lmmx_top_reviewQueue: { in: Record<string, never>; out: TopReviewQueueOut };
++  lmmx_top_reviewDecision: { in: TopReviewDecisionIn; out: { ok: boolean } };
++  lmmx_top_freeze: { in: TopFreezeIn; out: { ok: boolean } };
++  lmmx_top_unfreeze: { in: TopUnfreezeIn; out: { ok: boolean } };
++  lmmx_top_reassign: { in: TopReassignIn; out: { ok: boolean } };
++  lmmx_top_reveal: { in: TopRevealIn; out: TopRevealOut };
++  lmmx_top_updateTenant: { in: TopUpdateTenantIn; out: { ok: boolean } };
++  lmmx_top_auditList: { in: TopAuditListIn; out: TopAuditListOut };
++  lmmx_top_auditVerify: { in: TopAuditVerifyIn; out: TopAuditVerifyOut };
++  lmmx_top_leadsList: { in: TopLeadsListIn; out: TopLeadsListOut };
++  lmmx_top_leadGet: { in: TopLeadGetIn; out: TopLeadGetOut };
++  lmmx_top_leadUpdate: { in: TopLeadUpdateIn; out: { ok: boolean } };
++  lmmx_top_stats: { in: Record<string, never>; out: TopStatsOut };
++  lmmx_tenant_link: { in: TenantLinkIn; out: TenantLinkOut };
++  lmmx_tenant_summary: { in: Record<string, never>; out: TenantSummaryOut };
++  lmmx_tenant_history: { in: TenantHistoryIn; out: TenantHistoryOut };
++  lmmx_tenant_quote: { in: TenantQuoteIn; out: TenantQuoteOut };
++  lmmx_tenant_pay: { in: TenantPayIn; out: TenantPayOut };
++  lmmx_tenant_setDueDay: { in: TenantSetDueDayIn; out: TenantSetDueDayOut };
++  lmmx_tenant_setPlan: { in: TenantSetPlanIn; out: { ok: boolean } };
++  lmmx_tenant_confirmSetup: { in: TenantConfirmSetupIn; out: { status: "active" } };
++  lmmx_tenant_confirmChange: { in: TenantConfirmChangeIn; out: DeskConfirmChangeOut };
++  lmmx_tenant_cancelChange: { in: TenantCancelChangeIn; out: { ok: boolean } };
++  lmmx_bot_lookup: { in: BotLookupIn; out: BotLookupOut };
++  lmmx_bot_quote: { in: BotQuoteIn; out: BotQuoteOut };
++  lmmx_bot_pay: { in: BotPayIn; out: BotPayOut };
++  lmmx_bot_confirmCode: { in: BotConfirmCodeIn; out: BotConfirmCodeOut };
++  lmmx_bot_joinInfo: { in: BotJoinInfoIn; out: BotJoinInfoOut };
++}
++export type LmmxCallableName = keyof LmmxCallableMap;
++export const LMMX_DESK_CALLABLES = ["lmmx_desk_checkRecipient", "lmmx_desk_createTenant", "lmmx_desk_setupStatus", "lmmx_desk_confirmSetup", "lmmx_desk_resendOtp", "lmmx_desk_listTenants", "lmmx_desk_getTenant", "lmmx_desk_requestChange", "lmmx_desk_confirmChange", "lmmx_desk_cancelChange", "lmmx_desk_earnings", "lmmx_desk_preview", "lmmx_desk_pipeline"] as const;
++export const LMMX_TOP_CALLABLES = ["lmmx_top_reviewQueue", "lmmx_top_reviewDecision", "lmmx_top_freeze", "lmmx_top_unfreeze", "lmmx_top_reassign", "lmmx_top_reveal", "lmmx_top_updateTenant", "lmmx_top_auditList", "lmmx_top_auditVerify", "lmmx_top_leadsList", "lmmx_top_leadGet", "lmmx_top_leadUpdate", "lmmx_top_stats"] as const;
++export const LMMX_TENANT_CALLABLES = ["lmmx_tenant_link", "lmmx_tenant_summary", "lmmx_tenant_history", "lmmx_tenant_quote", "lmmx_tenant_pay", "lmmx_tenant_setDueDay", "lmmx_tenant_setPlan", "lmmx_tenant_confirmSetup", "lmmx_tenant_confirmChange", "lmmx_tenant_cancelChange"] as const;
++export const LMMX_BOT_CALLABLES = ["lmmx_bot_lookup", "lmmx_bot_quote", "lmmx_bot_pay", "lmmx_bot_confirmCode", "lmmx_bot_joinInfo"] as const;
+diff --git a/src/lmmx/mock.ts b/src/lmmx/mock.ts
+new file mode 100644
+index 0000000..d6c17c6
+--- /dev/null
++++ b/src/lmmx/mock.ts
+@@ -0,0 +1,158 @@
++// Realistic fixtures for every lmmx_tenant_* op (VITE_LMMX_MOCK=true). State lives in memory (and the chosen scenario in
++// sessionStorage), so an awaiting tenant really becomes active after the right code, and a payment really shows up after a
++// few seconds. Nothing here talks to a server.
++import {
++  LMMX, kes, parseLmmxCode, quoteInstalment, nextDueDate, eatDate,
++  type LmmxCallableMap, type LmmxErrorCode, type PendingChangeView, type InstalmentView, type TenantSummaryOut,
++} from './contract';
++
++export type Scenario = 'active' | 'awaiting' | 'frozen' | 'cooling' | 'deferred' | 'pending_otp' | 'paid_up';
++export const SCENARIOS: readonly Scenario[] = ['active', 'awaiting', 'frozen', 'cooling', 'deferred', 'pending_otp', 'paid_up'];
++const KEY = 'lmmx.mock.scenario';
++const FAIL = 'lmmx.mock.fail';
++
++export const mockScenario = (): Scenario => {
++  try { const v = sessionStorage.getItem(KEY) as Scenario | null; return v && SCENARIOS.includes(v) ? v : 'active'; } catch { return 'active'; }
++};
++export function setMockScenario(s: Scenario): void { try { sessionStorage.setItem(KEY, s); } catch { /* storage unavailable */ } reset(); }
++/** Make the NEXT call of any op fail with this code (null clears it). Lets every error state be seen. */
++export function setMockFail(code: LmmxErrorCode | null): void { try { if (code) sessionStorage.setItem(FAIL, code); else sessionStorage.removeItem(FAIL); } catch { /* storage unavailable */ } }
++
++class MockError extends Error {
++  details: { lmmx: LmmxErrorCode; attemptsLeft?: number };
++  code = 'functions/failed-precondition';
++  constructor(lmmx: LmmxErrorCode, message: string, attemptsLeft?: number) { super(message); this.details = { lmmx, attemptsLeft }; }
++}
++
++const RENT = 1_000_000;
++interface Store { status: TenantSummaryOut['status']; credited: number; dueDay: number; frequency: 'daily' | 'weekly' | 'biweekly'; suggested: number; pending?: PendingChangeView; history: InstalmentView[]; wrong: number; dueChanged: boolean; pendingPay: { at: number; credit: number; charge: number; fail: boolean } | null }
++let st: Store;
++function reset(): void {
++  const s = mockScenario();
++  const now = Date.now();
++  st = {
++    status: s === 'awaiting' ? 'awaiting_confirmation' : s === 'frozen' ? 'frozen' : 'active',
++    credited: s === 'paid_up' ? RENT : s === 'awaiting' ? 0 : 250_000,
++    dueDay: 5, frequency: 'weekly', suggested: 250_000, wrong: 0, dueChanged: false, pendingPay: null,
++    pending:
++      s === 'cooling' ? { changeId: 'chg1', kind: 'recipient', status: 'cooling_off', summary: 'Payout account changed to M-PESA ...473', coolingOffUntil: now + 30 * 3_600_000, applyAfter: now + 30 * 3_600_000, initiatedBy: 'desk' }
++      : s === 'deferred' ? { changeId: 'chg2', kind: 'rent', status: 'deferred', summary: 'Rent changed to KES 12,000', applyAfter: now + 9 * 86_400_000, initiatedBy: 'desk' }
++      : s === 'pending_otp' ? { changeId: 'chg3', kind: 'recipient', status: 'awaiting_tenant_otp', summary: 'Payout account changed to TILL ...902', initiatedBy: 'desk' }
++      : undefined,
++    history: s === 'awaiting' ? [] : [
++      { paymentId: 'p3', at: now - 2 * 86_400_000, creditMinor: 150_000, chargeMinor: 157_000, feesMinor: 7_000, status: 'success' },
++      { paymentId: 'p2', at: now - 5 * 86_400_000, creditMinor: 100_000, chargeMinor: 105_000, feesMinor: 5_000, status: 'success' },
++      { paymentId: 'p1', at: now - 6 * 86_400_000, creditMinor: 50_000, chargeMinor: 53_500, feesMinor: 3_500, status: 'failed' },
++    ],
++  };
++}
++reset();
++
++const delay = (ms = 350) => new Promise((r) => setTimeout(r, ms));
++const today = () => eatDate(Date.now());
++
++function summary(): TenantSummaryOut {
++  const due = nextDueDate(today(), st.dueDay, 1);
++  const payBy = nextDueDate(today(), st.dueDay, 1).replace(/-(\d\d)$/, (_m, d) => `-${String(Math.max(1, Number(d) - 3)).padStart(2, '0')}`);
++  const remaining = Math.max(0, RENT - st.credited);
++  return {
++    status: st.status, firstName: 'Mary', rentMinor: RENT, dueDay: st.dueDay, frequency: st.frequency, suggestedCreditMinor: st.suggested,
++    cycle: st.status === 'awaiting_confirmation' ? undefined : { cycleId: 'c1', status: remaining === 0 ? 'funded' : 'open', dueDate: due, payByDate: payBy, rentMinor: RENT, creditedMinor: st.credited, remainingMinor: remaining, settledMinor: 0, pct: Math.min(100, Math.floor((st.credited / RENT) * 100)) },
++    recipient: { channel: 'till', accountNumber: '5123902', resolvedNameMasked: 'J*** M****', nameMatch: 'matched', status: 'verified' },
++    pendingChange: st.pending,
++    awaitingSetup: st.status === 'awaiting_confirmation' ? { otpExpiresAt: Date.now() + 25 * 60_000, summary: `Pay rent ${kes(RENT)} to J*** M**** (TILL ...902) by day ${st.dueDay} monthly.` } : undefined,
++    frozen: st.status === 'frozen' ? true : undefined,
++    supportPhone: '0791286165',
++  };
++}
++
++function settlePendingPay(): void {
++  const p = st.pendingPay;
++  if (!p || Date.now() - p.at < 6_000) return;
++  st.history = [{ paymentId: `p${Date.now()}`, at: p.at, creditMinor: p.credit, chargeMinor: p.charge, feesMinor: p.charge - p.credit, status: p.fail ? 'failed' : 'success' }, ...st.history];
++  if (!p.fail) st.credited = Math.min(RENT, st.credited + p.credit);
++  st.pendingPay = null;
++}
++
++function checkCode(raw: unknown, kind: 'otp' | 'cancel'): void {
++  const p = parseLmmxCode(raw) ?? (/^\s*\d{4}\s*$/.test(String(raw)) ? { kind, code: String(raw).trim() } : null);
++  if (!p || p.kind !== kind) throw new MockError('LMMX_E_VALIDATION', 'bad code shape');
++  if (p.code === '0000') throw new MockError('LMMX_E_OTP_EXPIRED', 'code expired');
++  if (p.code === '9999') throw new MockError('LMMX_E_OTP_LOCKED', 'locked');
++  if (p.code !== '4683' && p.code !== '7391') {
++    st.wrong += 1;
++    if (st.wrong >= LMMX.OTP_MAX_ATTEMPTS) throw new MockError('LMMX_E_OTP_LOCKED', 'locked');
++    throw new MockError('LMMX_E_OTP_INVALID', 'wrong code', LMMX.OTP_MAX_ATTEMPTS - st.wrong);
++  }
++  st.wrong = 0;
++}
++
++export async function mockCall(op: keyof LmmxCallableMap, d: Record<string, unknown>): Promise<unknown> {
++  await delay();
++  try { const f = sessionStorage.getItem(FAIL) as LmmxErrorCode | null; if (f) { sessionStorage.removeItem(FAIL); throw new MockError(f, 'forced mock error'); } } catch (e) { if (e instanceof MockError) throw e; }
++  settlePendingPay();
++  switch (op) {
++    case 'lmmx_tenant_link': {
++      const id = String(d.idNumber);
++      if (id === '11111111') return { kinds: ['lmm'] };
++      if (id === '22222222') return { kinds: ['legacy'] };
++      if (id === '33333333') return { kinds: ['lmm', 'legacy'] };
++      if (id === '99999999') throw new MockError('LMMX_E_RATE', 'rate');
++      throw new MockError('LMMX_E_NOT_FOUND', 'no match'); // same failure for a wrong phone and a wrong ID
++    }
++    case 'lmmx_tenant_summary': return summary();
++    case 'lmmx_tenant_history': {
++      const page = d.cursor === 'more';
++      return page ? { items: [{ paymentId: 'p0', at: Date.now() - 20 * 86_400_000, creditMinor: 200_000, chargeMinor: 209_000, feesMinor: 9_000, status: 'success' }] } : { items: st.history, nextCursor: st.history.length >= 3 ? 'more' : undefined };
++    }
++    case 'lmmx_tenant_quote': {
++      const credit = Number(d.creditMinor);
++      const remaining = Math.max(0, RENT - st.credited);
++      if (st.status === 'frozen') throw new MockError('LMMX_E_FROZEN', 'frozen');
++      if (st.status !== 'active') throw new MockError('LMMX_E_STATE', 'not active');
++      if (!Number.isInteger(credit) || credit % 100 !== 0 || credit > remaining || (credit < LMMX.MIN_CREDIT_MINOR && credit !== remaining)) throw new MockError('LMMX_E_AMOUNT', 'amount');
++      const q = quoteInstalment({ creditMinor: credit, rentMinor: RENT, channel: 'till', remainingRentMinor: remaining });
++      return { quoteId: `mq-${credit}-${Date.now()}`, expiresAt: Date.now() + 10 * 60_000, creditMinor: q.creditMinor, transferReserveMinor: q.transferReserveMinor, serviceFeeMinor: q.serviceFeeMinor, collectionAllowanceMinor: q.collectionAllowanceMinor, chargeMinor: q.chargeMinor, feesMinor: q.feesMinor, payByDate: summary().cycle?.payByDate ?? today(), remainingAfterMinor: remaining - credit };
++    }
++    case 'lmmx_tenant_pay': {
++      const m = /^mq-(\d+)-/.exec(String(d.quoteId));
++      if (!m) throw new MockError('LMMX_E_QUOTE', 'quote');
++      const credit = Number(m[1]);
++      const q = quoteInstalment({ creditMinor: credit, rentMinor: RENT, channel: 'till', remainingRentMinor: Math.max(0, RENT - st.credited) });
++      // paying from 0700000000 fails after the prompt (declined), anything else succeeds a few seconds later
++      st.pendingPay = { at: Date.now(), credit, charge: q.chargeMinor, fail: String(d.payerPhone).endsWith('700000000') };
++      return { reference: 'LMX_MOCK_1', displayText: 'Check your phone for the M-PESA prompt', chargeMinor: q.chargeMinor };
++    }
++    case 'lmmx_tenant_setDueDay': {
++      const day = Number(d.dueDay);
++      if (!Number.isInteger(day) || day < LMMX.DUE_DAY_MIN || day > LMMX.DUE_DAY_MAX) throw new MockError('LMMX_E_VALIDATION', 'day');
++      if (st.dueChanged) throw new MockError('LMMX_E_STATE', 'already changed this cycle');
++      st.dueChanged = true;
++      return { dueDay: day, effectiveFromCycleDate: nextDueDate(today(), day, 30) };
++    }
++    case 'lmmx_tenant_setPlan': {
++      st.frequency = d.frequency as Store['frequency'];
++      if (typeof d.suggestedCreditMinor === 'number') st.suggested = d.suggestedCreditMinor;
++      return { ok: true };
++    }
++    case 'lmmx_tenant_confirmSetup': {
++      if (st.status !== 'awaiting_confirmation') throw new MockError('LMMX_E_STATE', 'not awaiting');
++      checkCode(d.otp, 'otp');
++      st.status = 'active';
++      return { status: 'active' };
++    }
++    case 'lmmx_tenant_confirmChange': {
++      if (!st.pending || st.pending.changeId !== d.changeId) throw new MockError('LMMX_E_NOT_FOUND', 'no change');
++      checkCode(d.otp, 'otp');
++      st.pending = { ...st.pending, status: 'cooling_off', coolingOffUntil: Date.now() + 48 * 3_600_000, applyAfter: Date.now() + 48 * 3_600_000 };
++      return { changeId: st.pending.changeId, status: 'cooling_off', applyAfter: st.pending.applyAfter };
++    }
++    case 'lmmx_tenant_cancelChange': {
++      if (!st.pending || st.pending.changeId !== d.changeId) throw new MockError('LMMX_E_NOT_FOUND', 'no change');
++      checkCode(d.cancelCode, 'cancel');
++      st.pending = undefined;
++      return { ok: true };
++    }
++    default: throw new MockError('LMMX_E_FORBIDDEN', 'not a tenant op');
++  }
++}
+diff --git a/src/lmmx/route.ts b/src/lmmx/route.ts
+new file mode 100644
+index 0000000..b41b1b7
+--- /dev/null
++++ b/src/lmmx/route.ts
+@@ -0,0 +1,19 @@
++// Where a signed-in tenant goes after `lmmx_tenant_link` says which accounts match. Pure, so it is easy to reason about.
++export type Kind = 'lmm' | 'legacy';
++export type Destination = 'lmm' | 'legacy' | 'choose' | 'none';
++
++export function decideDestination(kinds: readonly Kind[]): Destination {
++  const lmm = kinds.includes('lmm');
++  const legacy = kinds.includes('legacy');
++  return lmm && legacy ? 'choose' : lmm ? 'lmm' : legacy ? 'legacy' : 'none';
++}
++
++const KEY = 'samuhia.lmmx.kinds';
++/** What the link step found, kept for this browser session only so the app can offer "open my rent invoice instead". */
++export function rememberKinds(kinds: readonly Kind[]): void { try { sessionStorage.setItem(KEY, JSON.stringify(kinds)); } catch { /* storage unavailable */ } }
++export function recalledKinds(): Kind[] {
++  try {
++    const v = JSON.parse(sessionStorage.getItem(KEY) || '[]');
++    return Array.isArray(v) ? v.filter((k): k is Kind => k === 'lmm' || k === 'legacy') : [];
++  } catch { return []; }
++}
+diff --git a/src/lmmx/strings.ts b/src/lmmx/strings.ts
+new file mode 100644
+index 0000000..75e653d
+--- /dev/null
++++ b/src/lmmx/strings.ts
+@@ -0,0 +1,175 @@
++// Every new tenant-facing string of the Lipa Mdogo Mdogo web app lives here (plain English, short sentences).
++// Functions take the already-formatted pieces (use kes() and shortDate() from contract.ts), so wording stays in one place.
++import type { LmmxErrorCode } from './contract';
++
++export const S = {
++  brand: 'Lipa Mdogo Mdogo',
++  tagline: 'Pay your rent in small amounts, at your own pace.',
++
++  // Sign-in and linking
++  checking: 'Checking your account…',
++  linkTitle: 'Find your Lipa Mdogo Mdogo account',
++  linkIntro: 'Enter the ID you gave when you signed up. We match it with the phone number you just signed in with.',
++  idTypeLabel: 'ID type',
++  idTypes: { national_id: 'National ID', alien_id: 'Alien ID', passport: 'Passport' },
++  idNumberLabel: 'ID number',
++  idNumberHint: (type: string) => (type === 'passport' ? 'Passport: 6 to 9 letters or numbers.' : '6 to 9 digits.'),
++  idInvalid: 'That ID number does not look right. Please check it.',
++  linkButton: 'Continue',
++  linking: 'Checking…',
++  linkFailed: 'We could not match those details. Check your ID number, and sign in with the phone number you gave when you signed up.',
++  linkRate: 'Too many tries. Please wait a few minutes and try again.',
++  linkNetwork: 'We could not reach the server. Check your internet and try again.',
++  linkSkip: 'I am not on Lipa Mdogo Mdogo — continue to my rent invoices',
++  chooserTitle: 'What would you like to open?',
++  chooserLegacyTitle: 'My rent invoice',
++  chooserLegacyBody: 'My landlord uses Plot Yangu',
++  chooserLmmTitle: 'Lipa Mdogo Mdogo',
++  chooserLmmBody: 'Pay rent in small amounts',
++  switchToInvoice: 'Open my rent invoice instead',
++  switchToLmm: 'Open Lipa Mdogo Mdogo',
++  signOut: 'Sign out',
++
++  // Tabs
++  tabs: { home: 'Home', pay: 'Pay', history: 'History', settings: 'Settings' },
++
++  // Dashboard
++  loading: 'Loading…',
++  loadFailed: 'We could not load your account. Please try again.',
++  retry: 'Try again',
++  refresh: 'Refresh',
++  hello: (name: string) => `Hello ${name}`,
++  rentLabel: 'Monthly rent',
++  dueLabel: 'Rent due',
++  payByLabel: 'Pay by',
++  payByHelp: 'Pay by this date so your landlord gets all of it on the due date.',
++  balanceLabel: 'Still to pay',
++  paidAll: 'All paid for this month ✓',
++  progress: (paid: string, rent: string, pct: number) => `${paid} paid of ${rent} (${pct}%)`,
++  progressAria: 'Rent paid so far',
++  frequencyLabel: 'How often you plan to pay',
++  frequencies: { daily: 'Daily', weekly: 'Weekly', biweekly: 'Every 2 weeks' },
++  dueDayLine: (day: number) => `Your rent is due on day ${day} of each month.`,
++  noCycle: 'Your next rent cycle will show here soon.',
++  recipientTitle: 'Your landlord is paid to',
++  recipientNameLabel: 'Name',
++  recipientReview: 'Samuhia is double-checking these payment details. Paying is still safe.',
++  frozenTitle: 'Your account is on hold',
++  frozenBody: (phone: string) => `Payments are paused for now. Please contact support on ${phone}.`,
++  awaitingTitle: 'One last step',
++  awaitingBody: 'Confirm your sign-up with the code we sent you by SMS. It looks like LMM1234.',
++  awaitingExpires: (when: string) => `The code is valid until ${when}.`,
++  pendingTitle: 'A change is waiting',
++  pendingStatus: {
++    awaiting_tenant_otp: 'Waiting for your code',
++    cooling_off: 'Confirmed. It starts after a short waiting time.',
++    deferred: 'Confirmed. It starts after your rent is paid out, so this month is not affected.',
++    applied: 'Done',
++    cancelled: 'Cancelled',
++    expired: 'Expired',
++    rejected: 'Not approved',
++  } as Record<string, string>,
++  pendingStarts: (when: string) => `Starts: ${when}`,
++  pendingCooling: (when: string) => `Waiting time ends: ${when}`,
++
++  // Pay
++  payTitle: 'Pay towards your rent',
++  amountLabel: 'Amount (KES, whole shillings)',
++  amountHint: (min: string, max: string) => `At least ${min} and at most ${max}.`,
++  amountLastSmaller: 'Your last payment can be smaller than the minimum.',
++  amountInvalid: 'Type a whole number of shillings.',
++  quickLabel: 'Quick amounts',
++  quickFull: 'Full balance',
++  phoneLabel: 'M-PESA number that will pay',
++  phoneHint: 'We will send an M-PESA prompt to this number.',
++  phoneInvalid: 'Type a Kenyan number, like 0712 345 678.',
++  linesGoes: 'Goes to your rent',
++  linesFees: 'Fees',
++  linesPay: 'You pay',
++  estimate: 'Estimate. The exact price is confirmed in a moment.',
++  quoting: 'Getting the exact price…',
++  quoteExpired: 'The price expired and was refreshed. Please check it and tap Pay again.',
++  quoteFailed: 'We could not get the price. Please try again.',
++  payButton: (amount: string) => `Pay ${amount}`,
++  paying: 'Sending the prompt…',
++  waitingTitle: 'Check your phone',
++  waitingBody: (phone: string, amount: string) => `We sent an M-PESA prompt to ${phone}. Enter your PIN to pay ${amount}.`,
++  waitingNote: 'We are waiting for M-PESA to confirm. Please do not pay again.',
++  successTitle: 'Payment received ✓',
++  successBody: (credit: string) => `${credit} was added to your rent.`,
++  failedTitle: 'The payment did not go through',
++  failedBody: 'Nothing was added to your rent. You can try again.',
++  timeoutTitle: 'We have not seen the payment yet',
++  timeoutBody: 'If you entered your PIN, it can still arrive in a few minutes. Please do not pay again yet: check History first.',
++  didNotGetPrompt: 'I did not get a prompt',
++  payAgain: 'Pay again',
++  done: 'Done',
++  checkNow: 'Check now',
++
++  // History
++  historyTitle: 'Your payments',
++  historyEmpty: 'No payments yet.',
++  historyMore: 'Show more',
++  historyCredit: (amount: string) => `${amount} to rent`,
++  historyFees: (amount: string) => `Fees ${amount}`,
++  historyPaid: (amount: string) => `Paid ${amount}`,
++  historyStatus: { success: 'Received', failed: 'Failed', refunded: 'Refunded' } as Record<string, string>,
++
++  // Settings: due day and plan
++  dueDayTitle: 'Change your due day',
++  dueDayLabel: 'Day of the month (1 to 28)',
++  dueDayHelp: 'The new day starts with your next cycle, not this one. You can change it once per cycle, and not in the last 5 days before the due date.',
++  dueDaySave: 'Save due day',
++  dueDaySaved: (date: string) => `Saved. It starts from the cycle of ${date}.`,
++  dueDayState: 'You cannot change the due day right now. It can be changed once per cycle, and not in the last 5 days before the due date.',
++  planTitle: 'How often you plan to pay',
++  planHelp: 'This only sets your reminders and suggested amount. You can pay any amount at any time.',
++  suggestedLabel: 'Suggested amount (KES, optional)',
++  planSave: 'Save plan',
++  planSaved: 'Saved.',
++
++  // Codes
++  codesTitle: 'Confirm with a code',
++  codeSetupTitle: 'Confirm your sign-up',
++  codeChangeTitle: 'Confirm this change',
++  codeCancelTitle: 'Cancel this change',
++  codeLabel: 'Code',
++  codePlaceholder: 'LMM1234 or 1234',
++  codeCancelPlaceholder: 'LMC1234 or 1234',
++  codeConfirm: 'Confirm',
++  codeCancel: 'Cancel this change',
++  codeBad: 'Type the 4-digit code, for example LMM1234 or 1234.',
++  codeWrongKind: 'That is a code for a different step. Check your SMS.',
++  codeSetupDone: 'Confirmed. Lipa Mdogo Mdogo is on ✓',
++  codeChangeDone: 'Confirmed. Thank you.',
++  codeChangeStarts: (when: string) => `It starts on ${when}.`,
++  codeCancelDone: 'Cancelled. Your details stay as they were.',
++  codeAttemptsLeft: (n: number) => `${n} ${n === 1 ? 'try' : 'tries'} left.`,
++  codeShareWarning: 'Only use a code you asked for. Never share it with anyone else.',
++  whatsappHint: 'You can also send the code in the Samuhia WhatsApp chat.',
++
++  // Support / generic
++  support: (phone: string) => `Need help? Call ${phone}.`,
++  supportFallback: 'Need help? Contact Samuhia support.',
++  mockBanner: 'Demo data. Nothing here is real.',
++} as const;
++
++/** What the tenant reads for each server error code (the server's own message is shown only when we have nothing better). */
++export const ERROR_TEXT: Partial<Record<LmmxErrorCode, string>> = {
++  LMMX_E_AUTH: 'Please sign in again.',
++  LMMX_E_FORBIDDEN: 'You cannot do that with this account.',
++  LMMX_E_RATE: 'Too many tries. Please wait a few minutes and try again.',
++  LMMX_E_VALIDATION: 'Please check what you typed and try again.',
++  LMMX_E_NOT_FOUND: 'We could not find that. Please check and try again.',
++  LMMX_E_OTP_INVALID: 'That code is not right.',
++  LMMX_E_OTP_LOCKED: 'Too many wrong codes. This is locked for an hour. Please try again later or call support.',
++  LMMX_E_OTP_EXPIRED: 'That code has expired. Ask your Samuhia desk agent for a new one.',
++  LMMX_E_FROZEN: 'Your account is on hold. Please contact support.',
++  LMMX_E_DISABLED: 'Lipa Mdogo Mdogo is not available right now. Please try again later.',
++  LMMX_E_AMOUNT: 'That amount cannot be paid right now. Check your balance and try another amount.',
++  LMMX_E_QUOTE: 'That price has expired. A fresh one is shown below.',
++  LMMX_E_STATE: 'That cannot be done right now.',
++  LMMX_E_NEEDS_REAUTH: 'For your safety, please sign in again.',
++  LMMX_E_INTERNAL: 'Something went wrong on our side. Please try again in a few minutes.',
++};
++export const ERROR_FALLBACK = 'Something went wrong. Please try again.';
+diff --git a/src/lmmx/ui.tsx b/src/lmmx/ui.tsx
+new file mode 100644
+index 0000000..ce587ca
+--- /dev/null
++++ b/src/lmmx/ui.tsx
+@@ -0,0 +1,39 @@
++// Small shared pieces for the Lipa Mdogo Mdogo screens (Tailwind, mobile first, large touch targets).
++import type { ButtonHTMLAttributes, ReactNode } from 'react';
++
++export const Card = ({ children, className = '' }: { children: ReactNode; className?: string }) => (
++  <section className={`bg-white rounded-xl shadow-md p-5 sm:p-6 ${className}`}>{children}</section>
++);
++
++export const Title = ({ children }: { children: ReactNode }) => <h2 className="text-lg font-bold text-gray-900">{children}</h2>;
++
++export function Btn({ tone = 'primary', className = '', ...p }: ButtonHTMLAttributes<HTMLButtonElement> & { tone?: 'primary' | 'ghost' | 'danger' }) {
++  const look = tone === 'primary' ? 'bg-green-600 text-white hover:bg-green-700' : tone === 'danger' ? 'bg-red-600 text-white hover:bg-red-700' : 'bg-gray-100 text-gray-800 hover:bg-gray-200';
++  return <button type="button" {...p} className={`min-h-11 px-4 py-2 rounded-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed ${look} ${className}`} />;
++}
++
++export const Alert = ({ kind, children }: { kind: 'ok' | 'err' | 'warn' | 'info'; children: ReactNode }) => {
++  const look = kind === 'ok' ? 'border-green-300 bg-green-50 text-green-900' : kind === 'err' ? 'border-red-300 bg-red-50 text-red-800' : kind === 'warn' ? 'border-yellow-300 bg-yellow-50 text-yellow-900' : 'border-blue-200 bg-blue-50 text-blue-900';
++  return <div role={kind === 'err' ? 'alert' : 'status'} className={`rounded-lg border p-3 text-sm break-words ${look}`}>{children}</div>;
++};
++
++export const Field = ({ label, hint, error, children }: { label: string; hint?: string; error?: string; children: ReactNode }) => (
++  <label className="block text-sm text-gray-700">
++    <span className="font-medium">{label}</span>
++    <span className="mt-1 block">{children}</span>
++    {error ? <span role="alert" className="mt-1 block text-xs text-red-600 font-medium">{error}</span> : hint ? <span className="mt-1 block text-xs text-gray-500">{hint}</span> : null}
++  </label>
++);
++
++export const inputClass = 'w-full min-h-11 rounded-lg border border-gray-300 px-3 py-2 text-base focus:outline-none focus:ring-2 focus:ring-green-600';
++
++export const Spinner = ({ label }: { label: string }) => (
++  <div role="status" className="flex items-center gap-2 text-sm text-gray-600 p-4"><span className="h-4 w-4 rounded-full border-2 border-green-600 border-t-transparent animate-spin" aria-hidden />{label}</div>
++);
++
++export const Row = ({ label, children }: { label: string; children: ReactNode }) => (
++  <div className="flex justify-between gap-3 py-1.5 text-sm"><dt className="text-gray-600">{label}</dt><dd className="font-semibold text-gray-900 text-right">{children}</dd></div>
++);
++
++/** "Thu 5 Dec, 14:30" in Nairobi time, from epoch ms. */
++export const when = (ms: number): string => new Date(ms).toLocaleString('en-KE', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Nairobi' });
+diff --git a/tools/check-lmmx-contract.mjs b/tools/check-lmmx-contract.mjs
+new file mode 100644
+index 0000000..35186b6
+--- /dev/null
++++ b/tools/check-lmmx-contract.mjs
+@@ -0,0 +1,16 @@
++// Fails if the frontend copy of the Lipa Mdogo Mdogo (LMMX) contract drifted from the backend one.
++// Backend copy: functions/src/lmmx/contract.ts (added by CORE). Frontend copy: src/lmmx/contract.ts (this patch).
++import { existsSync, readFileSync } from "node:fs";
++const backend = "functions/src/lmmx/contract.ts";
++const frontend = "src/lmmx/contract.ts";
++if (!existsSync(backend)) {
++  console.error(`LMMX contract check: ${backend} does not exist yet.`);
++  console.error("It is added by the CORE patch (PAY backend). Apply that patch, then run this check again.");
++  process.exit(1);
++}
++if (readFileSync(backend, "utf8") !== readFileSync(frontend, "utf8")) {
++  console.error(`LMMX contract drift: ${backend} !== ${frontend}`);
++  console.error(`Fix: cp ${backend} ${frontend}  (or the other way round, whichever is the current Appendix A)`);
++  process.exit(1);
++}
++console.log("LMMX contract: backend and frontend copies are identical.");

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "check:mychama-contract": "node tools/check-mychama-contract.mjs",
+    "check:lmmx-contract": "node tools/check-lmmx-contract.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",

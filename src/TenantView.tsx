@@ -360,7 +360,7 @@ const TenantView: React.FC = () => {
           billsDue={splitInvoiceOutstanding(invoices).billsDue}
         />
 
-        {/* Lipa Mos Mos: pay rent a little at a time (shown while something is owed) */}
+        {/* Lipa Mdogo Mdogo: pay rent a little at a time (shown while something is owed) */}
         {(() => {
           const open = invoices.find((inv) => !inv.isPaid);
           return open ? <LipaMosMos agentId={open.agentUserId} tenantId={open.tenantId} phone={tenantData?.phone || ''} onPaid={handlePaymentSuccess} /> : null;

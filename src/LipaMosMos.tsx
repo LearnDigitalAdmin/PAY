@@ -27,7 +27,7 @@ const call = <T,>(name: string, data: unknown) => httpsCallable<unknown, T>(func
 
 interface Props { agentId: string; tenantId: number | string; phone?: string; onPaid?: () => void }
 
-/** Lipa Mos Mos: pay rent a little at a time. Money waits safely until the target or the invoice due date, then the landlord is paid. */
+/** Lipa Mdogo Mdogo: pay rent a little at a time. Money waits safely until the target or the invoice due date, then the landlord is paid. */
 export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onPaid }: Props) {
   const [res, setRes] = useState<Res | null>(null);
   const [freq, setFreq] = useState<Frequency>('weekly');
@@ -39,12 +39,12 @@ export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onP
 
   const load = useCallback(async () => {
     try { const r = await call<Res>('lmm_getPlan', ids); setRes(r); if (r.plan?.frequency) setFreq(r.plan.frequency); }
-    catch (e: any) { setRes({ available: false, reason: e?.message || 'Could not load Lipa Mos Mos' }); }
+    catch (e: any) { setRes({ available: false, reason: e?.message || 'Could not load Lipa Mdogo Mdogo' }); }
   }, [ids]);
   useEffect(() => { void load(); }, [load]);
 
-  if (!res) return <div className="bg-white rounded-xl shadow-md p-6 text-sm text-gray-500">Loading Lipa Mos Mos...</div>;
-  if (!res.available) return <div className="bg-white rounded-xl shadow-md p-6"><p className="font-semibold text-gray-900">Lipa Mos Mos</p><p className="text-sm text-gray-600 mt-1">{res.reason}</p></div>;
+  if (!res) return <div className="bg-white rounded-xl shadow-md p-6 text-sm text-gray-500">Loading Lipa Mdogo Mdogo...</div>;
+  if (!res.available) return <div className="bg-white rounded-xl shadow-md p-6"><p className="font-semibold text-gray-900">Lipa Mdogo Mdogo</p><p className="text-sm text-gray-600 mt-1">{res.reason}</p></div>;
 
   const plan = res.plan;
   const suggested = (plan?.suggestedMinor ?? res.suggestedMinor ?? 0) / 100;
@@ -70,7 +70,7 @@ export default function LipaMosMos({ agentId, tenantId, phone: phoneIn = '', onP
     <div className="bg-white rounded-xl shadow-md p-6 mb-8">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h3 className="text-lg font-bold text-gray-900">Lipa Mos Mos</h3>
+          <h3 className="text-lg font-bold text-gray-900">Lipa Mdogo Mdogo</h3>
           <p className="text-sm text-gray-600 mt-1">Pay your rent a little at a time. Your landlord is paid when it is fully covered, or on the due date with whatever you have paid.</p>
         </div>
       </div>

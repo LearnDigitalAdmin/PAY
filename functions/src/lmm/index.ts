@@ -42,7 +42,7 @@ export const lmm_setupRecipient = onCall(
       throw new HttpsError("invalid-argument", "These details do not match your registered payout account");
     }
     const r = await createSealedRecipient(lmmSecrets(), { landlordId, settlementType: String(d.settlementType ?? ""), bankCode: String(d.bankCode ?? prof.settlementBankCode ?? ""), accountNumber: String(d.accountNumber ?? ""), name: String(d.name ?? prof.businessName ?? prof.name ?? "Landlord") });
-    if (!r.ok) throw new HttpsError("failed-precondition", `Lipa Mos Mos is not available for this payout account: ${r.reason ?? "unsupported"}`);
+    if (!r.ok) throw new HttpsError("failed-precondition", `Lipa Mdogo Mdogo is not available for this payout account: ${r.reason ?? "unsupported"}`);
     return { ok: true };
   });
 

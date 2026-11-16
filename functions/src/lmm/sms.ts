@@ -19,16 +19,16 @@ export const kes = (minor: number): string => {
 
 export const lmmText = {
   started: (p: { name: string; targetMinor: number }) =>
-    fit144(`${dearLine(p.name)} your Lipa Mos Mos plan for ${kes(p.targetMinor)} rent is on. Pay a little at a time. Landlord is paid on the 5th. Samuhia Payments.`),
+    fit144(`${dearLine(p.name)} your Lipa Mdogo Mdogo plan for ${kes(p.targetMinor)} rent is on. Pay a little at a time. Landlord is paid on the 5th. Samuhia Payments.`),
   missed: (p: { name: string; days: number; balanceMinor: number }) =>
-    fit144(`${dearLine(p.name)} no Lipa Mos Mos payment for ${p.days} days. Balance ${kes(p.balanceMinor)}. Pay any amount on WhatsApp or Samuhia Payments.`),
+    fit144(`${dearLine(p.name)} no Lipa Mdogo Mdogo payment for ${p.days} days. Balance ${kes(p.balanceMinor)}. Pay any amount on WhatsApp or Samuhia Payments.`),
   milestone: (p: { name: string; pct: number; paidMinor: number; leftMinor: number }) =>
     p.pct >= 100
       ? fit144(`${dearLine(p.name)} well done! Your rent is fully paid (${kes(p.paidMinor)}). Your landlord will be paid shortly.`)
       : fit144(`${dearLine(p.name)} well done! You have paid ${p.pct}% of your rent (${kes(p.paidMinor)}). ${kes(p.leftMinor)} to go. Keep going.`),
   /** 5 days before the due date, tenant holds KES 40 (wallet) to 299: what comes off, and what reaches their rent. */
   feeWarning: (p: { name: string; creditedMinor: number; feeMinor: number; netMinor: number; dueOn: string }) =>
-    fit144(`${dearLine(p.name)} you paid ${kes(p.creditedMinor)} on Lipa Mos Mos. On ${shortDate(p.dueOn)} a ${kes(p.feeMinor)} fee comes off: ${kes(p.netMinor)} reaches rent. Pay KES 300+ to avoid it.`),
+    fit144(`${dearLine(p.name)} you paid ${kes(p.creditedMinor)} on Lipa Mdogo Mdogo. On ${shortDate(p.dueOn)} a ${kes(p.feeMinor)} fee comes off: ${kes(p.netMinor)} reaches rent. Pay KES 300+ to avoid it.`),
   /** 5 days before the due date, tenant holds too little to send at all. */
   tooSmallWarning: (p: { name: string; creditedMinor: number; minMinor: number; dueOn: string }) =>
     fit144(`${dearLine(p.name)} ${kes(p.creditedMinor)} is below the ${kes(p.minMinor)} minimum, so nothing can be sent to your landlord on ${shortDate(p.dueOn)}. Please pay more before then.`),
@@ -39,11 +39,11 @@ export const lmmText = {
   landlordPaidNet: (p: { name: string; paidMinor: number; feeMinor: number; netMinor: number; leftMinor: number }) =>
     p.leftMinor > 0
       ? fit144(`${dearLine(p.name)} ${kes(p.netMinor)} reached your rent (${kes(p.paidMinor)} less ${kes(p.feeMinor)} fee). ${kes(p.leftMinor)} still due: pay it via Pay Rent.`)
-      : fit144(`${dearLine(p.name)} ${kes(p.netMinor)} reached your rent (${kes(p.paidMinor)} less ${kes(p.feeMinor)} transfer fee). Thank you for using Lipa Mos Mos.`),
+      : fit144(`${dearLine(p.name)} ${kes(p.netMinor)} reached your rent (${kes(p.paidMinor)} less ${kes(p.feeMinor)} transfer fee). Thank you for using Lipa Mdogo Mdogo.`),
   landlordPaid: (p: { name: string; paidMinor: number; leftMinor: number }) =>
     p.leftMinor > 0
       ? fit144(`${dearLine(p.name)} ${kes(p.paidMinor)} was sent to your landlord today. Balance ${kes(p.leftMinor)} stays on your plan.`)
-      : fit144(`${dearLine(p.name)} your landlord has been paid ${kes(p.paidMinor)} for rent. Thank you for using Lipa Mos Mos.`),
+      : fit144(`${dearLine(p.name)} your landlord has been paid ${kes(p.paidMinor)} for rent. Thank you for using Lipa Mdogo Mdogo.`),
 };
 
 /** Low-level HostPinnacle send via the shared secret-based sender (functions/src/hpSms.ts). Never throws. */

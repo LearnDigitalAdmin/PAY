@@ -1,4 +1,4 @@
-/* Lipa Mos Mos end to end against an in-memory Firestore and a mocked Paystack/SMS (no network, no emulator).
+/* Lipa Mdogo Mdogo end to end against an in-memory Firestore and a mocked Paystack/SMS (no network, no emulator).
  * Run:  cd functions && npm run build && node test/lmm-flow.check.js   (exit 1 on failure) */
 process.env.PAYSTACK_SECRET_KEY = "sk_test_x"; process.env.LMM_SEAL_KEY = "seal-key-for-tests";
 process.env.HP_SMS_USERID = "u"; process.env.HP_SMS_APIKEY = "k"; process.env.HP_SMS_PASSWORD = "p"; process.env.HP_SMS_SENDERID = "s";
@@ -63,7 +63,7 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
 (async () => {
   await ok("plan starts, tenant is charged 2.5% extra, the charge has NO split, and the rent is credited exactly", async () => {
     await world();
-    assert.deepStrictEqual(tenantSms().length, 1); assert.match(tenantSms()[0], /^Dear John, your Lipa Mos Mos plan for KES 10,000 rent is on\./);
+    assert.deepStrictEqual(tenantSms().length, 1); assert.match(tenantSms()[0], /^Dear John, your Lipa Mdogo Mdogo plan for KES 10,000 rent is on\./);
     const { out, result } = await payAndConfirm(3000);
     assert.deepStrictEqual([out.creditMinor, out.chargeMinor, out.surchargeMinor], [KES(3000), KES(3075), KES(75)]);
     assert.strictEqual(result, "credited");
@@ -222,7 +222,7 @@ const ok = async (name, fn) => { try { await fn(); passed++; console.log("  ✓"
     await world({ wallet: true, invoiceTotal: 300, due: inDays(5) }); await payAndConfirm(40);
     await index.lmm_dailySweep.run({}); await index.lmm_dailySweep.run({});
     const w = tenantSms().filter((m) => /fee comes off/.test(m)); assert.strictEqual(w.length, 1, tenantSms().join(" | "));
-    assert.match(w[0], /^Dear John, you paid KES 40 on Lipa Mos Mos\. On \d{1,2} \w{3} a KES 30 fee comes off: KES 10 reaches rent\. Pay KES 300\+ to avoid it\.$/);
+    assert.match(w[0], /^Dear John, you paid KES 40 on Lipa Mdogo Mdogo\. On \d{1,2} \w{3} a KES 30 fee comes off: KES 10 reaches rent\. Pay KES 300\+ to avoid it\.$/);
     assert.strictEqual(transfers.length, 0, "not paid before the due date");
   });
   await ok("sweep: no warning 6+ days out, none at KES 300+, and 'too small' is a different message", async () => {

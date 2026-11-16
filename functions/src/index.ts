@@ -39,12 +39,14 @@ function myregisterDb(): admin.firestore.Firestore {
 
 import { PAYSTACK_SECRET_KEY, PAYSTACK_API_BASE } from "./desk/paystack";
 import { handleLmmCharge, handleLmmTransfer } from "./lmm";
+import { handleLmmxCharge, handleLmmxTransfer } from "./lmmx";
 import { alertOps as lmmAlert } from "./lmm/alert";
 import { firstName } from "./lmm/dear";
 import { createSealedRecipient } from "./lmm/recipient";
 import { LMM_SEAL_KEY } from "./lmm/seal";
 import { sendHpSms } from "./hpSms";
 export { lmm_getPlan, lmm_start, lmm_pay, lmm_setupRecipient, lmm_recipientStatus, lmm_dailySweep } from "./lmm";
+export * from "./lmmx";
 import { getDeskConfig } from "./desk/config";
 import { conveniencePctForTier } from "./desk/rentFees";
 import { initiateRentCharge } from "./desk/rentCharge";
@@ -1856,7 +1858,7 @@ export const paystackCallback = onRequest({
 
     if (hash !== expectedHash) {
       console.error("Invalid signature");
-      if (/LMM_|lmm-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mos Mos webhook arrived with a bad signature");
+      if (/LMM_|lmm-|LMX_|lmx-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mos Mos webhook arrived with a bad signature");
       res.status(400).json({ error: "Invalid signature" });
       return;
     }
@@ -1883,6 +1885,11 @@ export const paystackCallback = onRequest({
       // ── Lipa Mos Mos instalment: credited to the tenant's plan after Paystack verification ──────────
       if (reference.startsWith("LMM_")) {
         await handleLmmCharge(reference, data);
+      }
+
+      // ── Lipa Mdogo Mdogo (standalone tenant) instalment: verified and credited by lmmx ──────────
+      else if (reference.startsWith("LMX_")) {
+        await handleLmmxCharge(reference, data);
       }
 
       // ── Landlord Watch extra transcript (KES 99, company revenue) ─────────
@@ -1997,6 +2004,8 @@ export const paystackCallback = onRequest({
       // Update appropriate collection based on charge type
       if (reference.startsWith("LMM_")) {
         await admin.firestore().collection("lmm_payments").doc(reference).update({ status: "failed", error: String(data.gateway_response ?? "").slice(0, 200) }).catch(() => undefined);
+      } else if (reference.startsWith("LMX_")) {
+        await admin.firestore().collection("lmmx_payments").doc(reference).update({ status: "failed", error: String(data.gateway_response ?? "").slice(0, 200) }).catch(() => undefined);
       } else if (reference.startsWith("LWT_")) {
         await failTranscriptPayment(db, reference, data.gateway_response);
       } else if (reference.startsWith("CRP_")) {
@@ -2113,6 +2122,7 @@ export const paystackCallback = onRequest({
     // Lipa Mos Mos transfers to landlords: confirmation, failure or reversal
     if (typeof event.event === "string" && event.event.startsWith("transfer.")) {
       await handleLmmTransfer(event.event, (event as any).data);
+      await handleLmmxTransfer(event.event, (event as any).data);
     }
 
     res.status(200).json({

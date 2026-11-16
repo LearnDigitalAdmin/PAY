@@ -27,7 +27,7 @@ class DocRef {
   async update(d) { const cur = this._db.store.get(this.path); if (cur === undefined) throw Object.assign(new Error("NOT_FOUND " + this.path), { code: 5 }); this._db.store.set(this.path, applyUpdate(cur, d)); }
   async delete() { this._db.store.delete(this.path); }
 }
-const ops = { "==": (a, b) => a === b, ">": (a, b) => a > b, "<": (a, b) => a < b, in: (a, b) => b.includes(a), "array-contains": (a, b) => Array.isArray(a) && a.includes(b) };
+const ops = { "==": (a, b) => a === b, ">": (a, b) => a > b, "<": (a, b) => a < b, ">=": (a, b) => a >= b, "<=": (a, b) => a <= b, in: (a, b) => b.includes(a), "array-contains": (a, b) => Array.isArray(a) && a.includes(b) };
 class CollRef {
   constructor(db, path, f = [], lim = null) { this._db = db; this.path = path; this._f = f; this._l = lim; }
   doc(id) { return new DocRef(this._db, `${this.path}/${id || "auto" + ++auto}`); }

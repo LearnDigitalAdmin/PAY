@@ -1,4 +1,4 @@
-/* Lipa Mos Mos: fee maths, transfer fees and splitting, sealing, name cut, reminders, message lengths.
+/* Lipa Mdogo Mdogo: fee maths, transfer fees and splitting, sealing, name cut, reminders, message lengths.
  * Run:  cd functions && npm run build && node test/lmm.check.js   (exit 1 on failure) */
 const assert = require("assert");
 const path = require("path");
@@ -151,7 +151,7 @@ ok("every SMS starts 'Dear {first name},', stays under 144 characters, even with
   for (const m of msgs) { assert.ok(m.length <= 144, `${m.length}: ${m}`); assert.ok(m.startsWith("Dear Christopher,"), m); }
   assert.ok(T.lmmText.started({ name: "John Doe", targetMinor: KES(25000) }).startsWith("Dear John,"));
   assert.strictEqual(T.lmmText.feeWarning({ name: "John Doe", creditedMinor: KES(40), feeMinor: KES(30), netMinor: KES(10), dueOn: "2026-11-05" }),
-    "Dear John, you paid KES 40 on Lipa Mos Mos. On 5 Nov a KES 30 fee comes off: KES 10 reaches rent. Pay KES 300+ to avoid it.");
+    "Dear John, you paid KES 40 on Lipa Mdogo Mdogo. On 5 Nov a KES 30 fee comes off: KES 10 reaches rent. Pay KES 300+ to avoid it.");
   assert.strictEqual(T.lmmText.landlordPaidNet({ name: "John Doe", paidMinor: KES(40), feeMinor: KES(30), netMinor: KES(10), leftMinor: KES(30) }),
     "Dear John, KES 10 reached your rent (KES 40 less KES 30 fee). KES 30 still due: pay it via Pay Rent.");
   assert.strictEqual(T.fit144("x".repeat(300)).length, 144); assert.ok(!/[^\x20-\x7E]/.test(T.fit144("Hi 😀 café")));

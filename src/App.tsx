@@ -12,6 +12,8 @@ import Contact from './Contact';
 import { Loader2 } from 'lucide-react';
 import Welcome from './Welcome';
 import FAQPage from './Faq';
+import LmmxGate from './lmmx/LmmxGate';
+import LmmxApp from './lmmx/LmmxApp';
 
 // Protected Route Component — role comes from the verified session (Firebase Auth + server claims),
 // not from localStorage.
@@ -100,6 +102,11 @@ const App: React.FC = () => {
             </ProtectedRoute>
           }
         />
+
+        {/* Lipa Mdogo Mdogo (standalone tenants): the gate links phone + ID, the app is the dashboard */}
+        <Route path="/lmmx" element={<ProtectedRoute requiredRole="tenant"><LmmxGate /></ProtectedRoute>} />
+        <Route path="/lmmx/app" element={<ProtectedRoute requiredRole="tenant"><LmmxApp /></ProtectedRoute>} />
+        {import.meta.env.VITE_LMMX_MOCK === 'true' && <Route path="/lmmx/demo" element={<LmmxApp demo />} />}
 
         {/* 404 Route */}
         <Route path="*" element={<Navigate to="/" replace />} />
