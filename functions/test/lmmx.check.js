@@ -62,8 +62,18 @@ const payAndCredit = async (tid, creditMinor, { tamper = 0 } = {}) => {
 
 // ------------------------------------------------------------------------------------------------------------- fee engine
 ok("fee rows match the contract table (till, rent KES 10,000)", () => {
-  const rows = [[10_000, 10_700, 240], [50_000, 52_800, 900], [250_000, 261_500, 3000], [500_000, 520_400, 4500], [1_000_000, 1_040_800, 9000]];
+  const rows = [[10_000, 10_600, 225], [50_000, 52_300, 750], [250_000, 260_200, 2812], [500_000, 517_900, 3750], [1_000_000, 1_035_700, 7500]];
   for (const [x, g, d] of rows) { const q = C.quoteInstalment({ creditMinor: x, rentMinor: 1_000_000, channel: "till" }); assert.strictEqual(q.chargeMinor, g); assert.strictEqual(q.deskShareMinor, d); }
+});
+ok("pricing v2.1: lowered service bands, 75% desk share, and the safe transfer reserve (x1.2 + KES 5) is unchanged; the credit is never reduced", () => {
+  assert.deepStrictEqual(C.LMMX.SERVICE_BANDS.map((b) => b.bps), [400, 300, 200, 150, 100]);
+  assert.strictEqual(C.LMMX.DESK_SHARE_BPS, 7_500); assert.strictEqual(C.LMMX.TRANSFER_UPLIFT_BPS, 12_000); assert.strictEqual(C.LMMX.TRANSFER_BUFFER_MINOR, 500); assert.strictEqual(C.LMMX.COLLECTION_BPS, 150);
+  for (const x of [1_000, 9_900, 10_000, 49_900, 50_000, 199_900, 200_000, 499_900, 500_000, 1_500_000]) {
+    const q = C.quoteInstalment({ creditMinor: x, rentMinor: 1_500_000, channel: "till" });
+    assert.strictEqual(q.creditMinor, x); assert.strictEqual(q.deskShareMinor + q.platformShareMinor, q.serviceFeeMinor); assert.ok(q.platformShareMinor >= 0 && q.deskShareMinor <= q.serviceFeeMinor);
+  }
+  // a reserve that never undershoots Paystack's listed cost x 1.2 (till KES 80 -> at least KES 96 + 5)
+  assert.ok(C.transferReserveMinor(200_000, "till") >= 9_600 + 500);
 });
 ok("the charge always covers credit + reserve + service after Paystack's 1.5% (2000 random cases, 3 channels)", () => {
   for (let i = 0; i < 2000; i++) {
@@ -175,9 +185,9 @@ ok("dedupe returns only the account number and flags, bound to the asking desk",
 ok("pay: signed quote, desk share on a flat split, credit once; a replayed webhook credits nothing; the landlord payout is exactly the credit", async () => {
   world(); const s = await activate(); backdate(s.id);
   const t = db.store.get(`lmm_tenants/${s.id}`);
-  const q = await pay.makeQuote(t, 250_000); assert.strictEqual(q.chargeMinor, 261_500);
+  const q = await pay.makeQuote(t, 250_000); assert.strictEqual(q.chargeMinor, 260_200);
   const out = await pay.startPayment(t, q.quoteId, "0712345678"); assert.ok(charges.get(out.reference).split, "the charge carries the desk's flat split");
-  assert.strictEqual(splits[0].subaccounts[0].share, 3000);
+  assert.strictEqual(splits[0].subaccounts[0].share, 2812);
   const c = charges.get(out.reference); c.status = "success";
   assert.strictEqual(await pay.creditPayment(out.reference, c.amount), "credited"); assert.strictEqual(await pay.creditPayment(out.reference, c.amount), "ignored");
   const cy = db.list("lmmx_cycles").map((p) => db.store.get(p))[0]; assert.strictEqual(cy.creditedMinor, 250_000);

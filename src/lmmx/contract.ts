@@ -33,16 +33,16 @@ export const LMMX = {
   /** What a transfer really costs us: Paystack's listed cost x 1.2 (assumed excise), rounded up to a shilling, plus KES 5. Confirm on a real Paystack statement. */
   TRANSFER_UPLIFT_BPS: 12_000,
   TRANSFER_BUFFER_MINOR: 500,
-  /** Service fee, by instalment credit (minor units): bps of the credit. Larger instalments are cheaper. */
+  /** Service fee, by instalment credit (minor units): bps of the credit. Larger instalments are cheaper. (v2.1: lowered, was 6 / 4 / 3 / 2 / 1.5%.) */
   SERVICE_BANDS: [
-    { fromMinor: 1_000, bps: 600 },     // KES 10 - 99
-    { fromMinor: 10_000, bps: 400 },    // KES 100 - 499
-    { fromMinor: 50_000, bps: 300 },    // KES 500 - 1,999
-    { fromMinor: 200_000, bps: 200 },   // KES 2,000 - 4,999
-    { fromMinor: 500_000, bps: 150 },   // KES 5,000 and above
+    { fromMinor: 1_000, bps: 400 },     // KES 10 - 99
+    { fromMinor: 10_000, bps: 300 },    // KES 100 - 499
+    { fromMinor: 50_000, bps: 200 },    // KES 500 - 1,999
+    { fromMinor: 200_000, bps: 150 },   // KES 2,000 - 4,999
+    { fromMinor: 500_000, bps: 100 },   // KES 5,000 and above
   ] as const,
-  /** The desk keeps this share of the service fee, paid at once through the Paystack flat split. The platform keeps the rest. */
-  DESK_SHARE_BPS: 6_000,
+  /** The desk keeps this share of the service fee, paid at once through the Paystack flat split. The platform keeps the rest. (v2.1: raised from 60% so desks lose little while the fee falls.) */
+  DESK_SHARE_BPS: 7_500,
   /** KES 25 to the desk when a tenant's cycle is fully credited by its due date (needs at least 2 instalments). Paid as a top-desk payable. */
   COMPLETION_BONUS_MINOR: 2_500,
   DUE_DAY_DEFAULT: 5, DUE_DAY_MIN: 1, DUE_DAY_MAX: 28,
@@ -198,7 +198,7 @@ export interface Quote {
 }
 /**
  * T = ceil(x*F/R), but the last instalment of a payout leg takes whatever is left of F, so the leg's total is exactly F and the landlord is paid EXACTLY the credits.
- * S = ceil(x*bps/10000).  g = whole shilling of ceil((x+T+S) / (1 - 1.5%)).  Desk = floor(S*60%).
+ * S = ceil(x*bps/10000).  g = whole shilling of ceil((x+T+S) / (1 - 1.5%)).  Desk = floor(S*75%).
  */
 export function quoteInstalment(i: QuoteInput): Quote {
   if (!Number.isSafeInteger(i.rentMinor) || i.rentMinor <= 0) throw new RangeError("rent must be a positive integer");
