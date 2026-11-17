@@ -80,7 +80,7 @@ export async function createTenant(desk: DeskCtx, i: DeskCreateTenantIn): Promis
   if (prior?.tenantId) {
     const t = await loadTenant(prior.tenantId);
     const r = await loadRecipient(t.activeRecipientId);
-    return { tenantId: t.tenantId, status: t.status === "draft" ? "draft" : "awaiting_confirmation", nameMatch: r.nameMatch, needsReview: !!t.needsReview, expiresAt: t.setupExpiresAt ?? 0, resolvedNameMasked: r.resolvedNameMasked };
+    return { tenantId: t.tenantId, status: t.status === "draft" ? "draft" : t.status === "active" ? "active" : "awaiting_confirmation", nameMatch: r.nameMatch, needsReview: !!t.needsReview, expiresAt: t.setupExpiresAt ?? 0, resolvedNameMasked: r.resolvedNameMasked };
   }
   if (!desk.isTop && !(await rateOk(`new|${desk.uid}`, LMMX.DESK_NEW_TENANTS_PER_DAY, 86_400_000))) return fail("LMMX_E_RATE", "You have reached today's limit for new tenants.");
 
@@ -111,6 +111,11 @@ export async function createTenant(desk: DeskCtx, i: DeskCreateTenantIn): Promis
   });
   await audit({ action: "tenant_created", actor: { type: desk.isTop ? "top" : "desk", deskCode: desk.deskCode, uid: desk.uid, ip: desk.ip }, tenantId, summary: `tenant created, rent ${rent / 100}, recipient ${rec.recipientId}${needsReview ? " (needs review)" : ""}` });
   if (needsReview) return { tenantId, status: "draft", nameMatch: rec.nameMatch, needsReview: true, expiresAt: t.setupExpiresAt!, resolvedNameMasked: rec.resolvedNameMasked };
+  // The top desk needs no tenant code: it is activated now, the same way a confirmed setup is. (The landlord account checks and the first-payout safety window still apply.)
+  if (desk.isTop) {
+    await activateTenant(t, rec, "top", desk);
+    return { tenantId, status: "active", nameMatch: rec.nameMatch, needsReview: false, expiresAt: 0, resolvedNameMasked: rec.resolvedNameMasked };
+  }
   try { await sendSetupOtp(t, rec); } catch (e) { await closeTenant(t, "setup sms failed"); throw e; }
   return { tenantId, status: "awaiting_confirmation", nameMatch: rec.nameMatch, needsReview: false, expiresAt: t.setupExpiresAt!, resolvedNameMasked: rec.resolvedNameMasked };
 }
@@ -160,13 +165,19 @@ export async function confirmSetup(p: { tenantId: string; otp: string; via: OtpV
   if (r.status !== "verified") return fail("LMMX_E_REVIEW_REQUIRED", "The top desk must approve this landlord account first.");
   const hash = termsHashOf(t, r);
   await verifyOtp({ tenantId: t.tenantId, purpose: "setup", input: p.otp, expectedPayloadHash: hash, via: p.via, actorDesk: p.desk?.deskCode });
+  await activateTenant(t, r, p.via, p.desk);
+}
 
+/** Everything that happens when a setup is confirmed: status active, sealed pay record, first cycle, consent, lead, and the two welcome SMS.
+ *  The tenant's code is checked BEFORE this (confirmSetup). COG-0000 skips the code entirely and calls this with via "top". */
+export async function activateTenant(t: TenantDoc, r: RecipientDoc, via: OtpVia | "top", desk?: DeskCtx): Promise<void> {
+  const hash = termsHashOf(t, r);
   const hol = await holidays();
   const due = firstDueDate(eatDate(now()), t.dueDay);
   const cycle = newCycle(t, due, t.rent.amountMinor, hol);
   const rec: PayRecordDoc = {
     tenantId: t.tenantId, recipientId: r.recipientId, channel: r.channel, accountNumber: r.accountNumber, rentMinor: t.rent.amountMinor, dueDay: t.dueDay, frequency: t.frequency, setupCompletedAt: now(),
-    setupDeskCode: t.deskCode, setupOtpVia: p.via, termsHash: hash, termsSig: termsSigOf(hash), version: 1,
+    setupDeskCode: t.deskCode, setupOtpVia: via, termsHash: hash, termsSig: termsSigOf(hash), version: 1,
   };
   await db().runTransaction(async (tx) => {
     const tref = col(COL.tenants).doc(t.tenantId), rref = col(COL.recipients).doc(r.recipientId);
@@ -177,7 +188,7 @@ export async function confirmSetup(p: { tenantId: string; otp: string; via: OtpV
     tx.set(col(COL.payRecords).doc(t.tenantId), rec);
     tx.create(col(COL.cycles).doc(cycle.cycleId), cycle);
   });
-  await audit({ action: "setup_confirmed", actor: { type: p.via === "desk" ? "desk" : p.via === "bot" ? "bot" : "tenant", deskCode: p.desk?.deskCode, uid: p.desk?.uid }, tenantId: t.tenantId, summary: `setup confirmed via ${p.via}; first due ${due}` });
+  await audit({ action: "setup_confirmed", actor: { type: via === "desk" ? "desk" : via === "bot" ? "bot" : via === "top" ? "top" : "tenant", deskCode: desk?.deskCode, uid: desk?.uid }, tenantId: t.tenantId, summary: `setup confirmed via ${via}${via === "top" ? " (no code needed)" : ""}; first due ${due}` });
   await upsertLead(r, t).catch((e) => console.error("LMMX lead upsert failed", (e as Error).message));
   const c = contactOf(r);
   await sms(`lmmx_active_${t.tenantId}`, phoneOf(t), lmmxText.active({ rentMinor: t.rent.amountMinor, dueDay: t.dueDay, supportPhone: X.SUPPORT_PHONE }));

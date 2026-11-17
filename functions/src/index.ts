@@ -1858,7 +1858,7 @@ export const paystackCallback = onRequest({
 
     if (hash !== expectedHash) {
       console.error("Invalid signature");
-      if (/LMM_|lmm-|LMX_|lmx-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mos Mos webhook arrived with a bad signature");
+      if (/LMM_|lmm-|LMX_|lmx-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mdogo Mdogo webhook arrived with a bad signature");
       res.status(400).json({ error: "Invalid signature" });
       return;
     }

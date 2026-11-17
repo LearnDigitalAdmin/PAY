@@ -3,6 +3,9 @@
 import axios from "axios";
 import * as crypto from "crypto";
 import { dearLine } from "../lmm/dear";
+import { LMM } from "../lmm/config";
+import { newMilestone } from "../lmm/reminders";
+import { lmmText } from "../lmm/sms";
 import { verifyCharge } from "../lmm/settle";
 import { checkSafaricomPhone } from "../phone/safaricom";
 import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "../desk/paystack";
@@ -123,7 +126,7 @@ export async function creditPayment(reference: string, webhookAmount: number): P
     tx.update(pref, { status: "credited", creditedAt: now(), availableOn, paystackFeeMinor: v.fees });
     tx.update(cref, { creditedMinor: FV.increment(p.creditMinor), instalments: FV.increment(1), legReserveCollectedMinor: FV.increment(p.reserveMinor), lastCreditAt: now(), lastAvailableOn: availableOn, status, ...(c.firstCreditAt ? {} : { firstCreditAt: now() }) });
     const leftNow = Math.max(0, c.rentMinor - credited);
-    tx.update(tref, { lastPaymentAt: now(), cur: { creditedMinor: credited, remainingMinor: leftNow, dueDate: c.dueDate } });
+    tx.update(tref, { lastPaymentAt: now(), missedCount: 0, cur: { creditedMinor: credited, remainingMinor: leftNow, dueDate: c.dueDate } });
     ledger(tx, [
       { tenantId: p.tenantId, cycleId: p.cycleId, type: "collect", amountMinor: p.chargeMinor, direction: "in", ref: reference },
       { tenantId: p.tenantId, cycleId: p.cycleId, type: "collection_fee", amountMinor: v.fees, direction: "out", ref: reference },
@@ -138,6 +141,12 @@ export async function creditPayment(reference: string, webhookAmount: number): P
   await audit({ action: "payment_credited", actor: { type: "system" }, tenantId: p.tenantId, summary: `credited ${p.creditMinor / 100} (charge ${p.chargeMinor / 100}) ref ${reference.slice(-8)}` });
   const left = Math.max(0, state.c.rentMinor - state.credited);
   await sms(`lmmx_rcpt_${reference}`, phoneOf(state.t), fitSms(`${dearLine(nameOf(state.t))} we received ${kes(p.creditMinor)} towards your rent via ${LMMX_BRAND}. ${left > 0 ? `Balance ${kes(left)}. Pay by ${shortDate(state.c.payByDate)}.` : "Your rent is fully covered. Your landlord will be paid."}`));
+  // 25 / 50 / 75 / 100 % of the rent: one encouraging SMS per milestone per cycle (100 % is covered by the receipt above, so it is only recorded)
+  const pct = Math.floor((state.credited * 100) / state.c.rentMinor), mile = newMilestone(pct, state.c.milestonesSent ?? []);
+  if (mile) {
+    await col(COL.cycles).doc(state.c.cycleId).update({ milestonesSent: FV.arrayUnion(...LMM.MILESTONES.filter((x) => x <= mile)) });
+    if (mile < 100) await sms(`lmmx_ms_${state.c.cycleId}_${mile}`, phoneOf(state.t), lmmText.milestone({ name: nameOf(state.t), pct: mile, paidMinor: state.credited, leftMinor: left }));
+  }
   // a cycle fully credited by its due date through at least 2 instalments earns the desk a completion bonus (a payable the top desk pays by hand)
   if (left === 0 && state.instalments >= 2 && eatDate(now()) <= state.c.dueDate && state.t.deskCode !== LMMX_TOP_DESK && !state.c.completionBonusPaid) {
     const made = await payableBonus({ deskUid: state.t.deskUid, amountMinor: LMMX.COMPLETION_BONUS_MINOR, note: `Lipa Mdogo Mdogo completion bonus ${state.c.cycleId}`, parts: ["lmmx", "completion", state.c.cycleId] });

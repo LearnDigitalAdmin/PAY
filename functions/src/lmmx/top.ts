@@ -2,12 +2,12 @@
 import * as admin from "firebase-admin";
 import { COL } from "./config";
 import type { AuditRow, LeadRow, TopAuditListIn, TopAuditListOut, TopLeadGetOut, TopLeadsListIn, TopLeadsListOut, TopRevealIn, TopRevealOut, TopStatsOut, TenantStatus } from "./contract";
-import { LEAD_STAGES, maskName } from "./contract";
+import { LEAD_STAGES, LMMX_TOP_DESK, maskName } from "./contract";
 import type { LeadStage } from "./contract";
 import { dec } from "./crypto";
 import { fail } from "./errors";
 import { audit, col, flags, now, verifyAudit } from "./store";
-import { closeTenant, loadTenant, sendSetupOtp, nameOf, phoneOf } from "./tenants";
+import { activateTenant, closeTenant, loadTenant, sendSetupOtp, nameOf, phoneOf } from "./tenants";
 import type { DeskCtx } from "./authz";
 import type { LeadDoc, RecipientDoc, TenantDoc } from "./types";
 
@@ -35,7 +35,10 @@ export async function reviewDecision(top: Top, i: { recipientId: string; decisio
       const t = d.data() as TenantDoc;
       if (!t.needsReview) continue;
       await d.ref.update({ status: "awaiting_confirmation", needsReview: admin.firestore.FieldValue.delete(), setupExpiresAt: now() + 72 * 3_600_000, updatedAt: now() });
-      await sendSetupOtp({ ...t, status: "awaiting_confirmation" }, { ...r, status: "verified" }).catch((e) => console.error("LMMX review resend failed", (e as Error).message));
+      const live = { ...t, status: "awaiting_confirmation" as const }, rv = { ...r, status: "verified" as const };
+      // a tenant the top desk registered needs no code; every other desk's tenant gets its code by SMS now
+      if (t.deskCode === LMMX_TOP_DESK) await activateTenant(live, rv, "top").catch((e) => console.error("LMMX review activation failed", (e as Error).message));
+      else await sendSetupOtp(live, rv).catch((e) => console.error("LMMX review resend failed", (e as Error).message));
     }
   } else {
     await ref.update({ status: "retired" });

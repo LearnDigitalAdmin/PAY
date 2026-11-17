@@ -90,7 +90,8 @@ const Signup: React.FC = () => {
       });
 
       setPortalPreference('tenant');
-      navigate('/tenant');
+      // The ID they just gave is checked quietly against Lipa Mdogo Mdogo; a rent-invoice-only tenant still ends up on /tenant.
+      navigate('/lmmx');
     } catch (err: any) {
       setError(err.message || 'Failed to create account. Please try again.');
     } finally {

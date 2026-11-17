@@ -45,7 +45,17 @@ export const lmmx_desk_confirmSetup = fn("lmmx_desk_confirmSetup", async (r) => 
 export const lmmx_desk_resendOtp = fn("lmmx_desk_resendOtp", async (r) => { await requireEnabled(); return resendSetupOtp(await requireDesk(r), r.data?.tenantId); });
 export const lmmx_desk_listTenants = fn("lmmx_desk_listTenants", async (r) => listTenants(await requireDesk(r), r.data ?? {}));
 export const lmmx_desk_getTenant = fn("lmmx_desk_getTenant", async (r) => getTenantView(await requireDesk(r), r.data?.tenantId));
-export const lmmx_desk_requestChange = fn("lmmx_desk_requestChange", async (r) => { await requireEnabled(); return requestChange(await requireDesk(r), bad(r.data)); }, { timeoutSeconds: 120 });
+export const lmmx_desk_requestChange = fn("lmmx_desk_requestChange", async (r) => {
+  await requireEnabled();
+  const desk = await requireDesk(r), d = bad(r.data);
+  if (desk.isTop) {
+    // COG-0000 needs no tenant code and no cooling-off: the change is applied now (recent sign-in and an audited reason are still required).
+    const t = await requireTop(r, "Top desk change from the desk screen");
+    await topUpdate(t, { tenantId: d.tenantId, ...(d.kind === "rent" ? { rentMinor: d.rentMinor } : { recipient: d.recipient }), reason: t.reason });
+    return { changeId: `TOP${Date.now().toString(36).toUpperCase()}`, status: "applied" as const, requiresTenantOtp: false };
+  }
+  return requestChange(desk, d);
+}, { timeoutSeconds: 120 });
 export const lmmx_desk_confirmChange = fn("lmmx_desk_confirmChange", async (r) => { const desk = await requireDesk(r); return confirmChange({ changeId: String(r.data?.changeId ?? ""), otp: String(r.data?.otp ?? ""), via: "desk", desk }); });
 export const lmmx_desk_cancelChange = fn("lmmx_desk_cancelChange", async (r) => { await cancelChangeByDesk(await requireDesk(r), r.data?.changeId); return { ok: true }; });
 export const lmmx_desk_earnings = fn("lmmx_desk_earnings", async (r): Promise<DeskEarningsOut> => {

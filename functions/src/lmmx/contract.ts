@@ -12,7 +12,7 @@
  * Dates are Africa/Nairobi calendar days "YYYY-MM-DD". User-facing brand: "Lipa Mdogo Mdogo". Internal names keep "lmm"/"lmmx".
  */
 
-export const LMMX_CONTRACT_VERSION = 1;
+export const LMMX_CONTRACT_VERSION = 2;
 export const LMMX_REGION = "africa-south1";           // every lmmx_* callable
 export const LMMX_BRAND = "Lipa Mdogo Mdogo";
 export const LMMX_TOP_DESK = "COG-0000";
@@ -295,7 +295,8 @@ export interface DeskCheckRecipientIn { channel: Channel; bankCode?: string; acc
 /** Only the account number and booleans. Never another recipient's name, contact, tenants, desks or counts. */
 export interface DeskCheckRecipientOut { exists: boolean; accountNumber: string; nameMatchesEntered: boolean; reusable: boolean; reuseToken?: string }
 export interface DeskCreateTenantIn { profile: TenantProfileInput; rentMinor: number; dueDay?: number; frequency?: Frequency; recipient: RecipientInput; idempotencyKey: string }
-export interface DeskCreateTenantOut { tenantId: string; status: "awaiting_confirmation" | "draft"; nameMatch: NameMatch; needsReview: boolean; expiresAt: number; resolvedNameMasked: string }
+/** COG-0000 needs no tenant code: a tenant it creates comes back "active" at once (no OTP is sent). Everyone else gets "awaiting_confirmation" (or "draft" while a recipient is under review). */
+export interface DeskCreateTenantOut { tenantId: string; status: "awaiting_confirmation" | "draft" | "active"; nameMatch: NameMatch; needsReview: boolean; expiresAt: number; resolvedNameMasked: string }
 export interface DeskSetupStatusIn { tenantId: string }
 /** What the desk screen shows: "Waiting for verification" (awaiting, with a countdown) or an OTP box; active when done. */
 export interface DeskSetupStatusOut { tenantId: string; status: TenantStatus; otpExpiresAt?: number; attemptsLeft?: number; locked?: boolean; resendsLeft?: number; needsReview?: boolean }

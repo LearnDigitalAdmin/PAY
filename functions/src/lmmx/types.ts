@@ -7,7 +7,7 @@ export interface TenantDoc {
   email?: string; unitNumber?: string; propertyName?: string;
   consentAt?: number; landlordNoticeAt?: number; rent: { amountMinor: number; effectiveFromDue?: string }; dueDay: number; dueDayChangedCycleId?: string;
   frequency: Frequency; suggestedCreditMinor: number; activeRecipientId: string; pendingRecipientId?: string;
-  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string;
+  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string; lastSmsAt?: number; missedCount?: number;
   cur?: { creditedMinor: number; remainingMinor: number; dueDate: string };
 }
 export interface RecipientDoc {
@@ -21,7 +21,7 @@ export interface RecipientDoc {
 export interface CycleDoc {
   cycleId: string; tenantId: string; dueDate: string; payByDate: string; rentMinor: number; status: CycleStatus;
   creditedMinor: number; settledMinor: number; inflightMinor: number; instalments: number; firstCreditAt?: number; lastCreditAt?: number; lastAvailableOn?: string;
-  legRentMinor: number; legReserveCollectedMinor: number; settlementCount: number; createdAt: number; completionBonusPaid?: boolean; warned?: boolean; payByWarned?: boolean;
+  legRentMinor: number; legReserveCollectedMinor: number; settlementCount: number; createdAt: number; completionBonusPaid?: boolean; warned?: boolean; payByWarned?: boolean; milestonesSent?: number[];
 }
 export interface PaymentDoc {
   reference: string; paymentId: string; tenantId: string; cycleId: string; quoteId: string; phone: string; status: "initiating" | "pending" | "credited" | "failed" | "rejected";
@@ -46,5 +46,5 @@ export interface LeadDoc {
 }
 export interface PayRecordDoc {
   tenantId: string; recipientId: string; channel: Channel; accountNumber: string; rentMinor: number; dueDay: number; frequency: Frequency; setupCompletedAt: number; setupDeskCode: string;
-  setupOtpVia: "desk" | "bot" | "tenant"; termsHash: string; termsSig: string; version: number;
+  setupOtpVia: "desk" | "bot" | "tenant" | "top"; termsHash: string; termsSig: string; version: number;
 }

@@ -33,12 +33,12 @@ const asId = (v: unknown, label: string): string => {
   return s;
 };
 
-/** Lipa Mos Mos is offered only when the landlord has a sealed, active recipient and the feature has not been paused. (Firestore can only pause it.) */
+/** Lipa Mdogo Mdogo is offered only when the landlord has a sealed, active recipient and the feature has not been paused. (Firestore can only pause it.) */
 export async function lmmAvailable(agentId: string): Promise<{ ok: true; kind: PayoutKind | null } | { ok: false; reason: string }> {
   const [cfg, rec] = await Promise.all([db().collection("lmm_config").doc("global").get(), db().collection("lmm_recipients").doc(agentId).get()]);
-  if (cfg.exists && cfg.data()?.enabled === false) return { ok: false, reason: "Lipa Mos Mos is paused right now. Please try again later." };
+  if (cfg.exists && cfg.data()?.enabled === false) return { ok: false, reason: "Lipa Mdogo Mdogo is paused right now. Please try again later." };
   const r = rec.data();
-  if (!r || r.status !== "active") return { ok: false, reason: "This landlord has not enabled Lipa Mos Mos yet." };
+  if (!r || r.status !== "active") return { ok: false, reason: "This landlord has not enabled Lipa Mdogo Mdogo yet." };
   const k = String(r.type ?? "");
   return { ok: true, kind: k === "mobile_money" || k === "mobile_money_business" || k === "kepss" ? k : null };   // only used to word what the tenant is told; the money path re-verifies the recipient
 }

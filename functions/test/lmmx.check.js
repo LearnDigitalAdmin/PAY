@@ -306,6 +306,77 @@ ok("tenant sign-in: the verified phone AND the linked uid must match; the link n
   await rej(tenants.tenantLink(T("U2", "0712345678"), "+254712345678", { idType: "national_id", idNumber: "12345678" }, "1.1.1.1"), "LMMX_E_NOT_FOUND");
 });
 
+
+// ------------------------------------------------------------------------------------------------------------- top desk needs no codes
+const sweep = L("sweep"), topM = L("top");
+const seedTop = () => db.seed("desk_agents/T1", { agentId: "T1", agentCode: "COG-0000", status: "active", rank: "internal", phone: "+254700000000" });
+ok("COG-0000 creates a tenant with NO code: active at once, no LMM code SMS, landlord and tenant still welcomed", async () => {
+  world(); seedTop(); const r = await tenants.createTenant(TOP, input());
+  assert.strictEqual(r.status, "active"); const t = db.store.get(`lmm_tenants/${r.tenantId}`); assert.strictEqual(t.status, "active");
+  assert.ok(!sms.some((s) => /LMM\d{4}/.test(s.msg)), "no code was texted"); assert.strictEqual(db.store.get(`lmm_pay_records/${r.tenantId}`).setupOtpVia, "top");
+  assert.ok(tenantSms().some((m) => /is ready/.test(m))); assert.ok(sms.some((x) => x.mobile === "254722111222" && /plot\.samuhia\.co\.ke/.test(x.msg)));
+  assert.strictEqual(db.list("lmmx_cycles").length, 1);
+});
+ok("a regular desk still needs the tenant's code (nothing relaxed for them)", async () => {
+  world(); const r = await tenants.createTenant(DESK, input()); assert.strictEqual(r.status, "awaiting_confirmation"); assert.ok(tenantSms().some((m) => /LMM\d{4}/.test(m)));
+});
+ok("COG-0000 changes rent and the payout account from the desk screen at once: no code, no cooling-off, tenant and landlords told", async () => {
+  world(); seedTop(); const s = await activate();
+  const rent = await idx.lmmx_desk_requestChange.run({ ...topReq(), data: { tenantId: s.id, kind: "rent", rentMinor: 1_200_000, idempotencyKey: "top-key-0001" } });
+  assert.deepStrictEqual([rent.status, rent.requiresTenantOtp], ["applied", false]); assert.strictEqual(db.read(`lmm_tenants/${s.id}`).rent.amountMinor, 1_200_000);
+  sms.length = 0;
+  const acct = await idx.lmmx_desk_requestChange.run({ ...topReq(), data: { tenantId: s.id, kind: "recipient", recipient: newAcct(), idempotencyKey: "top-key-0002" } });
+  assert.strictEqual(acct.status, "applied"); const t = db.store.get(`lmm_tenants/${s.id}`); assert.strictEqual(db.store.get(`lmmx_recipients/${t.activeRecipientId}`).accountNumber, "777888");
+  assert.ok(!sms.some((x) => /LMM\d{4}|LMC\d{4}/.test(x.msg)), "no codes were texted"); assert.ok(sms.some((x) => x.mobile === "254722111222") && sms.some((x) => x.mobile === "254722333444"));
+  assert.ok(db.list("lmmx_audit").some((p) => db.store.get(p).action === "top_update"));
+  assert.strictEqual(db.list("lmmx_changes").length, 0, "no pending change was created");
+});
+ok("a regular desk is NOT let through the top path", async () => {
+  world(); const s = await activate(); db.seed("desk_agents/D1", { agentId: "D1", agentCode: "COG-0012", status: "active", rank: "clerk", phone: "+254700000012" });
+  const r = await idx.lmmx_desk_requestChange.run({ auth: { uid: "D1", token: {} }, rawRequest: { headers: {} }, data: { tenantId: s.id, kind: "rent", rentMinor: 1_200_000, idempotencyKey: "reg-key-0001" } });
+  assert.strictEqual(r.status, "awaiting_tenant_otp"); assert.strictEqual(db.read(`lmm_tenants/${s.id}`).rent.amountMinor, 1_000_000);
+});
+ok("a top-desk tenant held for review is activated without a code when COG-0000 approves the landlord account", async () => {
+  world(); seedTop(); const r = await tenants.createTenant(TOP, input({ recipient: { channel: "bank", bankCode: "063", accountNumber: "0123456789", accountName: "Totally Different Person", contactName: "Some One", contactPhone: "0722111222" } }));
+  assert.strictEqual(r.status, "draft"); assert.ok(r.needsReview); const rid = db.store.get(`lmm_tenants/${r.tenantId}`).activeRecipientId; sms.length = 0;
+  await topM.reviewDecision(TOP, { recipientId: rid, decision: "approve" });
+  assert.strictEqual(db.read(`lmm_tenants/${r.tenantId}`).status, "active"); assert.ok(!sms.some((x) => /LMM\d{4}/.test(x.msg)), "no code");
+});
+
+// ------------------------------------------------------------------------------------------------------------- reminders and milestones (parity with legacy)
+const rtenant = (o = {}) => ({ tenantId: "LMTREMINDER1", nameEnc: cr.enc("Mary Wanjiru"), phoneEnc: cr.enc("+254712345678"), status: "active", frequency: "weekly", createdAt: Date.now() - 20 * 86_400_000, lastPaymentAt: 0, lastSmsAt: 0, missedCount: 0, ...o });
+const rcycle = (o = {}) => ({ cycleId: "LMTREMINDER1_202612", dueDate: "2026-12-05", payByDate: "2026-12-03", rentMinor: 1_000_000, creditedMinor: 0, settledMinor: 0, status: "open", ...o });
+const kinds = (t, c, today, nowMs = Date.now()) => sweep.planReminders(t, c, today, nowMs).map((r) => r.kind);
+ok("reminders: 5-day warning, pay-by day, due day, overdue every 3 days, nothing once the rent is covered", () => {
+  assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-11-30"), ["warn"]); assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-12-03"), ["warn", "payby"]);
+  assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-12-05"), ["due"]); assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-12-09"), ["overdue"]);
+  assert.deepStrictEqual(kinds(rtenant(), rcycle({ creditedMinor: 1_000_000, status: "funded" }), "2026-12-03"), []);
+  const k1 = sweep.planReminders(rtenant(), rcycle(), "2026-12-09", 0)[0].key, k2 = sweep.planReminders(rtenant(), rcycle(), "2026-12-10", 0)[0].key, k3 = sweep.planReminders(rtenant(), rcycle(), "2026-12-12", 0)[0].key;
+  assert.strictEqual(k1, k2); assert.notStrictEqual(k1, k3);
+});
+ok("missed-instalment reminder follows the legacy rules: after the plan's quiet period, not within 3 days of another SMS, at most 3, never in the last week", () => {
+  const far = "2026-11-10"; const now = Date.parse("2026-11-10T08:00:00Z");
+  assert.deepStrictEqual(kinds(rtenant(), rcycle(), far, now), ["missed"]);
+  assert.deepStrictEqual(kinds(rtenant({ lastSmsAt: now - 86_400_000 }), rcycle(), far, now), [], "an SMS went out yesterday");
+  assert.deepStrictEqual(kinds(rtenant({ missedCount: 3 }), rcycle(), far, now), [], "3 already sent");
+  assert.deepStrictEqual(kinds(rtenant({ lastPaymentAt: now - 86_400_000 }), rcycle(), far, now), [], "paid yesterday");
+  assert.deepStrictEqual(kinds(rtenant({ status: "paused" }), rcycle(), far, now), []);
+  assert.ok(!kinds(rtenant(), rcycle(), "2026-12-02", Date.parse("2026-12-02T08:00:00Z")).includes("missed"), "the last-week warnings take over");
+  assert.ok(sweep.planReminders(rtenant(), rcycle(), far, now)[0].text.includes("Lipa Mdogo Mdogo"));
+});
+ok("milestones: one SMS each at 25/50/75 of the rent per cycle, 100 only recorded; a payment resets the missed count", async () => {
+  world(); const s = await activate(); const t0 = db.store.get(`lmm_tenants/${s.id}`); t0.missedCount = 2;
+  await payAndCredit(s.id, 250_000); await new Promise((r) => setTimeout(r, 30));
+  assert.ok(tenantSms().some((m) => /25%/.test(m)), "25% message"); assert.strictEqual(db.read(`lmm_tenants/${s.id}`).missedCount, 0);
+  const n25 = tenantSms().filter((m) => /paid 25%/.test(m)).length; await payAndCredit(s.id, 10_000);
+  assert.strictEqual(tenantSms().filter((m) => /paid 25%/.test(m)).length, n25, "not repeated");
+  await payAndCredit(s.id, 500_000); assert.ok(tenantSms().some((m) => /paid 75%/.test(m)), "75% message (760,000 of 1,000,000 is past 75%)");
+  const cy = db.list("lmmx_cycles").map((p) => db.store.get(p))[0]; assert.ok(cy.milestonesSent.includes(25) && cy.milestonesSent.includes(50));
+});
+ok("no user-facing 'Lipa Mos Mos' is left in the legacy messages", () => {
+  const fs = require("fs"); for (const f of ["lmm/plan.js", "lmm/sms.js", "lmm/index.js", "lmm/settle.js"]) { const src = fs.readFileSync(path.join(__dirname, "..", "lib", f), "utf8"); assert.ok(!/["`'][^"`'\n]*Lipa Mos Mos[^"`'\n]*["`']/.test(src.replace(/\/\/.*$/gm, "")), f); }
+});
+
 // ------------------------------------------------------------------------------------------------------------- audit
 ok("the audit chain verifies, and a tampered row is detected", async () => {
   world(); await activate(); await new Promise((r) => setTimeout(r, 20));

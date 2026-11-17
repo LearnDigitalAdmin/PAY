@@ -1,9 +1,11 @@
 import axios from "axios";
 import * as admin from "firebase-admin";
 import { dearLine } from "../lmm/dear";
+import { missedReminder } from "../lmm/reminders";
+import { lmmText } from "../lmm/sms";
 import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "../desk/paystack";
 import { COL, X } from "./config";
-import { LMMX, LMMX_BRAND, daysUntil, eatDate, fitSms, kes, nextDueDate, shortDate } from "./contract";
+import { LMMX, LMMX_BOT_LINK, LMMX_BRAND, daysUntil, eatDate, fitSms, kes, nextDueDate, shortDate } from "./contract";
 import { alert, audit, col, db, flags, now } from "./store";
 import { applyDueChanges, expireChanges } from "./changes";
 import { closeTenant, nameOf, phoneOf, sms } from "./tenants";
@@ -54,16 +56,34 @@ export async function dailySweep(): Promise<void> {
   }
 }
 
-async function remind(t: TenantDoc, c: CycleDoc, today: string): Promise<void> {
+export interface PlannedReminder { kind: "warn" | "payby" | "due" | "overdue" | "missed"; key: string; text: string }
+/** The reminders a tenant should get for this cycle today. Pure (no sending), so it is easy to test. Mirrors the legacy rhythm:
+ *  a 5-day warning, a pay-by-date nudge, a due-day note, overdue nudges every 3 days, and (earlier in the cycle) a missed-instalment
+ *  reminder after the plan's own quiet period, never closer than 3 days to any earlier SMS and at most 3 per stretch of silence. */
+export function planReminders(t: TenantDoc, c: CycleDoc, today: string, nowMs: number): PlannedReminder[] {
   const left = remainingOf(c), n = daysUntil(c.dueDate, today);
-  const who = dearLine(nameOf(t));
-  if (n <= LMMX.WARN_DAYS_BEFORE_DUE && n > 0 && c.status !== "funded") {
-    await sms(`lmmx_warn_${c.cycleId}`, phoneOf(t), fitSms(`${who} your ${LMMX_BRAND} rent is due in ${n} day${n === 1 ? "" : "s"} (${shortDate(c.dueDate)}). Balance ${kes(left)}. Pay by ${shortDate(c.payByDate)} so your landlord gets it all on time.`));
-  } else if (n === 0) {
-    await sms(`lmmx_due_${c.cycleId}`, phoneOf(t), fitSms(`${who} your ${LMMX_BRAND} rent is due today. Balance ${kes(left)}. Your landlord is paid what is in today; pay the rest as soon as you can.`));
-  } else if (n < 0) {
-    const bucket = Math.floor(-n / 3);
-    await sms(`lmmx_over_${c.cycleId}_${bucket}`, phoneOf(t), fitSms(`${who} your ${LMMX_BRAND} rent balance of ${kes(left)} is overdue. Pay any amount now: wa.me/254101716473`));
+  if (left <= 0 || c.status === "settled") return [];
+  const name = nameOf(t), who = dearLine(name), out: PlannedReminder[] = [];
+  if (n > 0 && n <= LMMX.WARN_DAYS_BEFORE_DUE && c.status !== "funded") {
+    out.push({ kind: "warn", key: `lmmx_warn_${c.cycleId}`, text: fitSms(`${who} your ${LMMX_BRAND} rent is due in ${n} day${n === 1 ? "" : "s"} (${shortDate(c.dueDate)}). Balance ${kes(left)}. Pay by ${shortDate(c.payByDate)} so your landlord gets it all on time.`) });
+  }
+  if (n > 0 && today === c.payByDate) out.push({ kind: "payby", key: `lmmx_payby_${c.cycleId}`, text: fitSms(`${who} today is the last day to pay your ${LMMX_BRAND} rent in time. Balance ${kes(left)}. Pay now: ${LMMX_BOT_LINK}`) });
+  if (n === 0) out.push({ kind: "due", key: `lmmx_due_${c.cycleId}`, text: fitSms(`${who} your ${LMMX_BRAND} rent is due today. Balance ${kes(left)}. Your landlord is paid what is in today; pay the rest as soon as you can.`) });
+  if (n < 0) out.push({ kind: "overdue", key: `lmmx_over_${c.cycleId}_${Math.floor(-n / 3)}`, text: fitSms(`${who} your ${LMMX_BRAND} rent balance of ${kes(left)} is overdue. Pay any amount now: ${LMMX_BOT_LINK}`) });
+  if (t.status === "active" && n > LMMX.WARN_DAYS_BEFORE_DUE) {
+    const m = missedReminder({ frequency: t.frequency, status: "active", remainingMinor: left, createdAt: t.createdAt, lastPaymentAt: t.lastPaymentAt ?? 0, lastSmsAt: t.lastSmsAt ?? 0, missedCount: t.missedCount ?? 0 }, nowMs);
+    if (m.send) out.push({ kind: "missed", key: `lmmx_missed_${t.tenantId}_${Math.floor(nowMs / 86_400_000)}`, text: lmmText.missed({ name, days: m.days, balanceMinor: left }) });
+  }
+  return out;
+}
+
+async function remind(t: TenantDoc, c: CycleDoc, today: string): Promise<void> {
+  for (const r of planReminders(t, c, today, now())) {
+    const sent = await sms(r.key, phoneOf(t), r.text);
+    if (sent) {
+      await col(COL.tenants).doc(t.tenantId).update({ lastSmsAt: now(), ...(r.kind === "missed" ? { missedCount: (t.missedCount ?? 0) + 1 } : {}) });
+      t.lastSmsAt = now(); if (r.kind === "missed") t.missedCount = (t.missedCount ?? 0) + 1;
+    }
   }
 }
 

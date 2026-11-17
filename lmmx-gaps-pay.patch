@@ -1,0 +1,410 @@
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index 2398566..8fc5ecb 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -1858,7 +1858,7 @@ export const paystackCallback = onRequest({
+ 
+     if (hash !== expectedHash) {
+       console.error("Invalid signature");
+-      if (/LMM_|lmm-|LMX_|lmx-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mos Mos webhook arrived with a bad signature");
++      if (/LMM_|lmm-|LMX_|lmx-/.test(body)) await lmmAlert("BAD_SIGNATURE", "a Lipa Mdogo Mdogo webhook arrived with a bad signature");
+       res.status(400).json({ error: "Invalid signature" });
+       return;
+     }
+diff --git a/functions/src/lmm/plan.ts b/functions/src/lmm/plan.ts
+index 921c181..7abbd5e 100644
+--- a/functions/src/lmm/plan.ts
++++ b/functions/src/lmm/plan.ts
+@@ -33,12 +33,12 @@ const asId = (v: unknown, label: string): string => {
+   return s;
+ };
+ 
+-/** Lipa Mos Mos is offered only when the landlord has a sealed, active recipient and the feature has not been paused. (Firestore can only pause it.) */
++/** Lipa Mdogo Mdogo is offered only when the landlord has a sealed, active recipient and the feature has not been paused. (Firestore can only pause it.) */
+ export async function lmmAvailable(agentId: string): Promise<{ ok: true; kind: PayoutKind | null } | { ok: false; reason: string }> {
+   const [cfg, rec] = await Promise.all([db().collection("lmm_config").doc("global").get(), db().collection("lmm_recipients").doc(agentId).get()]);
+-  if (cfg.exists && cfg.data()?.enabled === false) return { ok: false, reason: "Lipa Mos Mos is paused right now. Please try again later." };
++  if (cfg.exists && cfg.data()?.enabled === false) return { ok: false, reason: "Lipa Mdogo Mdogo is paused right now. Please try again later." };
+   const r = rec.data();
+-  if (!r || r.status !== "active") return { ok: false, reason: "This landlord has not enabled Lipa Mos Mos yet." };
++  if (!r || r.status !== "active") return { ok: false, reason: "This landlord has not enabled Lipa Mdogo Mdogo yet." };
+   const k = String(r.type ?? "");
+   return { ok: true, kind: k === "mobile_money" || k === "mobile_money_business" || k === "kepss" ? k : null };   // only used to word what the tenant is told; the money path re-verifies the recipient
+ }
+diff --git a/functions/src/lmmx/contract.ts b/functions/src/lmmx/contract.ts
+index 1cbf8b4..60c5029 100644
+--- a/functions/src/lmmx/contract.ts
++++ b/functions/src/lmmx/contract.ts
+@@ -12,7 +12,7 @@
+  * Dates are Africa/Nairobi calendar days "YYYY-MM-DD". User-facing brand: "Lipa Mdogo Mdogo". Internal names keep "lmm"/"lmmx".
+  */
+ 
+-export const LMMX_CONTRACT_VERSION = 1;
++export const LMMX_CONTRACT_VERSION = 2;
+ export const LMMX_REGION = "africa-south1";           // every lmmx_* callable
+ export const LMMX_BRAND = "Lipa Mdogo Mdogo";
+ export const LMMX_TOP_DESK = "COG-0000";
+@@ -295,7 +295,8 @@ export interface DeskCheckRecipientIn { channel: Channel; bankCode?: string; acc
+ /** Only the account number and booleans. Never another recipient's name, contact, tenants, desks or counts. */
+ export interface DeskCheckRecipientOut { exists: boolean; accountNumber: string; nameMatchesEntered: boolean; reusable: boolean; reuseToken?: string }
+ export interface DeskCreateTenantIn { profile: TenantProfileInput; rentMinor: number; dueDay?: number; frequency?: Frequency; recipient: RecipientInput; idempotencyKey: string }
+-export interface DeskCreateTenantOut { tenantId: string; status: "awaiting_confirmation" | "draft"; nameMatch: NameMatch; needsReview: boolean; expiresAt: number; resolvedNameMasked: string }
++/** COG-0000 needs no tenant code: a tenant it creates comes back "active" at once (no OTP is sent). Everyone else gets "awaiting_confirmation" (or "draft" while a recipient is under review). */
++export interface DeskCreateTenantOut { tenantId: string; status: "awaiting_confirmation" | "draft" | "active"; nameMatch: NameMatch; needsReview: boolean; expiresAt: number; resolvedNameMasked: string }
+ export interface DeskSetupStatusIn { tenantId: string }
+ /** What the desk screen shows: "Waiting for verification" (awaiting, with a countdown) or an OTP box; active when done. */
+ export interface DeskSetupStatusOut { tenantId: string; status: TenantStatus; otpExpiresAt?: number; attemptsLeft?: number; locked?: boolean; resendsLeft?: number; needsReview?: boolean }
+diff --git a/functions/src/lmmx/index.ts b/functions/src/lmmx/index.ts
+index 4fab0ec..d5ef601 100644
+--- a/functions/src/lmmx/index.ts
++++ b/functions/src/lmmx/index.ts
+@@ -45,7 +45,17 @@ export const lmmx_desk_confirmSetup = fn("lmmx_desk_confirmSetup", async (r) =>
+ export const lmmx_desk_resendOtp = fn("lmmx_desk_resendOtp", async (r) => { await requireEnabled(); return resendSetupOtp(await requireDesk(r), r.data?.tenantId); });
+ export const lmmx_desk_listTenants = fn("lmmx_desk_listTenants", async (r) => listTenants(await requireDesk(r), r.data ?? {}));
+ export const lmmx_desk_getTenant = fn("lmmx_desk_getTenant", async (r) => getTenantView(await requireDesk(r), r.data?.tenantId));
+-export const lmmx_desk_requestChange = fn("lmmx_desk_requestChange", async (r) => { await requireEnabled(); return requestChange(await requireDesk(r), bad(r.data)); }, { timeoutSeconds: 120 });
++export const lmmx_desk_requestChange = fn("lmmx_desk_requestChange", async (r) => {
++  await requireEnabled();
++  const desk = await requireDesk(r), d = bad(r.data);
++  if (desk.isTop) {
++    // COG-0000 needs no tenant code and no cooling-off: the change is applied now (recent sign-in and an audited reason are still required).
++    const t = await requireTop(r, "Top desk change from the desk screen");
++    await topUpdate(t, { tenantId: d.tenantId, ...(d.kind === "rent" ? { rentMinor: d.rentMinor } : { recipient: d.recipient }), reason: t.reason });
++    return { changeId: `TOP${Date.now().toString(36).toUpperCase()}`, status: "applied" as const, requiresTenantOtp: false };
++  }
++  return requestChange(desk, d);
++}, { timeoutSeconds: 120 });
+ export const lmmx_desk_confirmChange = fn("lmmx_desk_confirmChange", async (r) => { const desk = await requireDesk(r); return confirmChange({ changeId: String(r.data?.changeId ?? ""), otp: String(r.data?.otp ?? ""), via: "desk", desk }); });
+ export const lmmx_desk_cancelChange = fn("lmmx_desk_cancelChange", async (r) => { await cancelChangeByDesk(await requireDesk(r), r.data?.changeId); return { ok: true }; });
+ export const lmmx_desk_earnings = fn("lmmx_desk_earnings", async (r): Promise<DeskEarningsOut> => {
+diff --git a/functions/src/lmmx/payments.ts b/functions/src/lmmx/payments.ts
+index bee9fb9..8e4b1cd 100644
+--- a/functions/src/lmmx/payments.ts
++++ b/functions/src/lmmx/payments.ts
+@@ -3,6 +3,9 @@
+ import axios from "axios";
+ import * as crypto from "crypto";
+ import { dearLine } from "../lmm/dear";
++import { LMM } from "../lmm/config";
++import { newMilestone } from "../lmm/reminders";
++import { lmmText } from "../lmm/sms";
+ import { verifyCharge } from "../lmm/settle";
+ import { checkSafaricomPhone } from "../phone/safaricom";
+ import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "../desk/paystack";
+@@ -123,7 +126,7 @@ export async function creditPayment(reference: string, webhookAmount: number): P
+     tx.update(pref, { status: "credited", creditedAt: now(), availableOn, paystackFeeMinor: v.fees });
+     tx.update(cref, { creditedMinor: FV.increment(p.creditMinor), instalments: FV.increment(1), legReserveCollectedMinor: FV.increment(p.reserveMinor), lastCreditAt: now(), lastAvailableOn: availableOn, status, ...(c.firstCreditAt ? {} : { firstCreditAt: now() }) });
+     const leftNow = Math.max(0, c.rentMinor - credited);
+-    tx.update(tref, { lastPaymentAt: now(), cur: { creditedMinor: credited, remainingMinor: leftNow, dueDate: c.dueDate } });
++    tx.update(tref, { lastPaymentAt: now(), missedCount: 0, cur: { creditedMinor: credited, remainingMinor: leftNow, dueDate: c.dueDate } });
+     ledger(tx, [
+       { tenantId: p.tenantId, cycleId: p.cycleId, type: "collect", amountMinor: p.chargeMinor, direction: "in", ref: reference },
+       { tenantId: p.tenantId, cycleId: p.cycleId, type: "collection_fee", amountMinor: v.fees, direction: "out", ref: reference },
+@@ -138,6 +141,12 @@ export async function creditPayment(reference: string, webhookAmount: number): P
+   await audit({ action: "payment_credited", actor: { type: "system" }, tenantId: p.tenantId, summary: `credited ${p.creditMinor / 100} (charge ${p.chargeMinor / 100}) ref ${reference.slice(-8)}` });
+   const left = Math.max(0, state.c.rentMinor - state.credited);
+   await sms(`lmmx_rcpt_${reference}`, phoneOf(state.t), fitSms(`${dearLine(nameOf(state.t))} we received ${kes(p.creditMinor)} towards your rent via ${LMMX_BRAND}. ${left > 0 ? `Balance ${kes(left)}. Pay by ${shortDate(state.c.payByDate)}.` : "Your rent is fully covered. Your landlord will be paid."}`));
++  // 25 / 50 / 75 / 100 % of the rent: one encouraging SMS per milestone per cycle (100 % is covered by the receipt above, so it is only recorded)
++  const pct = Math.floor((state.credited * 100) / state.c.rentMinor), mile = newMilestone(pct, state.c.milestonesSent ?? []);
++  if (mile) {
++    await col(COL.cycles).doc(state.c.cycleId).update({ milestonesSent: FV.arrayUnion(...LMM.MILESTONES.filter((x) => x <= mile)) });
++    if (mile < 100) await sms(`lmmx_ms_${state.c.cycleId}_${mile}`, phoneOf(state.t), lmmText.milestone({ name: nameOf(state.t), pct: mile, paidMinor: state.credited, leftMinor: left }));
++  }
+   // a cycle fully credited by its due date through at least 2 instalments earns the desk a completion bonus (a payable the top desk pays by hand)
+   if (left === 0 && state.instalments >= 2 && eatDate(now()) <= state.c.dueDate && state.t.deskCode !== LMMX_TOP_DESK && !state.c.completionBonusPaid) {
+     const made = await payableBonus({ deskUid: state.t.deskUid, amountMinor: LMMX.COMPLETION_BONUS_MINOR, note: `Lipa Mdogo Mdogo completion bonus ${state.c.cycleId}`, parts: ["lmmx", "completion", state.c.cycleId] });
+diff --git a/functions/src/lmmx/sweep.ts b/functions/src/lmmx/sweep.ts
+index 8ae869f..a095523 100644
+--- a/functions/src/lmmx/sweep.ts
++++ b/functions/src/lmmx/sweep.ts
+@@ -1,9 +1,11 @@
+ import axios from "axios";
+ import * as admin from "firebase-admin";
+ import { dearLine } from "../lmm/dear";
++import { missedReminder } from "../lmm/reminders";
++import { lmmText } from "../lmm/sms";
+ import { PAYSTACK_API_BASE, PAYSTACK_SECRET_KEY } from "../desk/paystack";
+ import { COL, X } from "./config";
+-import { LMMX, LMMX_BRAND, daysUntil, eatDate, fitSms, kes, nextDueDate, shortDate } from "./contract";
++import { LMMX, LMMX_BOT_LINK, LMMX_BRAND, daysUntil, eatDate, fitSms, kes, nextDueDate, shortDate } from "./contract";
+ import { alert, audit, col, db, flags, now } from "./store";
+ import { applyDueChanges, expireChanges } from "./changes";
+ import { closeTenant, nameOf, phoneOf, sms } from "./tenants";
+@@ -54,16 +56,34 @@ export async function dailySweep(): Promise<void> {
+   }
+ }
+ 
+-async function remind(t: TenantDoc, c: CycleDoc, today: string): Promise<void> {
++export interface PlannedReminder { kind: "warn" | "payby" | "due" | "overdue" | "missed"; key: string; text: string }
++/** The reminders a tenant should get for this cycle today. Pure (no sending), so it is easy to test. Mirrors the legacy rhythm:
++ *  a 5-day warning, a pay-by-date nudge, a due-day note, overdue nudges every 3 days, and (earlier in the cycle) a missed-instalment
++ *  reminder after the plan's own quiet period, never closer than 3 days to any earlier SMS and at most 3 per stretch of silence. */
++export function planReminders(t: TenantDoc, c: CycleDoc, today: string, nowMs: number): PlannedReminder[] {
+   const left = remainingOf(c), n = daysUntil(c.dueDate, today);
+-  const who = dearLine(nameOf(t));
+-  if (n <= LMMX.WARN_DAYS_BEFORE_DUE && n > 0 && c.status !== "funded") {
+-    await sms(`lmmx_warn_${c.cycleId}`, phoneOf(t), fitSms(`${who} your ${LMMX_BRAND} rent is due in ${n} day${n === 1 ? "" : "s"} (${shortDate(c.dueDate)}). Balance ${kes(left)}. Pay by ${shortDate(c.payByDate)} so your landlord gets it all on time.`));
+-  } else if (n === 0) {
+-    await sms(`lmmx_due_${c.cycleId}`, phoneOf(t), fitSms(`${who} your ${LMMX_BRAND} rent is due today. Balance ${kes(left)}. Your landlord is paid what is in today; pay the rest as soon as you can.`));
+-  } else if (n < 0) {
+-    const bucket = Math.floor(-n / 3);
+-    await sms(`lmmx_over_${c.cycleId}_${bucket}`, phoneOf(t), fitSms(`${who} your ${LMMX_BRAND} rent balance of ${kes(left)} is overdue. Pay any amount now: wa.me/254101716473`));
++  if (left <= 0 || c.status === "settled") return [];
++  const name = nameOf(t), who = dearLine(name), out: PlannedReminder[] = [];
++  if (n > 0 && n <= LMMX.WARN_DAYS_BEFORE_DUE && c.status !== "funded") {
++    out.push({ kind: "warn", key: `lmmx_warn_${c.cycleId}`, text: fitSms(`${who} your ${LMMX_BRAND} rent is due in ${n} day${n === 1 ? "" : "s"} (${shortDate(c.dueDate)}). Balance ${kes(left)}. Pay by ${shortDate(c.payByDate)} so your landlord gets it all on time.`) });
++  }
++  if (n > 0 && today === c.payByDate) out.push({ kind: "payby", key: `lmmx_payby_${c.cycleId}`, text: fitSms(`${who} today is the last day to pay your ${LMMX_BRAND} rent in time. Balance ${kes(left)}. Pay now: ${LMMX_BOT_LINK}`) });
++  if (n === 0) out.push({ kind: "due", key: `lmmx_due_${c.cycleId}`, text: fitSms(`${who} your ${LMMX_BRAND} rent is due today. Balance ${kes(left)}. Your landlord is paid what is in today; pay the rest as soon as you can.`) });
++  if (n < 0) out.push({ kind: "overdue", key: `lmmx_over_${c.cycleId}_${Math.floor(-n / 3)}`, text: fitSms(`${who} your ${LMMX_BRAND} rent balance of ${kes(left)} is overdue. Pay any amount now: ${LMMX_BOT_LINK}`) });
++  if (t.status === "active" && n > LMMX.WARN_DAYS_BEFORE_DUE) {
++    const m = missedReminder({ frequency: t.frequency, status: "active", remainingMinor: left, createdAt: t.createdAt, lastPaymentAt: t.lastPaymentAt ?? 0, lastSmsAt: t.lastSmsAt ?? 0, missedCount: t.missedCount ?? 0 }, nowMs);
++    if (m.send) out.push({ kind: "missed", key: `lmmx_missed_${t.tenantId}_${Math.floor(nowMs / 86_400_000)}`, text: lmmText.missed({ name, days: m.days, balanceMinor: left }) });
++  }
++  return out;
++}
++
++async function remind(t: TenantDoc, c: CycleDoc, today: string): Promise<void> {
++  for (const r of planReminders(t, c, today, now())) {
++    const sent = await sms(r.key, phoneOf(t), r.text);
++    if (sent) {
++      await col(COL.tenants).doc(t.tenantId).update({ lastSmsAt: now(), ...(r.kind === "missed" ? { missedCount: (t.missedCount ?? 0) + 1 } : {}) });
++      t.lastSmsAt = now(); if (r.kind === "missed") t.missedCount = (t.missedCount ?? 0) + 1;
++    }
+   }
+ }
+ 
+diff --git a/functions/src/lmmx/tenants.ts b/functions/src/lmmx/tenants.ts
+index 9d1aa1a..db48b8c 100644
+--- a/functions/src/lmmx/tenants.ts
++++ b/functions/src/lmmx/tenants.ts
+@@ -80,7 +80,7 @@ export async function createTenant(desk: DeskCtx, i: DeskCreateTenantIn): Promis
+   if (prior?.tenantId) {
+     const t = await loadTenant(prior.tenantId);
+     const r = await loadRecipient(t.activeRecipientId);
+-    return { tenantId: t.tenantId, status: t.status === "draft" ? "draft" : "awaiting_confirmation", nameMatch: r.nameMatch, needsReview: !!t.needsReview, expiresAt: t.setupExpiresAt ?? 0, resolvedNameMasked: r.resolvedNameMasked };
++    return { tenantId: t.tenantId, status: t.status === "draft" ? "draft" : t.status === "active" ? "active" : "awaiting_confirmation", nameMatch: r.nameMatch, needsReview: !!t.needsReview, expiresAt: t.setupExpiresAt ?? 0, resolvedNameMasked: r.resolvedNameMasked };
+   }
+   if (!desk.isTop && !(await rateOk(`new|${desk.uid}`, LMMX.DESK_NEW_TENANTS_PER_DAY, 86_400_000))) return fail("LMMX_E_RATE", "You have reached today's limit for new tenants.");
+ 
+@@ -111,6 +111,11 @@ export async function createTenant(desk: DeskCtx, i: DeskCreateTenantIn): Promis
+   });
+   await audit({ action: "tenant_created", actor: { type: desk.isTop ? "top" : "desk", deskCode: desk.deskCode, uid: desk.uid, ip: desk.ip }, tenantId, summary: `tenant created, rent ${rent / 100}, recipient ${rec.recipientId}${needsReview ? " (needs review)" : ""}` });
+   if (needsReview) return { tenantId, status: "draft", nameMatch: rec.nameMatch, needsReview: true, expiresAt: t.setupExpiresAt!, resolvedNameMasked: rec.resolvedNameMasked };
++  // The top desk needs no tenant code: it is activated now, the same way a confirmed setup is. (The landlord account checks and the first-payout safety window still apply.)
++  if (desk.isTop) {
++    await activateTenant(t, rec, "top", desk);
++    return { tenantId, status: "active", nameMatch: rec.nameMatch, needsReview: false, expiresAt: 0, resolvedNameMasked: rec.resolvedNameMasked };
++  }
+   try { await sendSetupOtp(t, rec); } catch (e) { await closeTenant(t, "setup sms failed"); throw e; }
+   return { tenantId, status: "awaiting_confirmation", nameMatch: rec.nameMatch, needsReview: false, expiresAt: t.setupExpiresAt!, resolvedNameMasked: rec.resolvedNameMasked };
+ }
+@@ -160,13 +165,19 @@ export async function confirmSetup(p: { tenantId: string; otp: string; via: OtpV
+   if (r.status !== "verified") return fail("LMMX_E_REVIEW_REQUIRED", "The top desk must approve this landlord account first.");
+   const hash = termsHashOf(t, r);
+   await verifyOtp({ tenantId: t.tenantId, purpose: "setup", input: p.otp, expectedPayloadHash: hash, via: p.via, actorDesk: p.desk?.deskCode });
++  await activateTenant(t, r, p.via, p.desk);
++}
+ 
++/** Everything that happens when a setup is confirmed: status active, sealed pay record, first cycle, consent, lead, and the two welcome SMS.
++ *  The tenant's code is checked BEFORE this (confirmSetup). COG-0000 skips the code entirely and calls this with via "top". */
++export async function activateTenant(t: TenantDoc, r: RecipientDoc, via: OtpVia | "top", desk?: DeskCtx): Promise<void> {
++  const hash = termsHashOf(t, r);
+   const hol = await holidays();
+   const due = firstDueDate(eatDate(now()), t.dueDay);
+   const cycle = newCycle(t, due, t.rent.amountMinor, hol);
+   const rec: PayRecordDoc = {
+     tenantId: t.tenantId, recipientId: r.recipientId, channel: r.channel, accountNumber: r.accountNumber, rentMinor: t.rent.amountMinor, dueDay: t.dueDay, frequency: t.frequency, setupCompletedAt: now(),
+-    setupDeskCode: t.deskCode, setupOtpVia: p.via, termsHash: hash, termsSig: termsSigOf(hash), version: 1,
++    setupDeskCode: t.deskCode, setupOtpVia: via, termsHash: hash, termsSig: termsSigOf(hash), version: 1,
+   };
+   await db().runTransaction(async (tx) => {
+     const tref = col(COL.tenants).doc(t.tenantId), rref = col(COL.recipients).doc(r.recipientId);
+@@ -177,7 +188,7 @@ export async function confirmSetup(p: { tenantId: string; otp: string; via: OtpV
+     tx.set(col(COL.payRecords).doc(t.tenantId), rec);
+     tx.create(col(COL.cycles).doc(cycle.cycleId), cycle);
+   });
+-  await audit({ action: "setup_confirmed", actor: { type: p.via === "desk" ? "desk" : p.via === "bot" ? "bot" : "tenant", deskCode: p.desk?.deskCode, uid: p.desk?.uid }, tenantId: t.tenantId, summary: `setup confirmed via ${p.via}; first due ${due}` });
++  await audit({ action: "setup_confirmed", actor: { type: via === "desk" ? "desk" : via === "bot" ? "bot" : via === "top" ? "top" : "tenant", deskCode: desk?.deskCode, uid: desk?.uid }, tenantId: t.tenantId, summary: `setup confirmed via ${via}${via === "top" ? " (no code needed)" : ""}; first due ${due}` });
+   await upsertLead(r, t).catch((e) => console.error("LMMX lead upsert failed", (e as Error).message));
+   const c = contactOf(r);
+   await sms(`lmmx_active_${t.tenantId}`, phoneOf(t), lmmxText.active({ rentMinor: t.rent.amountMinor, dueDay: t.dueDay, supportPhone: X.SUPPORT_PHONE }));
+diff --git a/functions/src/lmmx/top.ts b/functions/src/lmmx/top.ts
+index 708ee1a..3c3bf6d 100644
+--- a/functions/src/lmmx/top.ts
++++ b/functions/src/lmmx/top.ts
+@@ -2,12 +2,12 @@
+ import * as admin from "firebase-admin";
+ import { COL } from "./config";
+ import type { AuditRow, LeadRow, TopAuditListIn, TopAuditListOut, TopLeadGetOut, TopLeadsListIn, TopLeadsListOut, TopRevealIn, TopRevealOut, TopStatsOut, TenantStatus } from "./contract";
+-import { LEAD_STAGES, maskName } from "./contract";
++import { LEAD_STAGES, LMMX_TOP_DESK, maskName } from "./contract";
+ import type { LeadStage } from "./contract";
+ import { dec } from "./crypto";
+ import { fail } from "./errors";
+ import { audit, col, flags, now, verifyAudit } from "./store";
+-import { closeTenant, loadTenant, sendSetupOtp, nameOf, phoneOf } from "./tenants";
++import { activateTenant, closeTenant, loadTenant, sendSetupOtp, nameOf, phoneOf } from "./tenants";
+ import type { DeskCtx } from "./authz";
+ import type { LeadDoc, RecipientDoc, TenantDoc } from "./types";
+ 
+@@ -35,7 +35,10 @@ export async function reviewDecision(top: Top, i: { recipientId: string; decisio
+       const t = d.data() as TenantDoc;
+       if (!t.needsReview) continue;
+       await d.ref.update({ status: "awaiting_confirmation", needsReview: admin.firestore.FieldValue.delete(), setupExpiresAt: now() + 72 * 3_600_000, updatedAt: now() });
+-      await sendSetupOtp({ ...t, status: "awaiting_confirmation" }, { ...r, status: "verified" }).catch((e) => console.error("LMMX review resend failed", (e as Error).message));
++      const live = { ...t, status: "awaiting_confirmation" as const }, rv = { ...r, status: "verified" as const };
++      // a tenant the top desk registered needs no code; every other desk's tenant gets its code by SMS now
++      if (t.deskCode === LMMX_TOP_DESK) await activateTenant(live, rv, "top").catch((e) => console.error("LMMX review activation failed", (e as Error).message));
++      else await sendSetupOtp(live, rv).catch((e) => console.error("LMMX review resend failed", (e as Error).message));
+     }
+   } else {
+     await ref.update({ status: "retired" });
+diff --git a/functions/src/lmmx/types.ts b/functions/src/lmmx/types.ts
+index a2ed618..97eaa9f 100644
+--- a/functions/src/lmmx/types.ts
++++ b/functions/src/lmmx/types.ts
+@@ -7,7 +7,7 @@ export interface TenantDoc {
+   email?: string; unitNumber?: string; propertyName?: string;
+   consentAt?: number; landlordNoticeAt?: number; rent: { amountMinor: number; effectiveFromDue?: string }; dueDay: number; dueDayChangedCycleId?: string;
+   frequency: Frequency; suggestedCreditMinor: number; activeRecipientId: string; pendingRecipientId?: string;
+-  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string;
++  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string; lastSmsAt?: number; missedCount?: number;
+   cur?: { creditedMinor: number; remainingMinor: number; dueDate: string };
+ }
+ export interface RecipientDoc {
+@@ -21,7 +21,7 @@ export interface RecipientDoc {
+ export interface CycleDoc {
+   cycleId: string; tenantId: string; dueDate: string; payByDate: string; rentMinor: number; status: CycleStatus;
+   creditedMinor: number; settledMinor: number; inflightMinor: number; instalments: number; firstCreditAt?: number; lastCreditAt?: number; lastAvailableOn?: string;
+-  legRentMinor: number; legReserveCollectedMinor: number; settlementCount: number; createdAt: number; completionBonusPaid?: boolean; warned?: boolean; payByWarned?: boolean;
++  legRentMinor: number; legReserveCollectedMinor: number; settlementCount: number; createdAt: number; completionBonusPaid?: boolean; warned?: boolean; payByWarned?: boolean; milestonesSent?: number[];
+ }
+ export interface PaymentDoc {
+   reference: string; paymentId: string; tenantId: string; cycleId: string; quoteId: string; phone: string; status: "initiating" | "pending" | "credited" | "failed" | "rejected";
+@@ -46,5 +46,5 @@ export interface LeadDoc {
+ }
+ export interface PayRecordDoc {
+   tenantId: string; recipientId: string; channel: Channel; accountNumber: string; rentMinor: number; dueDay: number; frequency: Frequency; setupCompletedAt: number; setupDeskCode: string;
+-  setupOtpVia: "desk" | "bot" | "tenant"; termsHash: string; termsSig: string; version: number;
++  setupOtpVia: "desk" | "bot" | "tenant" | "top"; termsHash: string; termsSig: string; version: number;
+ }
+diff --git a/functions/test/lmmx.check.js b/functions/test/lmmx.check.js
+index 49b2c99..6ff3164 100644
+--- a/functions/test/lmmx.check.js
++++ b/functions/test/lmmx.check.js
+@@ -306,6 +306,77 @@ ok("tenant sign-in: the verified phone AND the linked uid must match; the link n
+   await rej(tenants.tenantLink(T("U2", "0712345678"), "+254712345678", { idType: "national_id", idNumber: "12345678" }, "1.1.1.1"), "LMMX_E_NOT_FOUND");
+ });
+ 
++
++// ------------------------------------------------------------------------------------------------------------- top desk needs no codes
++const sweep = L("sweep"), topM = L("top");
++const seedTop = () => db.seed("desk_agents/T1", { agentId: "T1", agentCode: "COG-0000", status: "active", rank: "internal", phone: "+254700000000" });
++ok("COG-0000 creates a tenant with NO code: active at once, no LMM code SMS, landlord and tenant still welcomed", async () => {
++  world(); seedTop(); const r = await tenants.createTenant(TOP, input());
++  assert.strictEqual(r.status, "active"); const t = db.store.get(`lmm_tenants/${r.tenantId}`); assert.strictEqual(t.status, "active");
++  assert.ok(!sms.some((s) => /LMM\d{4}/.test(s.msg)), "no code was texted"); assert.strictEqual(db.store.get(`lmm_pay_records/${r.tenantId}`).setupOtpVia, "top");
++  assert.ok(tenantSms().some((m) => /is ready/.test(m))); assert.ok(sms.some((x) => x.mobile === "254722111222" && /plot\.samuhia\.co\.ke/.test(x.msg)));
++  assert.strictEqual(db.list("lmmx_cycles").length, 1);
++});
++ok("a regular desk still needs the tenant's code (nothing relaxed for them)", async () => {
++  world(); const r = await tenants.createTenant(DESK, input()); assert.strictEqual(r.status, "awaiting_confirmation"); assert.ok(tenantSms().some((m) => /LMM\d{4}/.test(m)));
++});
++ok("COG-0000 changes rent and the payout account from the desk screen at once: no code, no cooling-off, tenant and landlords told", async () => {
++  world(); seedTop(); const s = await activate();
++  const rent = await idx.lmmx_desk_requestChange.run({ ...topReq(), data: { tenantId: s.id, kind: "rent", rentMinor: 1_200_000, idempotencyKey: "top-key-0001" } });
++  assert.deepStrictEqual([rent.status, rent.requiresTenantOtp], ["applied", false]); assert.strictEqual(db.read(`lmm_tenants/${s.id}`).rent.amountMinor, 1_200_000);
++  sms.length = 0;
++  const acct = await idx.lmmx_desk_requestChange.run({ ...topReq(), data: { tenantId: s.id, kind: "recipient", recipient: newAcct(), idempotencyKey: "top-key-0002" } });
++  assert.strictEqual(acct.status, "applied"); const t = db.store.get(`lmm_tenants/${s.id}`); assert.strictEqual(db.store.get(`lmmx_recipients/${t.activeRecipientId}`).accountNumber, "777888");
++  assert.ok(!sms.some((x) => /LMM\d{4}|LMC\d{4}/.test(x.msg)), "no codes were texted"); assert.ok(sms.some((x) => x.mobile === "254722111222") && sms.some((x) => x.mobile === "254722333444"));
++  assert.ok(db.list("lmmx_audit").some((p) => db.store.get(p).action === "top_update"));
++  assert.strictEqual(db.list("lmmx_changes").length, 0, "no pending change was created");
++});
++ok("a regular desk is NOT let through the top path", async () => {
++  world(); const s = await activate(); db.seed("desk_agents/D1", { agentId: "D1", agentCode: "COG-0012", status: "active", rank: "clerk", phone: "+254700000012" });
++  const r = await idx.lmmx_desk_requestChange.run({ auth: { uid: "D1", token: {} }, rawRequest: { headers: {} }, data: { tenantId: s.id, kind: "rent", rentMinor: 1_200_000, idempotencyKey: "reg-key-0001" } });
++  assert.strictEqual(r.status, "awaiting_tenant_otp"); assert.strictEqual(db.read(`lmm_tenants/${s.id}`).rent.amountMinor, 1_000_000);
++});
++ok("a top-desk tenant held for review is activated without a code when COG-0000 approves the landlord account", async () => {
++  world(); seedTop(); const r = await tenants.createTenant(TOP, input({ recipient: { channel: "bank", bankCode: "063", accountNumber: "0123456789", accountName: "Totally Different Person", contactName: "Some One", contactPhone: "0722111222" } }));
++  assert.strictEqual(r.status, "draft"); assert.ok(r.needsReview); const rid = db.store.get(`lmm_tenants/${r.tenantId}`).activeRecipientId; sms.length = 0;
++  await topM.reviewDecision(TOP, { recipientId: rid, decision: "approve" });
++  assert.strictEqual(db.read(`lmm_tenants/${r.tenantId}`).status, "active"); assert.ok(!sms.some((x) => /LMM\d{4}/.test(x.msg)), "no code");
++});
++
++// ------------------------------------------------------------------------------------------------------------- reminders and milestones (parity with legacy)
++const rtenant = (o = {}) => ({ tenantId: "LMTREMINDER1", nameEnc: cr.enc("Mary Wanjiru"), phoneEnc: cr.enc("+254712345678"), status: "active", frequency: "weekly", createdAt: Date.now() - 20 * 86_400_000, lastPaymentAt: 0, lastSmsAt: 0, missedCount: 0, ...o });
++const rcycle = (o = {}) => ({ cycleId: "LMTREMINDER1_202612", dueDate: "2026-12-05", payByDate: "2026-12-03", rentMinor: 1_000_000, creditedMinor: 0, settledMinor: 0, status: "open", ...o });
++const kinds = (t, c, today, nowMs = Date.now()) => sweep.planReminders(t, c, today, nowMs).map((r) => r.kind);
++ok("reminders: 5-day warning, pay-by day, due day, overdue every 3 days, nothing once the rent is covered", () => {
++  assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-11-30"), ["warn"]); assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-12-03"), ["warn", "payby"]);
++  assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-12-05"), ["due"]); assert.deepStrictEqual(kinds(rtenant(), rcycle(), "2026-12-09"), ["overdue"]);
++  assert.deepStrictEqual(kinds(rtenant(), rcycle({ creditedMinor: 1_000_000, status: "funded" }), "2026-12-03"), []);
++  const k1 = sweep.planReminders(rtenant(), rcycle(), "2026-12-09", 0)[0].key, k2 = sweep.planReminders(rtenant(), rcycle(), "2026-12-10", 0)[0].key, k3 = sweep.planReminders(rtenant(), rcycle(), "2026-12-12", 0)[0].key;
++  assert.strictEqual(k1, k2); assert.notStrictEqual(k1, k3);
++});
++ok("missed-instalment reminder follows the legacy rules: after the plan's quiet period, not within 3 days of another SMS, at most 3, never in the last week", () => {
++  const far = "2026-11-10"; const now = Date.parse("2026-11-10T08:00:00Z");
++  assert.deepStrictEqual(kinds(rtenant(), rcycle(), far, now), ["missed"]);
++  assert.deepStrictEqual(kinds(rtenant({ lastSmsAt: now - 86_400_000 }), rcycle(), far, now), [], "an SMS went out yesterday");
++  assert.deepStrictEqual(kinds(rtenant({ missedCount: 3 }), rcycle(), far, now), [], "3 already sent");
++  assert.deepStrictEqual(kinds(rtenant({ lastPaymentAt: now - 86_400_000 }), rcycle(), far, now), [], "paid yesterday");
++  assert.deepStrictEqual(kinds(rtenant({ status: "paused" }), rcycle(), far, now), []);
++  assert.ok(!kinds(rtenant(), rcycle(), "2026-12-02", Date.parse("2026-12-02T08:00:00Z")).includes("missed"), "the last-week warnings take over");
++  assert.ok(sweep.planReminders(rtenant(), rcycle(), far, now)[0].text.includes("Lipa Mdogo Mdogo"));
++});
++ok("milestones: one SMS each at 25/50/75 of the rent per cycle, 100 only recorded; a payment resets the missed count", async () => {
++  world(); const s = await activate(); const t0 = db.store.get(`lmm_tenants/${s.id}`); t0.missedCount = 2;
++  await payAndCredit(s.id, 250_000); await new Promise((r) => setTimeout(r, 30));
++  assert.ok(tenantSms().some((m) => /25%/.test(m)), "25% message"); assert.strictEqual(db.read(`lmm_tenants/${s.id}`).missedCount, 0);
++  const n25 = tenantSms().filter((m) => /paid 25%/.test(m)).length; await payAndCredit(s.id, 10_000);
++  assert.strictEqual(tenantSms().filter((m) => /paid 25%/.test(m)).length, n25, "not repeated");
++  await payAndCredit(s.id, 500_000); assert.ok(tenantSms().some((m) => /paid 75%/.test(m)), "75% message (760,000 of 1,000,000 is past 75%)");
++  const cy = db.list("lmmx_cycles").map((p) => db.store.get(p))[0]; assert.ok(cy.milestonesSent.includes(25) && cy.milestonesSent.includes(50));
++});
++ok("no user-facing 'Lipa Mos Mos' is left in the legacy messages", () => {
++  const fs = require("fs"); for (const f of ["lmm/plan.js", "lmm/sms.js", "lmm/index.js", "lmm/settle.js"]) { const src = fs.readFileSync(path.join(__dirname, "..", "lib", f), "utf8"); assert.ok(!/["`'][^"`'\n]*Lipa Mos Mos[^"`'\n]*["`']/.test(src.replace(/\/\/.*$/gm, "")), f); }
++});
++
+ // ------------------------------------------------------------------------------------------------------------- audit
+ ok("the audit chain verifies, and a tampered row is detected", async () => {
+   world(); await activate(); await new Promise((r) => setTimeout(r, 20));
+diff --git a/src/Signup.tsx b/src/Signup.tsx
+index 946d289..1f3c489 100644
+--- a/src/Signup.tsx
++++ b/src/Signup.tsx
+@@ -90,7 +90,8 @@ const Signup: React.FC = () => {
+       });
+ 
+       setPortalPreference('tenant');
+-      navigate('/tenant');
++      // The ID they just gave is checked quietly against Lipa Mdogo Mdogo; a rent-invoice-only tenant still ends up on /tenant.
++      navigate('/lmmx');
+     } catch (err: any) {
+       setError(err.message || 'Failed to create account. Please try again.');
+     } finally {
+diff --git a/src/lmmx/contract.ts b/src/lmmx/contract.ts
+index 1cbf8b4..60c5029 100644
+--- a/src/lmmx/contract.ts
++++ b/src/lmmx/contract.ts
+@@ -12,7 +12,7 @@
+  * Dates are Africa/Nairobi calendar days "YYYY-MM-DD". User-facing brand: "Lipa Mdogo Mdogo". Internal names keep "lmm"/"lmmx".
+  */
+ 
+-export const LMMX_CONTRACT_VERSION = 1;
++export const LMMX_CONTRACT_VERSION = 2;
+ export const LMMX_REGION = "africa-south1";           // every lmmx_* callable
+ export const LMMX_BRAND = "Lipa Mdogo Mdogo";
+ export const LMMX_TOP_DESK = "COG-0000";
+@@ -295,7 +295,8 @@ export interface DeskCheckRecipientIn { channel: Channel; bankCode?: string; acc
+ /** Only the account number and booleans. Never another recipient's name, contact, tenants, desks or counts. */
+ export interface DeskCheckRecipientOut { exists: boolean; accountNumber: string; nameMatchesEntered: boolean; reusable: boolean; reuseToken?: string }
+ export interface DeskCreateTenantIn { profile: TenantProfileInput; rentMinor: number; dueDay?: number; frequency?: Frequency; recipient: RecipientInput; idempotencyKey: string }
+-export interface DeskCreateTenantOut { tenantId: string; status: "awaiting_confirmation" | "draft"; nameMatch: NameMatch; needsReview: boolean; expiresAt: number; resolvedNameMasked: string }
++/** COG-0000 needs no tenant code: a tenant it creates comes back "active" at once (no OTP is sent). Everyone else gets "awaiting_confirmation" (or "draft" while a recipient is under review). */
++export interface DeskCreateTenantOut { tenantId: string; status: "awaiting_confirmation" | "draft" | "active"; nameMatch: NameMatch; needsReview: boolean; expiresAt: number; resolvedNameMasked: string }
+ export interface DeskSetupStatusIn { tenantId: string }
+ /** What the desk screen shows: "Waiting for verification" (awaiting, with a countdown) or an OTP box; active when done. */
+ export interface DeskSetupStatusOut { tenantId: string; status: TenantStatus; otpExpiresAt?: number; attemptsLeft?: number; locked?: boolean; resendsLeft?: number; needsReview?: boolean }
