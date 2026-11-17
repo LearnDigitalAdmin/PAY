@@ -180,7 +180,7 @@ export const handleLmmxTransfer = (event: string, data: unknown) => onTransferEv
 
 // ============================================================================================================ SCHEDULES
 export const lmmx_dailySweep = onSchedule({ schedule: "0 10 * * *", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 540, memory: "512MiB", secrets: BUNDLE_SECRETS }, async () => { await dailySweep(); });
-export const lmmx_settlementWorker = onSchedule({ schedule: "every 15 minutes", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 300, memory: "512MiB", secrets: BUNDLE_SECRETS }, async () => { await settlementWorker(); });
+export const lmmx_settlementWorker = onSchedule({ schedule: "every 30 minutes", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 300, memory: "512MiB", secrets: BUNDLE_SECRETS }, async () => { await settlementWorker(); });
 export const lmmx_reconcileDaily = onSchedule({ schedule: "0 23 * * *", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 300, memory: "512MiB", secrets: BUNDLE_SECRETS }, async () => { await reconcileDaily(); });
 export const lmmx_auditAnchor = onSchedule({ schedule: "55 23 * * *", timeZone: "Africa/Nairobi", region: "us-central1", timeoutSeconds: 120, memory: "256MiB", secrets: BUNDLE_SECRETS }, async () => { await auditAnchor(); });
 void loadRecipient; void normId; void validIdNumber; void audit; void LMMX_TOP_DESK; void ({} as ChangeDoc);

@@ -30,7 +30,7 @@ async function setIfPending(ref: admin.firestore.DocumentReference, patch: Recor
 
 export const reconcileMyChamaIntentsV2 = onSchedule(
   {
-    schedule: "every 10 minutes",
+    schedule: "every 30 minutes",
     timeZone: "Africa/Nairobi",
     region: "us-central1",
     memory: "256MiB",

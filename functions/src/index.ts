@@ -634,7 +634,7 @@ function determineChargeType(reference: string): string {
  * the webhook, so a late webhook and this sweep can never double-apply.
  */
 export const reconcileMyChamaIntents = onSchedule({
-  schedule: "every 10 minutes",
+  schedule: "every 60 minutes",
   timeZone: "Africa/Nairobi",
   region: "us-central1",
   memory: "256MiB",
