@@ -5,7 +5,7 @@ import { onSchedule } from "firebase-functions/v2/scheduler";
 import { BUNDLE_SECRETS } from "../secretsBundle";
 import { COL, X } from "./config";
 import {
-  LMMX, LMMX_REGION, LMMX_TOP_DESK, earningsTable, maskName, normalizeKePhone, parseLmmxCode, validIdNumber,
+  LMMX, LMMX_REGION, LMMX_TOP_DESK, earningsTable, maskName, maskPhone, normalizeKePhone, parseLmmxCode, validIdNumber,
 } from "./contract";
 import type { BotConfirmCodeOut, BotLookupOut, LmmxCallableName, LmmxCallableMap, PipelineRow, DeskEarningsOut, DeskPreviewOut } from "./contract";
 import { dec, H } from "./crypto";
@@ -126,20 +126,56 @@ export const lmmx_tenant_cancelChange = fn("lmmx_tenant_cancelChange", async (r)
 
 // ============================================================================================================ BOT (signed requests, no Firebase Auth)
 const botPhone = (v: unknown): string => normalizeKePhone(v) ?? fail("LMMX_E_VALIDATION", "Invalid phone.");
+/** DIAGNOSTIC (temporary): never logs the phone, ID or any name. Only masked phone, ID shape, counts, booleans and error codes. */
+const lkLog = (step: string, info: Record<string, unknown>): void => console.log(`LMMX LOOKUP ${step} ${JSON.stringify(info)}`);
+const errInfo = (e: unknown): { code?: unknown; message: string } => ({ code: (e as { code?: unknown })?.code, message: String((e as Error)?.message ?? e).replace(/https?:\/\/\S+/g, "<url>").slice(0, 300) });
+async function lookupDiagnose(phone: string, id: string): Promise<{ legacy: boolean }> {
+  const idHash = H("id", normId(id));
+  const out: Record<string, unknown> = { phone: maskPhone(phone), idLen: id.length, idDigitsOnly: /^\d+$/.test(id), idLeadingZero: id.startsWith("0") };
+  try {
+    const byPhone = await col(COL.tenants).where("phoneHash", "==", H("phone", phone)).limit(5).get();
+    const rows = byPhone.docs.map((d) => d.data() as TenantDoc);
+    out.standalone_byPhone = { count: rows.length, statuses: rows.map((t) => t.status), idHashMatchesOne: rows.some((t) => t.idHash === idHash) };
+  } catch (e) { out.standalone_byPhone = { error: errInfo(e) }; }
+  try {
+    const byId = await col(COL.tenants).where("idHash", "==", idHash).limit(5).get();
+    out.standalone_byIdOnly = { count: byId.size, statuses: byId.docs.map((d) => (d.data() as TenantDoc).status) };
+  } catch (e) { out.standalone_byIdOnly = { error: errInfo(e) }; }
+  let legacy = false;
+  const variants: [string, string | number][] = [["string", id], ["leadingZero", `0${id}`], ...(Number.isFinite(Number(id)) && /^\d+$/.test(id) ? [["number", Number(id)] as [string, number]] : [])];
+  const legacyRes: Record<string, unknown> = {};
+  for (const [label, val] of variants) {
+    try {
+      const q = await col("users").firestore.collectionGroup("tenants").where("localId", "==", val).limit(1).get();
+      legacyRes[label] = { found: !q.empty };
+      if (label === "string" && !q.empty) legacy = true;
+    } catch (e) { legacyRes[label] = { error: errInfo(e) }; }
+  }
+  out.legacy_localId = legacyRes;
+  lkLog("none-diagnosis", out);
+  return { legacy };
+}
 export const lmmx_bot_lookup = fn("lmmx_bot_lookup", async (r): Promise<BotLookupOut> => {
   const d = bad(r.data) as unknown as Record<string, unknown>; await verifyBot("lmmx_bot_lookup", d);
   const phone = botPhone(d.phone), id = String(d.idNumber ?? "");
   if (!(await rateOk(`botl|${phone}`, X.RATE.botPer10Min, 600_000))) return fail("LMMX_E_RATE", "Too many tries. Please wait a few minutes.");
-  if (!/^[A-Za-z0-9]{6,9}$/.test(id)) return { kind: "none" };
+  if (!/^[A-Za-z0-9]{6,9}$/.test(id)) { lkLog("rejected-id-shape", { phone: maskPhone(phone), idLen: id.length }); return { kind: "none" }; }
+  lkLog("start", { phone: maskPhone(phone), idLen: id.length });
   const t = await botTenant(phone, id);
   if (t) {
+    lkLog("result", { kind: "standalone", status: t.status, frozen: !!t.frozen });
     if (t.status === "awaiting_confirmation") return { kind: "standalone", standalone: { firstName: "", rentMinor: t.rent.amountMinor, remainingMinor: t.rent.amountMinor, dueDate: "", payByDate: "", suggestedCreditMinor: t.suggestedCreditMinor, awaitingSetup: true } };
     const cyc = await loadCycles(t.tenantId); const cur = cyc.find((c) => remainingOf(c) > 0) ?? cyc[0];
     const s = await tenantSummary({ uid: "", tenantId: t.tenantId, tenant: t, phone, ip: "" });
     return { kind: "standalone", standalone: { firstName: s.firstName, rentMinor: t.rent.amountMinor, remainingMinor: cur ? remainingOf(cur) : t.rent.amountMinor, dueDate: cur?.dueDate ?? "", payByDate: cur?.payByDate ?? "", suggestedCreditMinor: s.suggestedCreditMinor, ...(t.frozen ? { frozen: true } : {}) } };
   }
-  const legacy = await col("users").firestore.collectionGroup("tenants").where("localId", "==", id).limit(1).get().catch(() => null);
-  return legacy && !legacy.empty ? { kind: "legacy" } : { kind: "none" };
+  // PMS stores a tenant's National ID (`localId`) as a NUMBER on most accounts and as a string on some, so ask for both forms.
+  const idForms: (string | number)[] = [id, ...(/^\d+$/.test(id) ? [Number(id)] : [])];
+  const legacy = await col("users").firestore.collectionGroup("tenants").where("localId", "in", idForms).limit(1).get().catch((e) => { lkLog("legacy-query-ERROR", { error: errInfo(e) }); return null; });
+  if (legacy && !legacy.empty) { lkLog("result", { kind: "legacy", storedLocalIdType: typeof legacy.docs[0].data().localId }); return { kind: "legacy" }; }
+  await lookupDiagnose(phone, id).catch((e) => lkLog("diagnose-failed", { error: errInfo(e) }));
+  lkLog("result", { kind: "none" });
+  return { kind: "none" };
 });
 const botTenantOrFail = async (d: Record<string, unknown>): Promise<TenantDoc> => (await botTenant(botPhone(d.phone), String(d.idNumber ?? ""))) ?? fail("LMMX_E_NOT_FOUND", "We could not find your account.");
 export const lmmx_bot_quote = fn("lmmx_bot_quote", async (r) => { const d = bad(r.data) as unknown as Record<string, unknown>; await verifyBot("lmmx_bot_quote", d); return makeQuote(await botTenantOrFail(d), Number(d.creditMinor)); });

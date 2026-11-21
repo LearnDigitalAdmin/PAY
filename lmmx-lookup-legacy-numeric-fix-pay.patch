@@ -1,0 +1,17 @@
+diff --git a/functions/src/lmmx/index.ts b/functions/src/lmmx/index.ts
+index 17e5445..22794c1 100644
+--- a/functions/src/lmmx/index.ts
++++ b/functions/src/lmmx/index.ts
+@@ -169,8 +169,10 @@ export const lmmx_bot_lookup = fn("lmmx_bot_lookup", async (r): Promise<BotLooku
+     const s = await tenantSummary({ uid: "", tenantId: t.tenantId, tenant: t, phone, ip: "" });
+     return { kind: "standalone", standalone: { firstName: s.firstName, rentMinor: t.rent.amountMinor, remainingMinor: cur ? remainingOf(cur) : t.rent.amountMinor, dueDate: cur?.dueDate ?? "", payByDate: cur?.payByDate ?? "", suggestedCreditMinor: s.suggestedCreditMinor, ...(t.frozen ? { frozen: true } : {}) } };
+   }
+-  const legacy = await col("users").firestore.collectionGroup("tenants").where("localId", "==", id).limit(1).get().catch((e) => { lkLog("legacy-query-ERROR", { error: errInfo(e) }); return null; });
+-  if (legacy && !legacy.empty) { lkLog("result", { kind: "legacy" }); return { kind: "legacy" }; }
++  // PMS stores a tenant's National ID (`localId`) as a NUMBER on most accounts and as a string on some, so ask for both forms.
++  const idForms: (string | number)[] = [id, ...(/^\d+$/.test(id) ? [Number(id)] : [])];
++  const legacy = await col("users").firestore.collectionGroup("tenants").where("localId", "in", idForms).limit(1).get().catch((e) => { lkLog("legacy-query-ERROR", { error: errInfo(e) }); return null; });
++  if (legacy && !legacy.empty) { lkLog("result", { kind: "legacy", storedLocalIdType: typeof legacy.docs[0].data().localId }); return { kind: "legacy" }; }
+   await lookupDiagnose(phone, id).catch((e) => lkLog("diagnose-failed", { error: errInfo(e) }));
+   lkLog("result", { kind: "none" });
+   return { kind: "none" };
