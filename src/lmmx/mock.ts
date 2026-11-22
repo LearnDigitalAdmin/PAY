@@ -2,7 +2,7 @@
 // sessionStorage), so an awaiting tenant really becomes active after the right code, and a payment really shows up after a
 // few seconds. Nothing here talks to a server.
 import {
-  LMMX, kes, parseLmmxCode, quoteInstalment, nextDueDate, eatDate,
+  LMMX, kes, normalizeKePhone, withdrawBreakdown, parseLmmxCode, quoteInstalment, nextDueDate, eatDate,
   type LmmxCallableMap, type LmmxErrorCode, type PendingChangeView, type InstalmentView, type TenantSummaryOut,
 } from './contract';
 
@@ -25,7 +25,7 @@ class MockError extends Error {
 }
 
 const RENT = 1_000_000;
-interface Store { status: TenantSummaryOut['status']; credited: number; dueDay: number; frequency: 'daily' | 'weekly' | 'biweekly'; suggested: number; pending?: PendingChangeView; history: InstalmentView[]; wrong: number; dueChanged: boolean; pendingPay: { at: number; credit: number; charge: number; fail: boolean } | null }
+interface Store { status: TenantSummaryOut['status']; credited: number; dueDay: number; frequency: 'daily' | 'weekly' | 'biweekly'; suggested: number; pending?: PendingChangeView; history: InstalmentView[]; wrong: number; dueChanged: boolean; pendingPay: { at: number; credit: number; charge: number; fail: boolean } | null; wdPending: boolean }
 let st: Store;
 function reset(): void {
   const s = mockScenario();
@@ -33,7 +33,7 @@ function reset(): void {
   st = {
     status: s === 'awaiting' ? 'awaiting_confirmation' : s === 'frozen' ? 'frozen' : 'active',
     credited: s === 'paid_up' ? RENT : s === 'awaiting' ? 0 : 250_000,
-    dueDay: 5, frequency: 'weekly', suggested: 250_000, wrong: 0, dueChanged: false, pendingPay: null,
+    dueDay: 5, frequency: 'weekly', suggested: 250_000, wrong: 0, dueChanged: false, pendingPay: null, wdPending: false,
     pending:
       s === 'cooling' ? { changeId: 'chg1', kind: 'recipient', status: 'cooling_off', summary: 'Payout account changed to M-PESA ...473', coolingOffUntil: now + 30 * 3_600_000, applyAfter: now + 30 * 3_600_000, initiatedBy: 'desk' }
       : s === 'deferred' ? { changeId: 'chg2', kind: 'rent', status: 'deferred', summary: 'Rent changed to KES 12,000', applyAfter: now + 9 * 86_400_000, initiatedBy: 'desk' }
@@ -74,12 +74,12 @@ function settlePendingPay(): void {
   st.pendingPay = null;
 }
 
-function checkCode(raw: unknown, kind: 'otp' | 'cancel'): void {
+function checkCode(raw: unknown, kind: 'otp' | 'cancel' | 'withdraw'): void {
   const p = parseLmmxCode(raw) ?? (/^\s*\d{4}\s*$/.test(String(raw)) ? { kind, code: String(raw).trim() } : null);
   if (!p || p.kind !== kind) throw new MockError('LMMX_E_VALIDATION', 'bad code shape');
   if (p.code === '0000') throw new MockError('LMMX_E_OTP_EXPIRED', 'code expired');
   if (p.code === '9999') throw new MockError('LMMX_E_OTP_LOCKED', 'locked');
-  if (p.code !== '4683' && p.code !== '7391') {
+  if (p.code !== '4683' && p.code !== '7391') {   // 4683 = confirm, 7391 = cancel, 0000 = expired, 9999 = locked
     st.wrong += 1;
     if (st.wrong >= LMMX.OTP_MAX_ATTEMPTS) throw new MockError('LMMX_E_OTP_LOCKED', 'locked');
     throw new MockError('LMMX_E_OTP_INVALID', 'wrong code', LMMX.OTP_MAX_ATTEMPTS - st.wrong);
@@ -100,7 +100,23 @@ export async function mockCall(op: keyof LmmxCallableMap, d: Record<string, unkn
       if (id === '99999999') throw new MockError('LMMX_E_RATE', 'rate');
       throw new MockError('LMMX_E_NOT_FOUND', 'no match'); // same failure for a wrong phone and a wrong ID
     }
-    case 'lmmx_tenant_summary': return summary();
+    case 'lmmx_tenant_summary': { const avail = st.status === 'active' ? st.credited : 0; return { ...summary(), availableMinor: avail, withdrawFeeMinor: avail >= LMMX.MIN_PAYOUT_MINOR ? withdrawBreakdown(avail).feeMinor : 0, payoutPending: st.wdPending, withdrawEligibleAt: Date.now() - 86_400_000 }; }
+    case 'lmmx_tenant_payLandlord': {
+      if (st.status === 'frozen') throw new MockError('LMMX_E_FROZEN', 'frozen');
+      if (st.credited < LMMX.MIN_PAYOUT_MINOR) throw new MockError('LMMX_E_AMOUNT', `You need at least ${kes(LMMX.MIN_PAYOUT_MINOR)} paid in to do this. You have ${kes(st.credited)}.`);
+      st.wdPending = true; return { requestedMinor: st.credited, message: `Request received. ${kes(st.credited)} will be sent to your landlord within 24 hours.` };
+    }
+    case 'lmmx_tenant_withdrawStart': {
+      if (st.status === 'frozen') throw new MockError('LMMX_E_FROZEN', 'frozen');
+      if (normalizeKePhone(d.phone) !== '+254712345678') throw new MockError('LMMX_E_VALIDATION', 'Withdrawals go only to the M-PESA number on your account.');
+      if (st.credited < LMMX.MIN_PAYOUT_MINOR) throw new MockError('LMMX_E_AMOUNT', `You need at least ${kes(LMMX.MIN_PAYOUT_MINOR)} paid in to do this. You have ${kes(st.credited)}.`);
+      const bd = withdrawBreakdown(st.credited); return { availableMinor: st.credited, serviceFeeMinor: bd.serviceFeeMinor, transferFeeMinor: bd.transferFeeMinor, feeMinor: bd.feeMinor, netMinor: bd.netMinor, otpExpiresAt: Date.now() + LMMX.OTP_TTL_MS };
+    }
+    case 'lmmx_tenant_withdrawConfirm': {
+      checkCode(d.otp, 'withdraw');
+      const gross = st.credited, bd = withdrawBreakdown(gross); st.credited = 0; st.wdPending = true;
+      return { requestedMinor: gross, serviceFeeMinor: bd.serviceFeeMinor, transferFeeMinor: bd.transferFeeMinor, feeMinor: bd.feeMinor, netMinor: bd.netMinor, message: `Withdrawal requested. ${kes(bd.netMinor)} will be sent to your M-PESA within 24 hours (${kes(bd.serviceFeeMinor)} service fee and ${kes(bd.transferFeeMinor)} M-PESA fee taken).` };
+    }
     case 'lmmx_tenant_history': {
       const page = d.cursor === 'more';
       return page ? { items: [{ paymentId: 'p0', at: Date.now() - 20 * 86_400_000, creditMinor: 200_000, chargeMinor: 209_000, feesMinor: 9_000, status: 'success' }] } : { items: st.history, nextCursor: st.history.length >= 3 ? 'more' : undefined };

@@ -7,7 +7,7 @@ import { COL, X } from "./config";
 import { LMMX, PAYSTACK_BANK_CODE, PAYSTACK_TYPE, maskName, normalizeKePhone } from "./contract";
 import type { Channel, NameMatch, RecipientInput } from "./contract";
 import { H, acctKey, enc, normName, randId, readToken, signToken, dec } from "./crypto";
-import { fail } from "./errors";
+import { LmmxError, fail } from "./errors";
 import { alert, audit, col, now, rateOk } from "./store";
 import type { RecipientDoc } from "./types";
 import type { DeskCtx } from "./authz";
@@ -57,13 +57,27 @@ async function resolveName(s: Spec): Promise<string | null> {
 export const sealOf = (r: Pick<RecipientDoc, "recipientId" | "recipientCode" | "paystackType" | "paystackBankCode" | "fp">): string =>
   sealRecipient(LMM_SEAL_KEY.value(), { landlordId: r.recipientId, recipientCode: r.recipientCode, type: r.paystackType, bankCode: r.paystackBankCode, fp: r.fp });
 
+/** Creates the Paystack transfer recipient and returns its code. Shared by landlord accounts and a tenant's own M-PESA wallet. */
+export async function paystackRecipientCode(s: Spec, name: string): Promise<string> {
+  try {
+    const res = await axios.post(`${PAYSTACK_API_BASE}/transferrecipient`, { type: s.type, name: name.slice(0, 100), account_number: s.accountNumber, bank_code: s.paystackBankCode, currency: "KES" }, { headers: hdr(), timeout: 20_000 });
+    const code = String(res.data?.data?.recipient_code ?? "");
+    if (!res.data?.status || !/^RCP_[A-Za-z0-9]+$/.test(code)) return fail("LMMX_E_VALIDATION", "Paystack could not accept this payout account.");
+    return code;
+  } catch (err) {
+    if (err instanceof LmmxError) throw err;
+    const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message;
+    return fail("LMMX_E_VALIDATION", `Paystack could not accept this payout account${msg ? `: ${String(msg).slice(0, 80)}` : "."}`);
+  }
+}
+
 /** What the desk learns about an existing account: only the number and flags. Counted against a daily limit so account numbers cannot be probed. */
 export async function checkRecipient(desk: DeskCtx, i: { channel: Channel; bankCode?: string; accountNumber: string; enteredName: string }) {
   if (!(await rateOk(`chk|${desk.uid}`, LMMX.DESK_RECIPIENT_CHECKS_PER_DAY, 86_400_000))) return fail("LMMX_E_RATE", "Too many account checks today.");
   const s = specOf(i);
   const key = acctKey(s.channel, s.channel === "bank" ? s.bankCode : "", s.accountNumber);
   const snap = await col(COL.recipients).where("acctKey", "==", key).limit(5).get();
-  const live = snap.docs.map((d) => d.data() as RecipientDoc).filter((r) => r.status === "verified" || r.status === "needs_review" || r.status === "pending");
+  const live = snap.docs.map((d) => d.data() as RecipientDoc).filter((r) => r.kind !== "wallet").filter((r) => r.status === "verified" || r.status === "needs_review" || r.status === "pending");
   await audit({ action: "recipient_checked", actor: { type: desk.isTop ? "top" : "desk", deskCode: desk.deskCode, uid: desk.uid }, summary: `check ${s.channel} ...${s.accountNumber.slice(-3)} -> ${live.length ? "exists" : "new"}` });
   const hit = live.find((r) => r.status === "verified");
   if (!live.length) return { exists: false, accountNumber: s.accountNumber, nameMatchesEntered: false, reusable: false };
@@ -103,7 +117,7 @@ export async function createOrReuseRecipient(desk: DeskCtx, tenantPhone: string,
     const t = readToken<{ rid: string; desk: string; exp: number }>("reuse", i.reuseToken);
     if (!t || t.exp < now() || t.desk !== desk.uid) return fail("LMMX_E_VALIDATION", "That reuse code expired. Check the account again.");
     const r = (await col(COL.recipients).doc(t.rid).get()).data() as RecipientDoc | undefined;
-    if (!r || r.status === "frozen" || r.status === "retired") return fail("LMMX_E_RECIPIENT_BLOCKED", "This landlord account cannot be reused.");
+    if (!r || r.kind === "wallet" || r.status === "frozen" || r.status === "retired") return fail("LMMX_E_RECIPIENT_BLOCKED", "This landlord account cannot be reused.");
     if (r.acctKey !== acctKey(s.channel, s.channel === "bank" ? s.bankCode : "", s.accountNumber)) return fail("LMMX_E_VALIDATION", "That reuse code is for a different account.");
     if (r.status === "verified" && r.activeTenantCount >= LMMX.RECIPIENT_TENANTS_BEFORE_REVIEW && !r.deskCodes.every((d) => d === desk.deskCode)) {
       await col(COL.recipients).doc(r.recipientId).update({ status: "needs_review", reviewReason: "shared_recipient" });
@@ -118,15 +132,7 @@ export async function createOrReuseRecipient(desk: DeskCtx, tenantPhone: string,
   const resolved = await resolveName(s);
   const match: NameMatch = resolved === null ? "unavailable" : nameMatches(name, resolved) ? "matched" : "mismatch";
   const recipientId = randId("RCP");
-  let code = "";
-  try {
-    const res = await axios.post(`${PAYSTACK_API_BASE}/transferrecipient`, { type: s.type, name: name.slice(0, 100), account_number: s.accountNumber, bank_code: s.paystackBankCode, currency: "KES" }, { headers: hdr(), timeout: 20_000 });
-    code = String(res.data?.data?.recipient_code ?? "");
-    if (!res.data?.status || !/^RCP_[A-Za-z0-9]+$/.test(code)) return fail("LMMX_E_VALIDATION", "Paystack could not accept this payout account.");
-  } catch (err) {
-    const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message;
-    return fail("LMMX_E_VALIDATION", `Paystack could not accept this payout account${msg ? `: ${String(msg).slice(0, 80)}` : "."}`);
-  }
+  const code = await paystackRecipientCode(s, name);
   const fp = fingerprint(LMM_SEAL_KEY.value(), s.paystackBankCode, s.accountNumber);
   const base = { recipientId, paystackType: s.type, paystackBankCode: s.paystackBankCode, fp, recipientCode: code };
   const needsReview = match === "mismatch";
@@ -141,6 +147,30 @@ export async function createOrReuseRecipient(desk: DeskCtx, tenantPhone: string,
   await col(COL.recipients).doc(recipientId).create(JSON.parse(JSON.stringify(doc)));
   await audit({ action: "recipient_created", actor: { type: desk.isTop ? "top" : "desk", deskCode: desk.deskCode, uid: desk.uid }, summary: `recipient ${recipientId} ${s.channel} ...${s.accountNumber.slice(-3)} name:${match}` });
   if (needsReview) await alert("UNEXPECTED", `LMMX recipient ${recipientId} name mismatch, needs top desk review`);
+  return doc;
+}
+
+/** A tenant's OWN M-PESA wallet, for withdrawals. Same sealed recipient as everything else, never offered to desks for reuse. Created only for the phone on record. */
+export async function ensureWalletRecipient(t: { tenantId: string; name: string; phoneE164: string; phoneHash: string; walletRecipientId?: string }): Promise<RecipientDoc> {
+  if (H("phone", t.phoneE164) !== t.phoneHash) return fail("LMMX_E_TAMPER", "Your account details do not match. Please contact Samuhia support.");
+  const s = specOf({ channel: "phone", accountNumber: t.phoneE164 });
+  const key = acctKey("phone", "", s.accountNumber);
+  if (t.walletRecipientId) {
+    const ex = (await col(COL.recipients).doc(t.walletRecipientId).get()).data() as RecipientDoc | undefined;
+    if (ex && ex.kind === "wallet" && ex.ownerTenantId === t.tenantId && ex.acctKey === key && ex.status === "verified") return ex;
+  }
+  const recipientId = randId("RCP");
+  const code = await paystackRecipientCode(s, t.name);
+  const fp = fingerprint(LMM_SEAL_KEY.value(), s.paystackBankCode, s.accountNumber);
+  const base = { recipientId, paystackType: s.type, paystackBankCode: s.paystackBankCode, fp, recipientCode: code };
+  const doc: RecipientDoc = {
+    recipientId, channel: "phone", bankCode: s.bankCode, paystackType: s.type, paystackBankCode: s.paystackBankCode, accountNumber: s.accountNumber, acctKey: key, fp, recipientCode: code, seal: sealOf(base),
+    resolvedNameEnc: enc(t.name), enteredNameEnc: enc(t.name), nameKey: H("name", normName(t.name)), resolvedNameMasked: maskName(t.name), nameMatch: "unavailable",
+    contactNameEnc: enc(t.name), contactKey: H("contact", t.phoneE164), contactPhoneEnc: enc(t.phoneE164), contactPhoneHash: t.phoneHash,
+    status: "verified", verifiedAt: now(), createdAt: now(), createdByDesk: "tenant", activeTenantCount: 0, deskCodes: [], kind: "wallet", ownerTenantId: t.tenantId,
+  };
+  await col(COL.recipients).doc(recipientId).create(JSON.parse(JSON.stringify(doc)));
+  await col(COL.tenants).doc(t.tenantId).update({ walletRecipientId: recipientId });
   return doc;
 }
 

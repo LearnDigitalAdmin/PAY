@@ -7,6 +7,7 @@
 // at runtime and the SMS silently fails (the legacy paystackCallback does not
 // bind them today — see docs/mychama/CONNECTOR_CONTRACT.md §9).
 import axios from "axios";
+import { trackDispatch } from "../sms";
 import { BUNDLE_SECRETS, bundleSecret } from "../secretsBundle";
 
 // MyChama's own HostPinnacle credentials — separate from PAY's shared
@@ -19,7 +20,7 @@ const MYCHAMA_HP_APIKEY = bundleSecret("MYCHAMA_HP_SMS_APIKEY");
 const MYCHAMA_HP_SENDERID = bundleSecret("MYCHAMA_HP_SMS_SENDERID");
 
 export async function sendMyChamaSms(phoneE164: string, message: string): Promise<void> {
-  await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", {
+  const sent = await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", {
     userid: MYCHAMA_HP_USERID.value(),
     password: MYCHAMA_HP_PASSWORD.value(),
     apikey: MYCHAMA_HP_APIKEY.value(),
@@ -31,6 +32,7 @@ export async function sendMyChamaSms(phoneE164: string, message: string): Promis
     output: "json",
     duplicatecheck: "true",
   });
+  await trackDispatch({ product: "mychama", mobile: phoneE164, message, raw: sent?.data });
 }
 
 /**
@@ -58,6 +60,7 @@ export async function sendHpSmsChecked(phoneE164: string, message: string): Prom
     const isError = d?.status === "error" || d?.ErrorCode !== undefined ||
       (typeof d?.status === "string" && d.status.toLowerCase().includes("fail"));
     if (isError) console.error("HostPinnacle rejected the send:", JSON.stringify(d));
+    else await trackDispatch({ product: "mychama", mobile: phoneE164, message, raw: d });
     return !isError;
   } catch (e) {
     console.error("HostPinnacle request failed:", (e as Error).message);

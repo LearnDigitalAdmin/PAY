@@ -354,7 +354,8 @@ ok("a top-desk tenant held for review is activated without a code when COG-0000 
 });
 
 // ------------------------------------------------------------------------------------------------------------- reminders and milestones (parity with legacy)
-const rtenant = (o = {}) => ({ tenantId: "LMTREMINDER1", nameEnc: cr.enc("Mary Wanjiru"), phoneEnc: cr.enc("+254712345678"), status: "active", frequency: "weekly", createdAt: Date.now() - 20 * 86_400_000, lastPaymentAt: 0, lastSmsAt: 0, missedCount: 0, ...o });
+const rtenantBase = (o = {}) => ({ tenantId: "LMTREMINDER1", nameEnc: cr.enc("Mary Wanjiru"), phoneEnc: cr.enc("+254712345678"), status: "active", frequency: "weekly", createdAt: Date.now() - 20 * 86_400_000, lastPaymentAt: 0, lastSmsAt: 0, missedCount: 0, ...o });
+const rtenant = rtenantBase;
 const rcycle = (o = {}) => ({ cycleId: "LMTREMINDER1_202612", dueDate: "2026-12-05", payByDate: "2026-12-03", rentMinor: 1_000_000, creditedMinor: 0, settledMinor: 0, status: "open", ...o });
 const kinds = (t, c, today, nowMs = Date.now()) => sweep.planReminders(t, c, today, nowMs).map((r) => r.kind);
 ok("reminders: 5-day warning, pay-by day, due day, overdue every 3 days, nothing once the rent is covered", () => {
@@ -365,13 +366,13 @@ ok("reminders: 5-day warning, pay-by day, due day, overdue every 3 days, nothing
   assert.strictEqual(k1, k2); assert.notStrictEqual(k1, k3);
 });
 ok("missed-instalment reminder follows the legacy rules: after the plan's quiet period, not within 3 days of another SMS, at most 3, never in the last week", () => {
-  const far = "2026-11-10"; const now = Date.parse("2026-11-10T08:00:00Z");
+  const far = "2026-11-10"; const now = Date.parse("2026-11-10T08:00:00Z"); const rtenant = (o = {}) => rtenantBase({ createdAt: now - 20 * 86_400_000, ...o });   // times relative to the fixed "now", so the test does not drift
   assert.deepStrictEqual(kinds(rtenant(), rcycle(), far, now), ["missed"]);
   assert.deepStrictEqual(kinds(rtenant({ lastSmsAt: now - 86_400_000 }), rcycle(), far, now), [], "an SMS went out yesterday");
   assert.deepStrictEqual(kinds(rtenant({ missedCount: 3 }), rcycle(), far, now), [], "3 already sent");
   assert.deepStrictEqual(kinds(rtenant({ lastPaymentAt: now - 86_400_000 }), rcycle(), far, now), [], "paid yesterday");
   assert.deepStrictEqual(kinds(rtenant({ status: "paused" }), rcycle(), far, now), []);
-  assert.ok(!kinds(rtenant(), rcycle(), "2026-12-02", Date.parse("2026-12-02T08:00:00Z")).includes("missed"), "the last-week warnings take over");
+  assert.ok(!kinds(rtenantBase({ createdAt: Date.parse("2026-12-02T08:00:00Z") - 20 * 86_400_000 }), rcycle(), "2026-12-02", Date.parse("2026-12-02T08:00:00Z")).includes("missed"), "the last-week warnings take over");
   assert.ok(sweep.planReminders(rtenant(), rcycle(), far, now)[0].text.includes("Lipa Mdogo Mdogo"));
 });
 ok("milestones: one SMS each at 25/50/75 of the rent per cycle, 100 only recorded; a payment resets the missed count", async () => {
@@ -387,6 +388,169 @@ ok("no user-facing 'Lipa Mos Mos' is left in the legacy messages", () => {
   const fs = require("fs"); for (const f of ["lmm/plan.js", "lmm/sms.js", "lmm/index.js", "lmm/settle.js"]) { const src = fs.readFileSync(path.join(__dirname, "..", "lib", f), "utf8"); assert.ok(!/["`'][^"`'\n]*Lipa Mos Mos[^"`'\n]*["`']/.test(src.replace(/\/\/.*$/gm, "")), f); }
 });
 
+
+// ------------------------------------------------------------------------------------------------------------- pay my landlord now / withdraw
+const pouts = L("payouts"), sweepM = L("sweep");
+const OPS = "254791286165";
+const wdCode = () => (tenantSms().filter((m) => /LMW\d{4}/.test(m)).pop().match(/LMW(\d{4})/) || [])[1];
+const firstCycle = () => db.list("lmmx_cycles").map((p) => db.store.get(p))[0];
+const DAY = 86_400_000;
+/** an active plan that is 15 days old (past the 2-week wait), with a balance of `credit` paid in as one instalment */
+const age = (id, days = 15) => { const t = db.store.get(`lmm_tenants/${id}`); const at = Date.now() - days * DAY; t.consentAt = at; t.activeSeal = tenants.activationSealOf(id, at); db.store.get(`lmm_pay_records/${id}`).setupCompletedAt = at; };
+const funded = async (credit = 200_000) => { world(); const s = await activate(); age(s.id); await payAndCredit(s.id, credit); await new Promise((r) => setTimeout(r, 30)); return s; };
+ok("withdraw: the number must be the phone on record; the code goes to that phone; nothing moves until the right code", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+  await rej(pouts.startWithdraw(t(), "0799999999", "tenant"), "LMMX_E_VALIDATION"); assert.ok(!tenantSms().some((m) => /LMW\d{4}/.test(m)));
+  const st = await pouts.startWithdraw(t(), "0712345678", "tenant");
+  assert.strictEqual(st.availableMinor, 200_000); assert.strictEqual(st.feeMinor, C.withdrawBreakdown(200_000).feeMinor); assert.strictEqual(st.netMinor, 200_000 - st.feeMinor);
+  const m = tenantSms().pop(); assert.match(m, /LMW\d{4} valid 30 min/); assert.match(m, /wa\.me\/254101716473\?text=LMW\d{4}/); assert.ok(m.length <= 280);
+  assert.strictEqual(firstCycle().creditedMinor, 200_000, "no money moved yet"); assert.strictEqual(db.list("lmmx_settlements").length, 0);
+  await rej(pouts.confirmWithdraw(t(), "0000" === wdCode() ? "1111" : "0000", "tenant"), "LMMX_E_OTP_INVALID"); assert.strictEqual(firstCycle().creditedMinor, 200_000);
+});
+ok("withdraw confirm: takes everything available in one step, queues ONE sealed transfer to the tenant's own wallet after a quiet hour, tells the company phone", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); const code = wdCode(); sms.length = 0;
+  const w = await pouts.confirmWithdraw(t(), code, "tenant");
+  assert.strictEqual(w.requestedMinor, 200_000); assert.strictEqual(w.netMinor, 200_000 - w.feeMinor);
+  const cy = firstCycle(); assert.strictEqual(cy.creditedMinor, 0); assert.strictEqual(cy.withdrawnMinor, 200_000); assert.strictEqual(cy.balSeal, L("cycles").cycleSeal(cy)); assert.strictEqual(cy.status, "open");
+  const st = db.list("lmmx_settlements").map((p) => db.store.get(p))[0]; assert.strictEqual(st.reason, "withdraw"); assert.strictEqual(st.amountMinor, w.netMinor); assert.ok(st.notBefore > Date.now() + 59 * 60_000);
+  assert.ok(sms.some((x) => x.mobile === OPS && /WITHDRAWAL REQUEST/.test(x.msg) && x.msg.includes(s.id)), "company phone told"); assert.ok(tenantSms().some((m) => /within 24 hours/.test(m)));
+  const ws = db.store.get(`lmmx_recipients/${st.recipientId}`); assert.strictEqual(ws.kind, "wallet"); assert.strictEqual(ws.accountNumber, "0712345678");
+  await settle.sendSettlement(st.id); assert.strictEqual(transfers.length, 0, "still inside the quiet hour");
+  db.store.get(`lmmx_settlements/${st.id}`).notBefore = 1; await settle.sendSettlement(st.id);
+  assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, w.netMinor); assert.strictEqual(transfers[0].recipient, st.recipientCode);
+  await settle.sendSettlement(st.id); assert.strictEqual(transfers.length, 1, "the same transfer is never sent twice (a duplicate is refused or ignored)");
+  await settle.onTransferEvent("transfer.success", { reference: transfers[0].reference, amount: w.netMinor, recipient: { recipient_code: st.recipientCode } });
+  assert.strictEqual(db.read(`lmmx_settlements/${st.id}`).status, "paid"); assert.ok(tenantSms().some((m) => /was sent to your M-PESA/.test(m))); assert.ok(sms.some((x) => x.mobile === OPS && /SENT/.test(x.msg)));
+});
+ok("withdraw: the code is single use, a second request while one is on its way is refused, nothing is overdrawn", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); const code = wdCode();
+  const both = await Promise.allSettled([pouts.confirmWithdraw(t(), code, "tenant"), pouts.confirmWithdraw(t(), code, "tenant")]);
+  assert.strictEqual(both.filter((r) => r.status === "fulfilled").length, 1, "only one of two simultaneous confirmations goes through"); assert.strictEqual(db.list("lmmx_settlements").length, 1);
+  assert.ok(firstCycle().creditedMinor >= 0 && firstCycle().creditedMinor - firstCycle().settledMinor - firstCycle().inflightMinor >= 0);
+  await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_STATE");   // already on its way (and nothing left anyway)
+});
+ok("below KES 50 (or nothing) there is nothing to withdraw or pay out", async () => {
+  const s = await funded(3_000); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+  await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_AMOUNT"); await rej(pouts.requestLandlordPayout(t(), "tenant"), "LMMX_E_AMOUNT");
+});
+ok("frozen tenants and paused payouts cannot start either, and a withdrawal frozen during its quiet hour waits", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+  db.seed("lmm_config/standalone", { enabled: true, payoutsPaused: true }); store.clearFlagCache(); await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_DISABLED"); await rej(pouts.requestLandlordPayout(t(), "tenant"), "LMMX_E_DISABLED");
+  db.seed("lmm_config/standalone", { enabled: true }); store.clearFlagCache();
+  await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant"); const id = db.list("lmmx_settlements")[0].split("/")[1];
+  db.store.get(`lmmx_settlements/${id}`).notBefore = 1; t().frozen = true; await settle.sendSettlement(id); assert.strictEqual(transfers.length, 0, "support froze the account");
+  t().frozen = false; await settle.sendSettlement(id); assert.strictEqual(transfers.length, 1);
+  t().frozen = true; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_FROZEN");
+});
+ok("tamper-proof: editing the balance in the database freezes the tenant and pays nothing; editing a queued withdrawal blocks it", async () => {
+  let s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+  firstCycle().creditedMinor = 900_000;   // someone edits Firestore
+  await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER"); assert.strictEqual(t().frozen, true); assert.strictEqual(transfers.length, 0);
+  s = await funded(); firstCycle().withdrawnMinor = 5;   // any money field, even one that looks harmless
+  await rej(pouts.requestLandlordPayout(t(), "tenant"), "LMMX_E_TAMPER");
+  s = await funded(); db.store.get(db.list("lmmx_cycles")[0]).creditedMinor = 1_000_000; backdate(s.id);
+  assert.strictEqual(await settle.settleCycle(db.list("lmmx_cycles")[0].split("/")[1]), "held:tamper"); assert.strictEqual(transfers.length, 0);
+  s = await funded(); const cy = firstCycle(); cy.balSeal = "0".repeat(64); const p2 = await payAndCredit(s.id, 10_000).catch((e) => e); assert.ok(p2.res === "rejected" || p2 instanceof Error, "a tampered cycle refuses a new credit");
+  s = await funded(); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant"); const sid = db.list("lmmx_settlements")[0].split("/")[1];
+  db.store.get(`lmmx_settlements/${sid}`).amountMinor += 100; db.store.get(`lmmx_settlements/${sid}`).notBefore = 1; await settle.sendSettlement(sid);
+  assert.strictEqual(transfers.length, 0); assert.strictEqual(db.read(`lmmx_settlements/${sid}`).status, "blocked");
+});
+ok("withdraw: if the transfer fails 3 times the credit goes back to the tenant, sealed", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant");
+  const sid = db.list("lmmx_settlements")[0].split("/")[1]; db.store.get(`lmmx_settlements/${sid}`).notBefore = 1;
+  for (let i = 0; i < 3; i++) { await settle.sendSettlement(sid); const st = db.store.get(`lmmx_settlements/${sid}`); if (st.status !== "locked") break; await settle.onTransferEvent("transfer.failed", { reference: st.reference, amount: st.amountMinor, recipient: { recipient_code: st.recipientCode } }); }
+  const st = db.read(`lmmx_settlements/${sid}`); assert.strictEqual(st.status, "failed"); const cy = firstCycle(); assert.strictEqual(cy.creditedMinor, 200_000); assert.strictEqual(cy.withdrawnMinor, 0); assert.strictEqual(cy.balSeal, L("cycles").cycleSeal(cy));
+});
+ok("withdrawals count against the same daily outflow cap as landlord payouts", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); const code = wdCode();
+  const day = L("settle").dayKey(); db.seed(`lmm_counters/out_${day}`, { outMinor: 1_999_999_00 });
+  await rej(pouts.confirmWithdraw(t(), code, "tenant"), "LMMX_E_DISABLED"); assert.strictEqual(firstCycle().creditedMinor, 200_000, "nothing was taken");
+  db.seed(`lmm_counters/out_${day}`, { outMinor: 0 }); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant");
+  assert.ok(db.read(`lmm_counters/out_${day}`).outMinor > 0, "counted");
+});
+ok("a tenant's own wallet is never offered to a desk as a landlord account", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant");
+  const c = await L("recipients").checkRecipient(DESK2, { channel: "phone", accountNumber: "0712345678", enteredName: "Mary Wanjiru" }); assert.strictEqual(c.exists, false);
+});
+ok("pay my landlord now: asks for everything available, every normal safety check still applies, then pays EXACTLY what was credited", async () => {
+  const s = await funded(200_000); const t = () => db.store.get(`lmm_tenants/${s.id}`); sms.length = 0;
+  const r = await pouts.requestLandlordPayout(t(), "tenant"); assert.strictEqual(r.requestedMinor, 200_000); assert.match(r.message, /safety check/);
+  assert.ok(sms.some((x) => x.mobile === OPS && /payout request/.test(x.msg))); assert.strictEqual(transfers.length, 0); assert.strictEqual(firstCycle().payoutRequested, true);
+  backdate(s.id); await sweepM.settlementWorker();
+  assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, 200_000, "uncut"); assert.strictEqual(transfers[0].recipient, db.store.get(`lmmx_recipients/${t().activeRecipientId}`).recipientCode);
+  await settle.onTransferEvent("transfer.success", { reference: transfers[0].reference, amount: 200_000 }); assert.strictEqual(db.list("lmmx_settlements").map((p) => db.store.get(p))[0].status, "paid");
+});
+ok("tenant summary and bot lookup show what is available and the withdrawal fee", async () => {
+  const s = await funded(); const t = db.store.get(`lmm_tenants/${s.id}`);
+  const b = await pouts.summaryBalance(t); assert.strictEqual(b.availableMinor, 200_000); assert.strictEqual(b.withdrawFeeMinor, C.withdrawBreakdown(200_000).feeMinor); assert.strictEqual(b.payoutPending, false);
+  const lk = await idx.lmmx_bot_lookup.run({ data: signed("lmmx_bot_lookup", { phone: "+254712345678", idNumber: "12345678" }) }); assert.strictEqual(lk.standalone.availableMinor, 200_000);
+});
+ok("bot: a withdrawal code only works from the tenant's own WhatsApp number; the bot cannot change account settings", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+  await idx.lmmx_bot_withdrawStart.run({ data: signed("lmmx_bot_withdrawStart", { phone: "+254712345678", idNumber: "12345678" }) }); const code = wdCode();
+  await rej(idx.lmmx_bot_withdrawStart.run({ data: signed("lmmx_bot_withdrawStart", { phone: "+254799999999", idNumber: "12345678" }) }), "LMMX_E_NOT_FOUND");
+  const bot = (phone, text) => idx.lmmx_bot_confirmCode.run({ data: signed("lmmx_bot_confirmCode", { phone, text }) });
+  assert.strictEqual((await bot("+254799999999", `LMW${code}`)).result, "not_found"); assert.strictEqual(db.list("lmmx_settlements").length, 0);
+  const ok1 = await bot("+254712345678", `lmw ${code}`); assert.strictEqual(ok1.result, "withdraw_requested"); assert.strictEqual(db.list("lmmx_settlements").length, 1); assert.strictEqual((await bot("+254712345678", `LMW${code}`)).result, "invalid");
+  const exportsList = Object.keys(idx).filter((k) => k.startsWith("lmmx_bot_")); for (const k of exportsList) assert.ok(!/setDueDay|setPlan|updateTenant|requestChange|profile|name|idNumber/i.test(k), "bot has no account-settings ops: " + k);
+  void t;
+});
+
+// ------------------------------------------------------------------------------------------------------------- withdrawal-only rules: 15% fee, 2 weeks, instalment cap, 72 hours
+ok("withdrawal fees: 15% service fee (whole shilling, rounded up) plus the normal M-PESA fee, shown separately and deducted from what is sent", async () => {
+  assert.deepStrictEqual(C.withdrawBreakdown(200_000), { serviceFeeMinor: 30_000, transferFeeMinor: 5_300, feeMinor: 35_300, netMinor: 164_700 });
+  assert.strictEqual(C.withdrawBreakdown(5_050 + 50).serviceFeeMinor, 800, "15% of KES 51 is KES 7.65: rounded up to KES 8");
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+  const st = await pouts.startWithdraw(t(), "0712345678", "tenant"); assert.deepStrictEqual([st.serviceFeeMinor, st.transferFeeMinor, st.feeMinor, st.netMinor], [30_000, 5_300, 35_300, 164_700]);
+  assert.match(tenantSms().pop(), /15% service fee/);
+  const w = await pouts.confirmWithdraw(t(), wdCode(), "tenant"); assert.deepStrictEqual([w.serviceFeeMinor, w.netMinor], [30_000, 164_700]); assert.match(w.message, /service fee/);
+  const stl = db.list("lmmx_settlements").map((p) => db.store.get(p))[0]; assert.strictEqual(stl.amountMinor, 164_700); assert.strictEqual(stl.grossMinor, 200_000);
+  assert.ok(db.list("lmmx_ledger").map((p) => db.store.get(p)).some((r) => r.type === "withdraw_service" && r.amountMinor === 30_000), "the service fee is booked");
+  assert.strictEqual((await pouts.summaryBalance(t())).withdrawFeeMinor, 0, "nothing left, so no fee quoted");
+});
+ok("2-week rule: a plan under 14 days old cannot withdraw (it can still pay the landlord now); after 14 days it can", async () => {
+  world(); const s = await activate(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await payAndCredit(s.id, 200_000); await new Promise((r) => setTimeout(r, 30));
+  await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_STATE"); try { await pouts.startWithdraw(t(), "0712345678", "tenant"); } catch (e) { assert.match(e.message, /2 weeks/); assert.match(e.message, /Pay my landlord now/); }
+  assert.ok((await pouts.summaryBalance(t())).withdrawEligibleAt > Date.now() + 13 * DAY, "the date it opens is shown");
+  assert.strictEqual((await pouts.requestLandlordPayout(t(), "tenant")).requestedMinor, 200_000, "paying the landlord has no such wait");
+  age(s.id, 13); await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_STATE"); age(s.id, 15); assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0);
+});
+ok("2-week rule cannot be dodged by editing dates in the database: the activation date is signed and cross-checked", async () => {
+  let s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+  t().consentAt = Date.now() - 40 * DAY; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER"); assert.strictEqual(t().frozen, true);
+  s = await funded(); db.store.get(`lmm_pay_records/${s.id}`).setupCompletedAt = Date.now() - 40 * DAY; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER");
+  s = await funded(); t().consentAt = Date.now() - 40 * DAY; db.store.get(`lmm_pay_records/${s.id}`).setupCompletedAt = t().consentAt; await rej(pouts.confirmWithdraw(t(), "0000", "tenant"), "LMMX_E_OTP_INVALID");   // a fresh plan edited consistently still fails the signature
+  await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER");
+});
+ok("instalment cap: KES 300 a day, x7 weekly, x14 biweekly, for every payment behind the balance; the stricter of the plan then and now; payments are signed", async () => {
+  assert.deepStrictEqual(["daily", "weekly", "biweekly"].map((f) => C.withdrawInstalmentCapMinor(f)), [30_000, 210_000, 420_000]);
+  let s = await funded(220_000); const t = () => db.store.get(`lmm_tenants/${s.id}`);   // weekly plan: KES 2,200 is over KES 2,100
+  try { await pouts.startWithdraw(t(), "0712345678", "tenant"); assert.fail("should refuse"); } catch (e) { assert.strictEqual((e.details && e.details.lmmx) || e.lmmx, "LMMX_E_STATE"); assert.match(e.message, /KES 2,200/); assert.match(e.message, /KES 2,100/); assert.match(e.message, /Pay my landlord now/); }
+  assert.strictEqual((await pouts.requestLandlordPayout(t(), "tenant")).requestedMinor, 220_000, "the landlord can always be paid");
+  s = await funded(210_000); assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0, "exactly the weekly cap is allowed");
+  s = await funded(25_000); t().frequency = "daily"; assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0, "KES 250 is under the daily cap");
+  s = await funded(100_000); t().frequency = "daily"; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_STATE");   // paid on a weekly plan, now daily: the stricter cap applies
+  s = await funded(25_000); t().frequency = "biweekly"; assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0);
+  s = await funded(220_000); const pay = db.list("lmmx_payments").map((p) => db.store.get(p)).find((p) => p.status === "credited"); assert.ok(pay.paySeal && pay.freq === "weekly", "each credited payment is signed with its plan");
+  pay.creditMinor = 100_000; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER"); assert.strictEqual(t().frozen, true);   // someone lowered the amount in the database
+});
+ok("the cap is checked again inside the reservation: a big payment made AFTER the code was sent still blocks the withdrawal and nothing moves", async () => {
+  const s = await funded(100_000); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); const code = wdCode();
+  await payAndCredit(s.id, 220_000); await new Promise((r) => setTimeout(r, 30));   // over the weekly cap of KES 2,100
+  await rej(pouts.confirmWithdraw(t(), code, "tenant"), "LMMX_E_STATE");
+  assert.strictEqual(db.list("lmmx_settlements").length, 0); assert.strictEqual(firstCycle().creditedMinor, 320_000); assert.ok(!firstCycle().withdrawnMinor);
+});
+ok("72 hours after a withdrawal the same phone or ID cannot set up a new plan (any desk, top desk too) or change the plan; after 72 hours it can", async () => {
+  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); seedTopForCool(); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant");
+  await rej(chg.setPlan(t(), "daily", undefined), "LMMX_E_STATE");
+  await tenants.closeTenant(t(), "test");   // the old plan is gone; a new plan for the same person is what is blocked
+  await rej(tenants.createTenant(DESK, input()), "LMMX_E_STATE"); await rej(tenants.createTenant(TOP, input()), "LMMX_E_STATE");
+  await rej(tenants.createTenant(DESK, input({ profile: { ...input().profile, phone: "0744555666" } })), "LMMX_E_STATE");      // same ID, new phone
+  await rej(tenants.createTenant(DESK, input({ profile: { ...input().profile, idNumber: "87654321" } })), "LMMX_E_STATE");     // same phone, new ID
+  for (const k of db.list("lmmx_locks").filter((p) => p.includes("wdcool_"))) db.store.get(k).at = Date.now() - 73 * 3_600_000;
+  assert.strictEqual((await tenants.createTenant(DESK, input())).status, "awaiting_confirmation");
+});
+const seedTopForCool = () => db.seed("desk_agents/T1", { agentId: "T1", agentCode: "COG-0000", status: "active", rank: "internal", phone: "+254700000000" });
 // ------------------------------------------------------------------------------------------------------------- audit
 ok("the audit chain verifies, and a tampered row is detected", async () => {
   world(); await activate(); await new Promise((r) => setTimeout(r, 20));

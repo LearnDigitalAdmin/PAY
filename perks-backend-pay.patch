@@ -1,0 +1,852 @@
+diff --git a/docs/perks/BACKEND.md b/docs/perks/BACKEND.md
+new file mode 100644
+index 0000000..7e8b6d7
+--- /dev/null
++++ b/docs/perks/BACKEND.md
+@@ -0,0 +1,29 @@
++# Samuhia Perks backend
++
++Lives in `functions/src/perks/`, deployed with the rest of PAY's functions (region `africa-south1`). Shares the Firebase project, the `app-secrets-bundle` secret and the HostPinnacle `HP_SMS_*` credentials.
++
++## Entry points
++- `perks_op` - operator actions. Caller must be listed in Firestore doc `perks_config/operators` as `{ uids: ["<firebase uid>", ...] }` (create it in the console; no client can write it).
++- `perks_me` - the signed-in customer's own account. Identity is the phone proven by `verifyLoginOtp` (`otp_phone` claim). The phone is never taken from the request body.
++
++Actions: `recordSale, redeem, reverseSale, registerReferral, createVoucher, bulkVouchers, assignVoucher, setVoucherStatus, saveCampaign, setCampaignActive, setActiveCampaign, saveTemplate, updateSettings, getSettings, retrySms, setConsent, getCustomer, list, runDraw` (operator) and `summary, setMarketing` (customer). There is no customer redeem action.
++
++## Guarantees
++- Every points change is one Firestore transaction (record + ledger + cached balance). Ledger rows are never edited or deleted; reversals add a negative row.
++- Idempotency keys on sales and redemptions: a repeated request returns the original result.
++- Referral reward (50 inviter / 30 invitee) only above KES 50, once per invitee (`perks_referrals/{inviteeId}`), atomic with the qualifying sale.
++- Marketing adverts are appended only when the customer has marketing consent and an active, in-date campaign exists; templates cannot contain links.
++- `runDraw` always refuses until `drawProductionApproved` is set in the console (the API cannot set it). Keep it off pending Kenyan legal review.
++
++## Data (default database, all server-only in firestore.rules)
++`perks_settings/main, perks_customers/{e164 digits}, perks_codes/{referralCode}, perks_tx, perks_ledger, perks_referrals/{inviteeId}, perks_redemptions, perks_vouchers/{code}, perks_campaigns, perks_templates/{type}, perks_smsLog, perks_audit, perks_consentLog, perks_config/operators`
++
++Composite indexes (customerId asc, createdAt desc) are in PMS `firestore.indexes.json`; rules are in PMS `plot-rules/firestore.rules`.
++
++## Moving it out of PAY later
++Only `perks/deps.ts` imports from the rest of PAY (Firestore handle, region, secrets binding, SMS sender). Copy the folder, re-implement those four exports, done. `test/perks.check.js` fails if another file reaches outside the folder.
++
++## Known gaps
++- Inbound STOP replies are not handled yet (needs a HostPinnacle inbound webhook); opt-out is currently operator- or customer-app-driven.
++- Operators with the same uid in `perks_config/operators` have full access; there is no per-action role split yet.
++- Reversing a sale does not claw back a referral reward it triggered.
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index 98169cb..2267528 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -82,6 +82,7 @@ import {
+ // ─── MyChama connector / auth wiring (P0) — see docs/mychama/CONNECTOR_CONTRACT.md ───
+ export * from "./mychama";
+ export * from "./auth";
++export * from "./perks"; // Samuhia Perks loyalty backend (self-contained folder; see docs/perks/BACKEND.md)
+ 
+ 
+ // ============= CONFIGURATION =============
+diff --git a/functions/src/perks/deps.ts b/functions/src/perks/deps.ts
+new file mode 100644
+index 0000000..465d217
+--- /dev/null
++++ b/functions/src/perks/deps.ts
+@@ -0,0 +1,18 @@
++// THE ONLY FILE in perks/ that imports from the rest of PAY/functions.
++// To move Perks into its own codebase, re-implement these exports (Firestore handle, region, secrets binding, SMS sender)
++// and copy the folder. Nothing else here depends on PAY. tests/perks.check.js enforces this boundary.
++import * as admin from "firebase-admin";
++import { HttpsError } from "firebase-functions/v2/https";
++import { plotDb } from "../mychama/config";
++import { MYCHAMA_REGION } from "../mychama/contract";
++import { HP_SECRETS, sendHpSms } from "../hpSms";
++
++export { HttpsError };
++export const REGION = MYCHAMA_REGION;
++/** Bind on every Perks function that can send SMS. Credentials: the shared HP_SMS_* secrets in app-secrets-bundle. */
++export const SECRETS = HP_SECRETS;
++export const db = (): admin.firestore.Firestore => plotDb();
++export const sendSms = async (e164: string, message: string): Promise<{ success: boolean; error?: string }> => {
++  const r = await sendHpSms({ mobile: e164.replace(/^\+/, ""), message });
++  return { success: r.success, error: r.error };
++};
+diff --git a/functions/src/perks/handlers.ts b/functions/src/perks/handlers.ts
+new file mode 100644
+index 0000000..714172a
+--- /dev/null
++++ b/functions/src/perks/handlers.ts
+@@ -0,0 +1,82 @@
++// Action dispatch for the two callables. No firebase-functions import here, so it is unit-testable and portable.
++import type { firestore } from "firebase-admin";
++import { P, PerksError } from "./types";
++import * as ops from "./ops";
++import { dispatch, retrySms, type Sender } from "./notify";
++import { customerId, toE164 } from "./rules";
++
++type Db = firestore.Firestore;
++type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
++const LISTABLE: Record<string, string> = { customers: P.customers, tx: P.tx, ledger: P.ledger, referrals: P.referrals, redemptions: P.redemptions, vouchers: P.vouchers, campaigns: P.campaigns, templates: P.templates, smsLog: P.smsLog, audit: P.audit };
++
++async function recent(db: Db, coll: string, n: number): Promise<Rec[]> {
++  const q = await db.collection(coll).orderBy("createdAt", "desc").limit(n).get();
++  return q.docs.map((d) => d.data() as Rec);
++}
++async function forCustomer(db: Db, coll: string, cid: string, n: number): Promise<Rec[]> {
++  const q = await db.collection(coll).where("customerId", "==", cid).orderBy("createdAt", "desc").limit(n).get();
++  return q.docs.map((d) => d.data() as Rec);
++}
++
++export async function handleOperator(db: Db, send: Sender, uid: string, action: string, p: Rec): Promise<unknown> {
++  const withUid = { operatorUid: uid };
++  const sms = async <T extends { notifications?: import("./types").Notification[] }>(r: T): Promise<T> => { await dispatch(db, send, r.notifications || []); return r; };
++  switch (action) {
++    case "recordSale": return sms(await ops.recordSale(db, { ...p, ...withUid } as never));
++    case "redeem": return sms(await ops.redeem(db, { ...p, ...withUid } as never));
++    case "reverseSale": return ops.reverseSale(db, { ...withUid, transactionId: p.transactionId, reason: p.reason });
++    case "registerReferral": return ops.registerReferral(db, { ...withUid, inviteePhone: p.inviteePhone, code: p.code });
++    case "createVoucher": return ops.createVoucher(db, { ...withUid, type: p.type, value: p.value, expiresAt: p.expiresAt, campaignId: p.campaignId });
++    case "bulkVouchers": {
++      const n = Math.min(20, Math.max(1, Number(p.count) || 5)), out = [];
++      for (let i = 0; i < n; i++) out.push(await ops.createVoucher(db, { ...withUid, type: p.type, value: p.value }));
++      return { created: out.length, vouchers: out };
++    }
++    case "assignVoucher": return sms(await ops.assignVoucher(db, { ...withUid, voucherId: p.voucherId, phone: p.phone }));
++    case "setVoucherStatus": return ops.setVoucherStatus(db, { ...withUid, voucherId: p.voucherId, status: p.status });
++    case "saveCampaign": return ops.saveCampaign(db, { ...p, ...withUid } as never);
++    case "setCampaignActive": return ops.setCampaignActive(db, { id: p.id, active: p.active });
++    case "setActiveCampaign": return ops.setActiveCampaign(db, { id: p.id });
++    case "saveTemplate": return ops.saveTemplate(db, { ...withUid, id: p.id, body: p.body, active: p.active });
++    case "updateSettings": return ops.updateSettings(db, { ...withUid, patch: p.patch });
++    case "getSettings": return ops.getSettings(db);
++    case "retrySms": return retrySms(db, send, { id: p.id });
++    case "setConsent": return ops.setMarketingConsent(db, { customerId: customerId(toE164(p.phone)), marketing: p.marketing === true, source: "operator", actor: uid });
++    case "runDraw": {
++      const s = await ops.getSettings(db);
++      if (!s.referralDrawEnabled || !s.drawProductionApproved) throw new PerksError("failed-precondition", "The reward draw is disabled pending legal and regulatory review.");
++      throw new PerksError("unimplemented", "The reward draw is not implemented.");
++    }
++    case "getCustomer": {
++      const cid = customerId(toE164(p.phone)), c = await db.doc(`${P.customers}/${cid}`).get();
++      if (!c.exists) return { found: false };
++      const [tx, ledger, smsLog, vouchers] = await Promise.all([P.tx, P.ledger, P.smsLog, P.vouchers].map((k) => forCustomer(db, k, cid, 50)));
++      return { found: true, customer: c.data(), tx, ledger, smsLog, vouchers };
++    }
++    case "list": {
++      const coll = LISTABLE[String(p.collection)];
++      if (!coll) throw new PerksError("invalid-argument", "Unknown collection.");
++      return { items: await recent(db, coll, Math.min(200, Math.max(1, Number(p.limit) || 50))) };
++    }
++    default: throw new PerksError("invalid-argument", "Unknown action.");
++  }
++}
++
++/** Customers only ever see their own account. The phone comes from the verified OTP token, never from the request. */
++export async function handleCustomer(db: Db, who: { uid: string; phone: string }, action: string, p: Rec): Promise<unknown> {
++  const cid = customerId(toE164(who.phone)), ref = db.doc(`${P.customers}/${cid}`), snap = await ref.get();
++  if (!snap.exists) return { registered: false };
++  const c = snap.data() as Rec;
++  if (!c.authUid) await ref.set({ authUid: who.uid }, { merge: true });
++  else if (c.authUid !== who.uid) throw new PerksError("permission-denied", "This account is linked to a different sign-in.");
++  switch (action) {
++    case "summary": {
++      const [tx, ledger, vouchers, refs] = await Promise.all([forCustomer(db, P.tx, cid, 50), forCustomer(db, P.ledger, cid, 50), forCustomer(db, P.vouchers, cid, 50),
++        db.collection(P.referrals).where("referrerCustomerId", "==", cid).get().then((q) => q.docs.map((d) => d.data() as Rec))]);
++      const strip = ({ authUid: _a, ...rest }: Rec) => rest; // eslint-disable-line @typescript-eslint/no-unused-vars
++      return { registered: true, customer: strip(c), tx, ledger, vouchers, referrals: refs.map((r) => ({ status: r.status, createdAt: r.createdAt, rewardedAt: r.rewardedAt })) };
++    }
++    case "setMarketing": return ops.setMarketingConsent(db, { customerId: cid, marketing: p.value === true, source: "customer", actor: who.uid });
++    default: throw new PerksError("invalid-argument", "Unknown action.");
++  }
++}
+diff --git a/functions/src/perks/index.ts b/functions/src/perks/index.ts
+new file mode 100644
+index 0000000..325adec
+--- /dev/null
++++ b/functions/src/perks/index.ts
+@@ -0,0 +1,37 @@
++// Perks callables. Two entry points keep the surface small and easy to relocate:
++//   perks_op  - operator actions (allow-listed uids in perks_config/operators)
++//   perks_me  - the signed-in customer's own account (identity = phone proven by the OTP login token)
++import { onCall, type CallableRequest } from "firebase-functions/v2/https";
++import { db, HttpsError, REGION, SECRETS, sendSms } from "./deps";
++import { handleCustomer, handleOperator } from "./handlers";
++import { P, PerksError } from "./types";
++
++const toHttps = (e: unknown) => {
++  if (e instanceof PerksError) return new HttpsError(e.code, e.message);
++  if (e instanceof HttpsError) return e;
++  console.error("perks internal error:", (e as Error)?.message);
++  return new HttpsError("internal", "Something went wrong. Please try again.");
++};
++
++async function requireOperator(req: CallableRequest): Promise<string> {
++  if (!req.auth) throw new HttpsError("unauthenticated", "Sign in required.");
++  const snap = await db().doc(`${P.config}/operators`).get();
++  const uids = ((snap.data() || {}).uids as string[] | undefined) || [];
++  if (!uids.includes(req.auth.uid)) throw new HttpsError("permission-denied", "This account is not a Perks operator.");
++  return req.auth.uid;
++}
++
++export const perks_op = onCall({ region: REGION, cors: true, maxInstances: 5, timeoutSeconds: 60, secrets: SECRETS }, async (req) => {
++  const uid = await requireOperator(req);
++  const d = (req.data || {}) as { action?: unknown; payload?: Record<string, unknown> };
++  try { return await handleOperator(db(), sendSms, uid, String(d.action ?? ""), d.payload || {}); } catch (e) { throw toHttps(e); }
++});
++
++export const perks_me = onCall({ region: REGION, cors: true, maxInstances: 10, timeoutSeconds: 30 }, async (req) => {
++  if (!req.auth) throw new HttpsError("unauthenticated", "Sign in required.");
++  const t = req.auth.token as { otp_phone?: unknown; phone_number?: unknown };
++  const phone = typeof t.otp_phone === "string" ? t.otp_phone : typeof t.phone_number === "string" ? t.phone_number : "";
++  if (!phone) throw new HttpsError("permission-denied", "Verify your phone number to continue.");
++  const d = (req.data || {}) as { action?: unknown; payload?: Record<string, unknown> };
++  try { return await handleCustomer(db(), { uid: req.auth.uid, phone }, String(d.action ?? ""), d.payload || {}); } catch (e) { throw toHttps(e); }
++});
+diff --git a/functions/src/perks/notify.ts b/functions/src/perks/notify.ts
+new file mode 100644
+index 0000000..d722999
+--- /dev/null
++++ b/functions/src/perks/notify.ts
+@@ -0,0 +1,49 @@
++// SMS pipeline: template + (consented) campaign advert -> perks_smsLog -> provider. Never throws into the money path.
++import type { firestore } from "firebase-admin";
++import { P, PerksError, type Notification } from "./types";
++import { campaignLive, composeSms, DEFAULT_TEMPLATES, type CampaignLike } from "./rules";
++import { settingsFrom } from "./ops";
++
++type Db = firestore.Firestore;
++export type Sender = (e164: string, message: string) => Promise<{ success: boolean; error?: string }>;
++export const MAX_RETRIES = 3;
++
++export async function dispatch(db: Db, send: Sender, list: Notification[], now: () => number = Date.now): Promise<void> {
++  for (const n of list) {
++    try { await dispatchOne(db, send, n, now); } catch (e) { console.error("perks sms dispatch failed:", (e as Error).message); }
++  }
++}
++
++async function dispatchOne(db: Db, send: Sender, n: Notification, now: () => number): Promise<void> {
++  const [sSnap, cSnap, tSnap] = await Promise.all([db.doc(`${P.settings}/main`).get(), db.doc(`${P.customers}/${n.customerId}`).get(), db.doc(`${P.templates}/${n.type}`).get()]);
++  if (!cSnap.exists) return;
++  const s = settingsFrom(sSnap.data());
++  const c = cSnap.data() as { phone: string; marketingConsent?: boolean };
++  const t = tSnap.data() as { body?: string; active?: boolean } | undefined;
++  const body = t && t.active !== false && t.body ? t.body : DEFAULT_TEMPLATES[n.type];
++  let campaign: (CampaignLike & { id: string }) | null = null;
++  if (c.marketingConsent === true && s.activeCampaignId) {
++    const k = await db.doc(`${P.campaigns}/${s.activeCampaignId}`).get();
++    const kd = k.data() as CampaignLike | undefined;
++    if (kd && campaignLive(kd, now())) campaign = { ...kd, id: s.activeCampaignId };
++  }
++  const message = composeSms(body, { phone: c.phone, ...n.vars }, campaign, c.marketingConsent === true);
++  const ref = db.collection(P.smsLog).doc();
++  await ref.set({ id: ref.id, customerId: n.customerId, phone: c.phone, transactionId: n.transactionId ?? null, templateId: n.type, campaignId: campaign ? campaign.id : null,
++    message, status: "PENDING", estimatedCost: s.smsCost, createdAt: now(), sentAt: null, error: null, retryCount: 0 });
++  const r = await send(c.phone, message);
++  await ref.set(r.success ? { status: "SENT", sentAt: now(), error: null } : { status: "FAILED", error: String(r.error || "send failed").slice(0, 300) }, { merge: true });
++}
++
++export async function retrySms(db: Db, send: Sender, a: { id: string }, now: () => number = Date.now): Promise<{ status: string }> {
++  const ref = db.doc(`${P.smsLog}/${String(a.id)}`);
++  const snap = await ref.get();
++  if (!snap.exists) throw new PerksError("not-found", "Message not found.");
++  const m = snap.data() as { status: string; phone: string; message: string; retryCount?: number };
++  if (m.status !== "FAILED") throw new PerksError("failed-precondition", "Only failed messages can be retried.");
++  if ((m.retryCount || 0) >= MAX_RETRIES) throw new PerksError("failed-precondition", "Retry limit reached.");
++  const r = await send(m.phone, m.message);
++  const status = r.success ? "SENT" : "FAILED";
++  await ref.set({ status, retryCount: (m.retryCount || 0) + 1, retriedAt: now(), sentAt: r.success ? now() : null, error: r.success ? null : String(r.error || "send failed").slice(0, 300) }, { merge: true });
++  return { status };
++}
+diff --git a/functions/src/perks/ops.ts b/functions/src/perks/ops.ts
+new file mode 100644
+index 0000000..dd46e73
+--- /dev/null
++++ b/functions/src/perks/ops.ts
+@@ -0,0 +1,262 @@
++// Perks write operations. Every money/points change is ONE Firestore transaction: ledger entry + cached balance + record.
++// Idempotency keys make a double tap (or a retried request) return the original result instead of recording twice.
++import { createHash, randomInt } from "crypto";
++import type { firestore } from "firebase-admin";
++import { DEFAULT_SETTINGS, P, PerksError, type Notification, type PerksSettings, type VoucherStatus, type VoucherType } from "./types";
++import { campaignLive, cleanItems, cleanMoney, cleanPoints, customerId, normCode, pointsFor, qualifiesReferral, rateFor, redemptionValueKes, TEMPLATE_IDS, toE164, validateTemplateBody } from "./rules";
++
++type Db = firestore.Firestore;
++type Tx = firestore.Transaction;
++type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
++const sha = (s: string) => createHash("sha256").update(s).digest("hex");
++const ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
++const makeCode = (n = 6) => Array.from({ length: n }, () => ALPHA[randomInt(ALPHA.length)]).join("");
++const need = (key: unknown) => { const k = String(key ?? ""); if (k.length < 8 || k.length > 80) throw new PerksError("invalid-argument", "A request id (idempotency key) is required."); return k; };
++
++export const settingsFrom = (d: Rec | undefined): PerksSettings => ({ ...DEFAULT_SETTINGS, ...(d || {}) });
++export async function getSettings(db: Db): Promise<PerksSettings> { return settingsFrom((await db.doc(`${P.settings}/main`).get()).data()); }
++
++const audit = (tx: Tx, db: Db, actor: string, action: string, ref: string, extra: Rec, now: number) => { tx.set(db.collection(P.audit).doc(), { actor, action, ref, ...extra, at: now, createdAt: now }); };
++const ledger = (tx: Tx, db: Db, e: { customerId: string; type: string; points: number; balanceAfter: number; referenceId: string; description: string; createdBy: string; now: number }) => {
++  const r = db.collection(P.ledger).doc();
++  tx.set(r, { id: r.id, customerId: e.customerId, type: e.type, points: e.points, balanceAfter: e.balanceAfter, referenceId: e.referenceId, description: e.description, createdBy: e.createdBy, createdAt: e.now });
++};
++const balanceValue = (b: number, s: PerksSettings) => redemptionValueKes(b, s);
++
++async function allocCode(tx: Tx, db: Db): Promise<string> {
++  for (let i = 0; i < 8; i++) { const c = makeCode(); if (!(await tx.get(db.doc(`${P.codes}/${c}`))).exists) return c; }
++  throw new PerksError("aborted", "Could not allocate a referral code. Try again.");
++}
++
++// ───────────────────────── sales ─────────────────────────
++export interface SaleArgs { operatorUid: string; phone: unknown; items: unknown; nonEligibleAmount?: unknown; referralCode?: unknown; idempotencyKey: unknown }
++export async function recordSale(db: Db, a: SaleArgs, now = Date.now()) {
++  const key = need(a.idempotencyKey), phone = toE164(a.phone), cid = customerId(phone), items = cleanItems(a.items);
++  const ne = a.nonEligibleAmount === undefined || a.nonEligibleAmount === "" ? 0 : cleanMoney(a.nonEligibleAmount, true, "Non-eligible amount");
++  const code = a.referralCode ? normCode(a.referralCode) : "";
++  const txId = "T" + sha(`${a.operatorUid}:${key}`).slice(0, 20);
++  return db.runTransaction(async (tx) => {
++    const sRef = db.doc(`${P.settings}/main`), cRef = db.doc(`${P.customers}/${cid}`), tRef = db.doc(`${P.tx}/${txId}`), rRef = db.doc(`${P.referrals}/${cid}`);
++    const [sSnap, cSnap, tSnap, rSnap] = await Promise.all([tx.get(sRef), tx.get(cRef), tx.get(tRef), tx.get(rRef)]);
++    const cur: Rec = cSnap.data() || {};
++    if (tSnap.exists) return { duplicate: true, transaction: tSnap.data() as Rec, customer: { id: cid, phone, pointsBalance: cur.pointsBalance || 0, referralCode: cur.referralCode }, notifications: [] as Notification[] };
++    const s = settingsFrom(sSnap.data());
++    const lines = items.map((i) => { const pointsRate = rateFor(i.itemType, s); return { ...i, eligibleAmount: i.price, pointsRate, pointsEarned: pointsFor(i.price, pointsRate) }; });
++    const eligible = lines.reduce((n, l) => n + l.eligibleAmount, 0), points = lines.reduce((n, l) => n + l.pointsEarned, 0), total = eligible + ne;
++    const isNew = !cSnap.exists, txCount: number = cur.txCount || 0;
++    const referralCode: string = isNew ? await allocCode(tx, db) : cur.referralCode;
++
++    let ref: Rec | null = rSnap.exists ? (rSnap.data() as Rec) : null, refIsNew = false;
++    if (!ref && code) {
++      if (txCount > 0) throw new PerksError("failed-precondition", "A referral can only be attached on a customer's first visit.");
++      const cs = await tx.get(db.doc(`${P.codes}/${code}`));
++      if (!cs.exists) throw new PerksError("not-found", "Referral code not found.");
++      const inviterId = (cs.data() as Rec).customerId as string;
++      if (inviterId === cid) throw new PerksError("failed-precondition", "Self-referral is not allowed.");
++      ref = { id: cid, referrerCustomerId: inviterId, referredCustomerId: cid, referralCode: code, status: "PENDING", referrerReward: s.referrerReward, inviteeReward: s.inviteeReward, qualifyingTransactionId: null, qualifyingAmount: null, drawResult: null, createdAt: now, rewardedAt: null };
++      refIsNew = true;
++    }
++    const qualifies = !!ref && ref.status === "PENDING" && qualifiesReferral(eligible, s);
++    let inviter: Rec | null = null;
++    if (qualifies && ref) { const i = await tx.get(db.doc(`${P.customers}/${ref.referrerCustomerId}`)); inviter = i.exists ? (i.data() as Rec) : null; }
++
++    // ---- all reads done; writes only below ----
++    let bal: number = cur.pointsBalance || 0;
++    const txDoc: Rec = { id: txId, customerId: cid, phone, totalAmount: total, eligibleAmount: eligible, nonEligibleAmount: ne, pointsEarned: points,
++      pointsRateSnapshot: { services: s.servicesPointsRate, products: s.productsPointsRate }, status: "COMPLETED", createdBy: a.operatorUid, createdAt: now, idempotencyKey: key, referralCode: code || null,
++      items: lines.map((l, n) => ({ id: `${txId}-${n + 1}`, itemName: l.itemName, itemType: l.itemType, quantity: 1, unitPrice: l.price, totalPrice: l.price, eligibleAmount: l.eligibleAmount, pointsRate: l.pointsRate, pointsEarned: l.pointsEarned })) };
++    tx.set(tRef, txDoc);
++    if (points > 0) { bal += points; ledger(tx, db, { customerId: cid, type: "EARN", points, balanceAfter: bal, referenceId: txId, description: `Sale ${txId}`, createdBy: a.operatorUid, now }); }
++    const notifications: Notification[] = [];
++    if (isNew) notifications.push({ customerId: cid, type: "welcome", vars: { referralCode } });
++    if (refIsNew && ref) tx.set(rRef, ref);
++    if (qualifies && ref) {
++      if (inviter) {
++        bal += s.inviteeReward;
++        ledger(tx, db, { customerId: cid, type: "REFERRAL", points: s.inviteeReward, balanceAfter: bal, referenceId: ref.id, description: "Welcome referral reward", createdBy: a.operatorUid, now });
++        const ib: number = (inviter.pointsBalance || 0) + s.referrerReward;
++        ledger(tx, db, { customerId: ref.referrerCustomerId, type: "REFERRAL", points: s.referrerReward, balanceAfter: ib, referenceId: ref.id, description: "Referral reward", createdBy: a.operatorUid, now });
++        tx.set(db.doc(`${P.customers}/${ref.referrerCustomerId}`), { pointsBalance: ib, updatedAt: now }, { merge: true });
++        tx.set(rRef, { ...ref, status: "REWARDED", qualifyingTransactionId: txId, qualifyingAmount: eligible, rewardedAt: now }, { merge: true });
++        audit(tx, db, a.operatorUid, "REFERRAL_REWARDED", ref.id, { txId }, now);
++        notifications.push({ customerId: ref.referrerCustomerId, type: "referralReferrer", vars: { referrerReward: s.referrerReward, pointsBalance: ib, balanceValue: balanceValue(ib, s) } });
++        notifications.push({ customerId: cid, type: "referralInvitee", vars: { inviteeReward: s.inviteeReward, pointsBalance: bal, balanceValue: balanceValue(bal, s) } });
++      } else tx.set(rRef, { ...ref, status: "REJECTED" }, { merge: true });
++    }
++    tx.set(cRef, { id: cid, phone, pointsBalance: bal, totalEligibleSpend: (cur.totalEligibleSpend || 0) + eligible, txCount: txCount + 1, referralCode,
++      referredBy: ref ? ref.referrerCustomerId : cur.referredBy ?? null, loyaltyConsent: isNew ? true : cur.loyaltyConsent !== false, marketingConsent: cur.marketingConsent === true,
++      authUid: cur.authUid ?? null, createdAt: cur.createdAt || now, updatedAt: now }, { merge: true });
++    if (isNew) tx.set(db.doc(`${P.codes}/${referralCode}`), { customerId: cid, createdAt: now });
++    notifications.unshift({ customerId: cid, type: "sale", transactionId: txId, vars: { amount: total, pointsEarned: points, pointsBalance: bal, balanceValue: balanceValue(bal, s), service: lines.map((l) => l.itemName).join(", ").slice(0, 60) } });
++    return { duplicate: false, transaction: txDoc, customer: { id: cid, phone, pointsBalance: bal, referralCode }, notifications };
++  });
++}
++
++export async function reverseSale(db: Db, a: { operatorUid: string; transactionId: unknown; reason: unknown }, now = Date.now()) {
++  const id = String(a.transactionId ?? ""), reason = String(a.reason ?? "").trim();
++  if (!id) throw new PerksError("invalid-argument", "Transaction id required.");
++  if (reason.length < 3 || reason.length > 200) throw new PerksError("invalid-argument", "Give a reason (3 to 200 characters).");
++  return db.runTransaction(async (tx) => {
++    const tRef = db.doc(`${P.tx}/${id}`), tSnap = await tx.get(tRef);
++    if (!tSnap.exists) throw new PerksError("not-found", "Transaction not found.");
++    const t = tSnap.data() as Rec;
++    if (t.status !== "COMPLETED") throw new PerksError("failed-precondition", "Only completed sales can be reversed.");
++    const cRef = db.doc(`${P.customers}/${t.customerId}`), c = ((await tx.get(cRef)).data() || {}) as Rec;
++    const bal: number = c.pointsBalance || 0;
++    if (bal < t.pointsEarned) throw new PerksError("failed-precondition", "The customer has already spent these points; reverse the redemption first.");
++    const after = bal - t.pointsEarned;
++    if (t.pointsEarned > 0) ledger(tx, db, { customerId: t.customerId, type: "REVERSAL", points: -t.pointsEarned, balanceAfter: after, referenceId: id, description: `Reversal of ${id}: ${reason}`, createdBy: a.operatorUid, now });
++    tx.set(tRef, { status: "REVERSED", reversedAt: now, reversedBy: a.operatorUid, reversalReason: reason }, { merge: true });
++    tx.set(cRef, { pointsBalance: after, totalEligibleSpend: Math.max(0, (c.totalEligibleSpend || 0) - t.eligibleAmount), updatedAt: now }, { merge: true });
++    audit(tx, db, a.operatorUid, "SALE_REVERSED", id, { reason }, now);
++    return { reversed: true, pointsBalance: after };
++  });
++}
++
++// ───────────────────────── redemption (operator only) ─────────────────────────
++export async function redeem(db: Db, a: { operatorUid: string; phone: unknown; points: unknown; idempotencyKey: unknown }, now = Date.now()) {
++  const key = need(a.idempotencyKey), cid = customerId(toE164(a.phone)), pts = cleanPoints(a.points), rid = "R" + sha(`${a.operatorUid}:${key}`).slice(0, 20);
++  return db.runTransaction(async (tx) => {
++    const sRef = db.doc(`${P.settings}/main`), cRef = db.doc(`${P.customers}/${cid}`), rRef = db.doc(`${P.redemptions}/${rid}`);
++    const [sSnap, cSnap, rSnap] = await Promise.all([tx.get(sRef), tx.get(cRef), tx.get(rRef)]);
++    if (rSnap.exists) return { duplicate: true, redemption: rSnap.data() as Rec, notifications: [] as Notification[] };
++    if (!cSnap.exists) throw new PerksError("not-found", "Customer not found.");
++    const s = settingsFrom(sSnap.data()), c = cSnap.data() as Rec, bal: number = c.pointsBalance || 0;
++    if (pts < s.minimumRedemption) throw new PerksError("failed-precondition", `Minimum redemption is ${s.minimumRedemption} points.`);
++    if (pts > bal) throw new PerksError("failed-precondition", "Customer does not have enough points.");
++    const value = redemptionValueKes(pts, s), after = bal - pts;
++    ledger(tx, db, { customerId: cid, type: "REDEEM", points: -pts, balanceAfter: after, referenceId: rid, description: "Redeemed in shop", createdBy: a.operatorUid, now });
++    const redemption = { id: rid, customerId: cid, phone: c.phone, points: pts, valueKes: value, balanceAfter: after, createdBy: a.operatorUid, createdAt: now };
++    tx.set(rRef, redemption);
++    tx.set(cRef, { pointsBalance: after, updatedAt: now }, { merge: true });
++    return { duplicate: false, redemption, notifications: [{ customerId: cid, type: "redeem", vars: { pointsRedeemed: pts, discount: value, pointsBalance: after, balanceValue: balanceValue(after, s) } }] as Notification[] };
++  });
++}
++
++// ───────────────────────── referrals ─────────────────────────
++export async function registerReferral(db: Db, a: { operatorUid: string; inviteePhone: unknown; code: unknown }, now = Date.now()) {
++  const phone = toE164(a.inviteePhone), cid = customerId(phone), code = normCode(a.code);
++  return db.runTransaction(async (tx) => {
++    const cRef = db.doc(`${P.customers}/${cid}`), rRef = db.doc(`${P.referrals}/${cid}`), kRef = db.doc(`${P.codes}/${code}`), sRef = db.doc(`${P.settings}/main`);
++    const [cSnap, rSnap, kSnap, sSnap] = await Promise.all([tx.get(cRef), tx.get(rRef), tx.get(kRef), tx.get(sRef)]);
++    if (!kSnap.exists) throw new PerksError("not-found", "Referral code not found.");
++    const inviterId = (kSnap.data() as Rec).customerId as string;
++    if (inviterId === cid) throw new PerksError("failed-precondition", "Self-referral is not allowed.");
++    if (rSnap.exists) throw new PerksError("already-exists", "This customer already has a referrer.");
++    if (cSnap.exists && (cSnap.data() as Rec).txCount > 0) throw new PerksError("failed-precondition", "Only a new customer can be referred.");
++    const s = settingsFrom(sSnap.data());
++    const newCode = cSnap.exists ? (cSnap.data() as Rec).referralCode : await allocCode(tx, db);
++    const ref = { id: cid, referrerCustomerId: inviterId, referredCustomerId: cid, referralCode: code, status: "PENDING", referrerReward: s.referrerReward, inviteeReward: s.inviteeReward, qualifyingTransactionId: null, qualifyingAmount: null, drawResult: null, createdAt: now, rewardedAt: null };
++    tx.set(rRef, ref);
++    tx.set(cRef, { id: cid, phone, pointsBalance: 0, totalEligibleSpend: 0, txCount: 0, referralCode: newCode, referredBy: inviterId, loyaltyConsent: true, marketingConsent: false, authUid: null, createdAt: now, updatedAt: now }, { merge: true });
++    if (!cSnap.exists) tx.set(db.doc(`${P.codes}/${newCode}`), { customerId: cid, createdAt: now });
++    audit(tx, db, a.operatorUid, "REFERRAL_REGISTERED", cid, { code }, now);
++    return ref;
++  });
++}
++
++// ───────────────────────── vouchers (single use, status-guarded) ─────────────────────────
++const VTYPES: VoucherType[] = ["DISCOUNT", "AIRTIME", "POINTS"];
++const voucherText = (t: string, v: number) => (t === "POINTS" ? `${v} points` : t === "AIRTIME" ? `KES ${v} airtime` : `KES ${v} off`);
++export async function createVoucher(db: Db, a: { operatorUid: string; type: unknown; value: unknown; expiresAt?: unknown; campaignId?: unknown }, now = Date.now()) {
++  if (!VTYPES.includes(a.type as VoucherType)) throw new PerksError("invalid-argument", "Voucher type must be DISCOUNT, AIRTIME or POINTS.");
++  const value = cleanMoney(a.value, false, "Voucher value"), type = a.type as VoucherType;
++  const expiresAt = a.expiresAt ? Number(a.expiresAt) : null;
++  if (expiresAt !== null && !(expiresAt > now)) throw new PerksError("invalid-argument", "Expiry must be in the future.");
++  for (let i = 0; i < 6; i++) {
++    const code = `${type.slice(0, 4)}${value}-${makeCode(5)}`;
++    try {
++      await db.doc(`${P.vouchers}/${code}`).create({ id: code, code, type, value, status: "AVAILABLE", customerId: null, campaignId: a.campaignId ? String(a.campaignId) : null, expiresAt, createdBy: a.operatorUid, createdAt: now, redeemedAt: null });
++      return { id: code, code, type, value };
++    } catch (e) { if ((e as { code?: number }).code !== 6) throw e; }
++  }
++  throw new PerksError("aborted", "Could not create a unique voucher code.");
++}
++export async function assignVoucher(db: Db, a: { operatorUid: string; voucherId: unknown; phone: unknown }, now = Date.now()) {
++  const vid = String(a.voucherId ?? ""), cid = customerId(toE164(a.phone));
++  return db.runTransaction(async (tx) => {
++    const vRef = db.doc(`${P.vouchers}/${vid}`), cRef = db.doc(`${P.customers}/${cid}`), sRef = db.doc(`${P.settings}/main`);
++    const [vSnap, cSnap, sSnap] = await Promise.all([tx.get(vRef), tx.get(cRef), tx.get(sRef)]);
++    if (!vSnap.exists) throw new PerksError("not-found", "Voucher not found.");
++    if (!cSnap.exists) throw new PerksError("not-found", "Customer not found.");
++    const v = vSnap.data() as Rec, c = cSnap.data() as Rec, s = settingsFrom(sSnap.data());
++    if (v.status !== "AVAILABLE") throw new PerksError("failed-precondition", "Voucher is not available.");
++    if (v.expiresAt && v.expiresAt < now) throw new PerksError("failed-precondition", "Voucher has expired.");
++    let bal: number = c.pointsBalance || 0;
++    const patch: Rec = { customerId: cid, status: "AWARDED", awardedAt: now };
++    if (v.type === "POINTS") { bal += v.value; ledger(tx, db, { customerId: cid, type: "VOUCHER", points: v.value, balanceAfter: bal, referenceId: vid, description: `Voucher ${vid}`, createdBy: a.operatorUid, now }); tx.set(cRef, { pointsBalance: bal, updatedAt: now }, { merge: true }); patch.status = "REDEEMED"; patch.redeemedAt = now; }
++    tx.set(vRef, patch, { merge: true });
++    audit(tx, db, a.operatorUid, "VOUCHER_ASSIGNED", vid, { customerId: cid }, now);
++    return { voucherId: vid, status: patch.status as VoucherStatus, notifications: [{ customerId: cid, type: "voucher", vars: { voucherCode: vid, voucherValue: voucherText(v.type, v.value), pointsBalance: bal, balanceValue: balanceValue(bal, s) } }] as Notification[] };
++  });
++}
++export async function setVoucherStatus(db: Db, a: { operatorUid: string; voucherId: unknown; status: unknown }, now = Date.now()) {
++  const vid = String(a.voucherId ?? ""), next = a.status;
++  if (next !== "REDEEMED" && next !== "VOID") throw new PerksError("invalid-argument", "Status must be REDEEMED or VOID.");
++  return db.runTransaction(async (tx) => {
++    const vRef = db.doc(`${P.vouchers}/${vid}`), snap = await tx.get(vRef);
++    if (!snap.exists) throw new PerksError("not-found", "Voucher not found.");
++    const v = snap.data() as Rec;
++    if (next === "REDEEMED" && v.status !== "AWARDED") throw new PerksError("failed-precondition", "Only an awarded voucher can be redeemed.");
++    if (next === "VOID" && v.status !== "AVAILABLE" && v.status !== "AWARDED") throw new PerksError("failed-precondition", "This voucher can no longer be voided.");
++    tx.set(vRef, { status: next, ...(next === "REDEEMED" ? { redeemedAt: now } : { voidedAt: now }) }, { merge: true });
++    audit(tx, db, a.operatorUid, `VOUCHER_${next}`, vid, {}, now);
++    return { voucherId: vid, status: next };
++  });
++}
++
++// ───────────────────────── campaigns, templates, settings, consent ─────────────────────────
++export async function saveCampaign(db: Db, a: { operatorUid: string; id?: unknown; name: unknown; advert: unknown; destinationUrl: unknown; priority?: unknown; startDate?: unknown; endDate?: unknown; promotes?: unknown }, now = Date.now()) {
++  const name = String(a.name ?? "").trim(), advert = String(a.advert ?? "").trim(), url = String(a.destinationUrl ?? "").trim();
++  if (name.length < 2 || name.length > 60) throw new PerksError("invalid-argument", "Campaign name must be 2 to 60 characters.");
++  if (advert.length < 5 || advert.length > 160) throw new PerksError("invalid-argument", "Advert must be 5 to 160 characters.");
++  if (!/^https:\/\/[^\s]+$/.test(url) || url.length > 200) throw new PerksError("invalid-argument", "Destination must be an https link.");
++  const day = (v: unknown) => { const t = String(v ?? ""); if (t && !/^\d{4}-\d{2}-\d{2}$/.test(t)) throw new PerksError("invalid-argument", "Dates must be YYYY-MM-DD."); return t || null; };
++  const startDate = day(a.startDate), endDate = day(a.endDate);
++  if (startDate && endDate && endDate < startDate) throw new PerksError("invalid-argument", "End date is before the start date.");
++  const id = a.id ? String(a.id) : "K" + makeCode(7), ref = db.doc(`${P.campaigns}/${id}`), snap = await ref.get();
++  if (a.id && !snap.exists) throw new PerksError("not-found", "Campaign not found.");
++  const doc = { id, name, advert, destinationUrl: url, priority: Math.max(1, Math.min(99, Number(a.priority) || 1)), startDate, endDate, promotes: String(a.promotes ?? "").slice(0, 80), active: snap.exists ? (snap.data() as Rec).active !== false : true, createdAt: snap.exists ? (snap.data() as Rec).createdAt : now, updatedAt: now };
++  await ref.set(doc, { merge: true });
++  return doc;
++}
++export async function setCampaignActive(db: Db, a: { id: unknown; active: unknown }, now = Date.now()) {
++  const id = String(a.id ?? ""), ref = db.doc(`${P.campaigns}/${id}`);
++  if (!(await ref.get()).exists) throw new PerksError("not-found", "Campaign not found.");
++  await ref.set({ active: a.active === true, updatedAt: now }, { merge: true });
++  if (a.active !== true) { const s = await getSettings(db); if (s.activeCampaignId === id) await db.doc(`${P.settings}/main`).set({ activeCampaignId: "" }, { merge: true }); }
++  return { id, active: a.active === true };
++}
++export async function setActiveCampaign(db: Db, a: { id: unknown }, now = Date.now()) {
++  const id = String(a.id ?? ""), snap = await db.doc(`${P.campaigns}/${id}`).get();
++  if (!snap.exists) throw new PerksError("not-found", "Campaign not found.");
++  if (!campaignLive(snap.data() as Rec as never, now)) throw new PerksError("failed-precondition", "That campaign is paused or outside its dates.");
++  await db.doc(`${P.settings}/main`).set({ activeCampaignId: id }, { merge: true });
++  return { activeCampaignId: id };
++}
++export async function saveTemplate(db: Db, a: { operatorUid: string; id: unknown; body: unknown; active?: unknown }, now = Date.now()) {
++  const id = String(a.id ?? "");
++  if (!(TEMPLATE_IDS as string[]).includes(id)) throw new PerksError("invalid-argument", "Unknown template.");
++  const body = validateTemplateBody(a.body);
++  await db.doc(`${P.templates}/${id}`).set({ id, body, active: a.active !== false, updatedAt: now, updatedBy: a.operatorUid }, { merge: true });
++  return { id, body };
++}
++const NUM_KEYS: Record<string, [number, number]> = { servicesPointsRate: [0, 100], productsPointsRate: [0, 100], minimumRedemption: [1, 100000], referrerReward: [0, 10000], inviteeReward: [0, 10000], referralMinimumPurchase: [0, 100000], smsCost: [0, 50] };
++/** drawProductionApproved is deliberately NOT editable here (legal/regulatory sign-off is a console-only change). Rates apply to new sales only. */
++export async function updateSettings(db: Db, a: { operatorUid: string; patch: unknown }, now = Date.now()) {
++  const p = (a.patch ?? {}) as Rec, out: Rec = {};
++  for (const [k, [lo, hi]] of Object.entries(NUM_KEYS)) if (p[k] !== undefined) { const n = Number(p[k]); if (!Number.isFinite(n) || n < lo || n > hi) throw new PerksError("invalid-argument", `${k} must be between ${lo} and ${hi}.`); out[k] = k === "smsCost" ? n : Math.floor(n); }
++  if (p.referralDrawEnabled !== undefined) out.referralDrawEnabled = p.referralDrawEnabled === true;
++  if (!Object.keys(out).length) throw new PerksError("invalid-argument", "Nothing to update.");
++  await db.runTransaction(async (tx) => { tx.set(db.doc(`${P.settings}/main`), out, { merge: true }); audit(tx, db, a.operatorUid, "SETTINGS_UPDATED", "main", { keys: Object.keys(out) }, now); });
++  return getSettings(db);
++}
++export async function setMarketingConsent(db: Db, a: { customerId: string; marketing: boolean; source: string; actor: string }, now = Date.now()) {
++  return db.runTransaction(async (tx) => {
++    const cRef = db.doc(`${P.customers}/${a.customerId}`), snap = await tx.get(cRef);
++    if (!snap.exists) throw new PerksError("not-found", "Customer not found.");
++    tx.set(cRef, { marketingConsent: a.marketing === true, marketingConsentUpdatedAt: now, updatedAt: now }, { merge: true });
++    tx.set(db.collection(P.consentLog).doc(), { customerId: a.customerId, kind: "marketing", value: a.marketing === true, source: a.source, actor: a.actor, createdAt: now });
++    return { marketingConsent: a.marketing === true };
++  });
++}
+diff --git a/functions/src/perks/rules.ts b/functions/src/perks/rules.ts
+new file mode 100644
+index 0000000..0ffdcad
+--- /dev/null
++++ b/functions/src/perks/rules.ts
+@@ -0,0 +1,75 @@
++// Perks business rules. Pure functions: this is the single place the points maths lives (the demo's logic, ported).
++import { PerksError, type ItemType, type NotificationType, type PerksSettings } from "./types";
++
++export const MAX_AMOUNT = 1_000_000;
++
++export function toE164(raw: unknown): string {
++  const p = String(raw ?? "").replace(/[\s-]/g, "");
++  const out = /^\+254[17]\d{8}$/.test(p) ? p : /^254[17]\d{8}$/.test(p) ? "+" + p : /^0[17]\d{8}$/.test(p) ? "+254" + p.slice(1) : "";
++  if (!out) throw new PerksError("invalid-argument", "Enter a valid Kenyan mobile number, for example 0712 345 678.");
++  return out;
++}
++export const customerId = (e164: string) => e164.replace(/^\+/, "");
++export const normCode = (raw: unknown) => String(raw ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
++
++export function cleanMoney(v: unknown, allowZero = false, what = "Amount"): number {
++  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
++  if (typeof n !== "number" || !Number.isInteger(n) || n < (allowZero ? 0 : 1) || n > MAX_AMOUNT) throw new PerksError("invalid-argument", `${what} must be a whole number of KES between ${allowZero ? 0 : 1} and ${MAX_AMOUNT}.`);
++  return n;
++}
++export function cleanPoints(v: unknown): number {
++  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
++  if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > 1_000_000) throw new PerksError("invalid-argument", "Points must be a whole number.");
++  return n;
++}
++
++export interface SaleItem { itemName: string; itemType: ItemType; price: number }
++export function cleanItems(raw: unknown): SaleItem[] {
++  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 30) throw new PerksError("invalid-argument", "Add between 1 and 30 items.");
++  return raw.map((r, i) => {
++    const o = (r ?? {}) as Record<string, unknown>;
++    const itemName = String(o.itemName ?? "").trim();
++    if (itemName.length < 1 || itemName.length > 80) throw new PerksError("invalid-argument", `Item ${i + 1}: name is required.`);
++    if (o.itemType !== "SERVICE" && o.itemType !== "PRODUCT") throw new PerksError("invalid-argument", `Item ${i + 1}: type must be SERVICE or PRODUCT.`);
++    return { itemName, itemType: o.itemType as ItemType, price: cleanMoney(o.price, false, `Item ${i + 1} price`) };
++  });
++}
++
++/** floor(eligible / 100 * rate), computed on integers so there is no float drift. */
++export const pointsFor = (eligible: number, rate: number) => Math.floor((eligible * rate) / 100);
++export const rateFor = (t: ItemType, s: PerksSettings) => (t === "SERVICE" ? s.servicesPointsRate : s.productsPointsRate);
++export const redemptionValueKes = (points: number, s: PerksSettings) => Math.round((points * s.pointsValue * 100) / s.pointsValueUnit) / 100;
++/** Strictly greater than the minimum: KES 50 does not qualify, KES 51 does. */
++export const qualifiesReferral = (eligible: number, s: PerksSettings) => eligible > s.referralMinimumPurchase;
++
++export const ALLOWED_PLACEHOLDERS = ["phone", "amount", "service", "pointsEarned", "pointsBalance", "balanceValue", "pointsRedeemed", "discount", "referralCode", "referrerReward", "inviteeReward", "voucherCode", "voucherValue"];
++export const DEFAULT_TEMPLATES: Record<NotificationType, string> = {
++  sale: "Samuhia Cyber: KES {{amount}} received. You earned {{pointsEarned}} pts. Balance {{pointsBalance}} pts (KES {{balanceValue}}).",
++  redeem: "Samuhia Cyber: you redeemed {{pointsRedeemed}} pts for KES {{discount}} off. Balance {{pointsBalance}} pts.",
++  referralReferrer: "Samuhia Perks: your referral qualified! You earned {{referrerReward}} pts. Balance {{pointsBalance}} pts.",
++  referralInvitee: "Samuhia Perks: welcome bonus! You earned {{inviteeReward}} pts. Balance {{pointsBalance}} pts.",
++  voucher: "Samuhia Perks: you won voucher {{voucherCode}} worth {{voucherValue}}. Show it at Samuhia Cyber.",
++  welcome: "Welcome to Samuhia Perks! Your referral code is {{referralCode}}. Earn points on every visit.",
++};
++export const TEMPLATE_IDS = Object.keys(DEFAULT_TEMPLATES) as NotificationType[];
++
++export function validateTemplateBody(body: unknown): string {
++  const b = String(body ?? "").trim();
++  if (b.length < 5 || b.length > 480) throw new PerksError("invalid-argument", "Template must be 5 to 480 characters.");
++  if (/https?:\/\/|www\./i.test(b)) throw new PerksError("invalid-argument", "Adverts and links belong in Campaigns, not templates.");
++  for (const m of b.matchAll(/\{\{\s*(\w+)\s*\}\}/g)) if (!ALLOWED_PLACEHOLDERS.includes(m[1])) throw new PerksError("invalid-argument", `Unknown placeholder {{${m[1]}}}.`);
++  return b;
++}
++
++export interface CampaignLike { advert: string; destinationUrl: string; active: boolean; startDate?: string | null; endDate?: string | null }
++export function campaignLive(c: CampaignLike | null | undefined, now: number): c is CampaignLike {
++  if (!c || !c.active) return false;
++  const day = new Date(now + 3 * 3600_000).toISOString().slice(0, 10); // Africa/Nairobi is UTC+3
++  return (!c.startDate || c.startDate <= day) && (!c.endDate || c.endDate >= day);
++}
++
++/** TRANSACTION TEMPLATE + CAMPAIGN ADVERT + LINK, advert only with explicit marketing consent. */
++export function composeSms(body: string, vars: Record<string, string | number>, campaign: CampaignLike | null, marketingConsent: boolean): string {
++  const base = body.replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, k: string) => String(vars[k] ?? ""));
++  return marketingConsent && campaign ? `${base} ${campaign.advert} ${campaign.destinationUrl} Reply STOP to opt out.` : base;
++}
+diff --git a/functions/src/perks/types.ts b/functions/src/perks/types.ts
+new file mode 100644
+index 0000000..4077bf6
+--- /dev/null
++++ b/functions/src/perks/types.ts
+@@ -0,0 +1,30 @@
++// Perks domain types and constants. Pure: no imports from the rest of PAY/functions.
++export class PerksError extends Error {
++  constructor(public code: "invalid-argument" | "failed-precondition" | "not-found" | "permission-denied" | "already-exists" | "aborted" | "unimplemented", message: string) { super(message); }
++}
++
++/** Firestore collections (default database). Server-only: client rules deny everything on these. */
++export const P = {
++  settings: "perks_settings", customers: "perks_customers", codes: "perks_codes", tx: "perks_tx", ledger: "perks_ledger",
++  referrals: "perks_referrals", redemptions: "perks_redemptions", vouchers: "perks_vouchers", campaigns: "perks_campaigns",
++  templates: "perks_templates", smsLog: "perks_smsLog", audit: "perks_audit", consentLog: "perks_consentLog", config: "perks_config",
++} as const;
++
++export type ItemType = "SERVICE" | "PRODUCT";
++export type VoucherType = "DISCOUNT" | "AIRTIME" | "POINTS";
++export type VoucherStatus = "AVAILABLE" | "AWARDED" | "REDEEMED" | "VOID";
++
++export interface PerksSettings {
++  servicesPointsRate: number; productsPointsRate: number; pointsValue: number; pointsValueUnit: number; minimumRedemption: number;
++  referrerReward: number; inviteeReward: number; referralMinimumPurchase: number; smsCost: number; activeCampaignId: string;
++  /** Operator-visible switch. The draw also needs drawProductionApproved, which is NEVER settable through the API. */
++  referralDrawEnabled: boolean; drawProductionApproved: boolean;
++}
++export const DEFAULT_SETTINGS: PerksSettings = {
++  servicesPointsRate: 7, productsPointsRate: 4, pointsValue: 20, pointsValueUnit: 100, minimumRedemption: 100,
++  referrerReward: 50, inviteeReward: 30, referralMinimumPurchase: 50, smsCost: 0.2, activeCampaignId: "",
++  referralDrawEnabled: false, drawProductionApproved: false,
++};
++
++export type NotificationType = "sale" | "redeem" | "referralReferrer" | "referralInvitee" | "voucher" | "welcome";
++export interface Notification { customerId: string; type: NotificationType; vars: Record<string, string | number>; transactionId?: string }
+diff --git a/functions/test/perks.check.js b/functions/test/perks.check.js
+new file mode 100644
+index 0000000..b54fb05
+--- /dev/null
++++ b/functions/test/perks.check.js
+@@ -0,0 +1,204 @@
++/* Samuhia Perks backend: business rules, atomic ops, consent-gated SMS, access boundaries.
++ * Run:  cd functions && npm run build && node test/perks.check.js   (exit 1 on failure) */
++const assert = require("assert");
++const fs = require("fs");
++const path = require("path");
++const { FakeDb } = require("./desk-fake-firestore");
++const lib = (p) => require(path.join(__dirname, "..", "lib", "perks", p));
++const R = lib("rules"), { handleOperator, handleCustomer } = lib("handlers"), { PerksError } = lib("types");
++
++// The shared fake has where(==)/limit only; add orderBy so the real queries run unchanged.
++const C = Object.getPrototypeOf(new FakeDb().collection("x")), get0 = C.get, lim0 = C.limit;
++C.orderBy = function (f, d = "asc") { const n = Object.create(this); n._o = [f, d]; return n; };
++C.limit = function (n) { const c = lim0.call(this, n); c._o = this._o; c._lim = n; c._l = null; return c; };
++C.get = async function () {
++  const q = await get0.call(this); let docs = q.docs;
++  if (this._o) { const [f, d] = this._o; docs = [...docs].sort((a, b) => (a.data()[f] < b.data()[f] ? -1 : a.data()[f] > b.data()[f] ? 1 : 0) * (d === "desc" ? -1 : 1)); }
++  if (this._lim) docs = docs.slice(0, this._lim);
++  return { docs, size: docs.length, empty: !docs.length };
++};
++
++let passed = 0, failed = 0, n = 0;
++const test = async (name, fn) => { try { await fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
++const rejects = async (fn, code, re) => { try { await fn(); } catch (e) { assert(e instanceof PerksError, "expected PerksError, got " + e); if (code) assert.strictEqual(e.code, code); if (re) assert(re.test(e.message), e.message); return; } assert.fail("expected rejection"); };
++
++const sent = [];
++let failNext = false;
++const send = async (phone, message) => { if (failNext) { failNext = false; return { success: false, error: "gateway down" }; } sent.push({ phone, message }); return { success: true }; };
++const fresh = () => { sent.length = 0; return new FakeDb(); };
++const key = () => `key-${++n}-abcdefgh`;
++const op = (db, action, p) => handleOperator(db, send, "op1", action, p);
++const sale = (db, phone, items, extra = {}) => op(db, "recordSale", { phone, items, idempotencyKey: key(), ...extra });
++const svc = (price, itemName = "Printing") => ({ itemName, itemType: "SERVICE", price });
++const prod = (price, itemName = "USB cables") => ({ itemName, itemType: "PRODUCT", price });
++const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) || {}).pointsBalance;
++
++(async () => {
++  await test("points table: services 7 and products 4 per KES 100, floored", () => {
++    const s = { servicesPointsRate: 7, productsPointsRate: 4 };
++    for (const [amt, want] of [[100, 7], [200, 14], [350, 24], [500, 35]]) assert.strictEqual(R.pointsFor(amt, R.rateFor("SERVICE", s)), want);
++    for (const [amt, want] of [[100, 4], [200, 8], [350, 14], [500, 20]]) assert.strictEqual(R.pointsFor(amt, R.rateFor("PRODUCT", s)), want);
++  });
++  await test("phone normalisation", () => {
++    for (const v of ["0712345678", "0112345678", "+254712345678", "254712 345 678"]) assert(/^\+254[17]\d{8}$/.test(R.toE164(v)));
++    assert.throws(() => R.toE164("0612345678"));
++  });
++  await test("mixed sale: per-item points, non-eligible earns nothing, total correct", async () => {
++    const db = fresh();
++    const r = await sale(db, "0712345678", [svc(100), prod(200), svc(300, "Phone flashing")], { nonEligibleAmount: 200 });
++    assert.strictEqual(r.transaction.pointsEarned, 7 + 8 + 21);
++    assert.strictEqual(r.transaction.eligibleAmount, 600);
++    assert.strictEqual(r.transaction.totalAmount, 800);
++    assert.strictEqual(bal(db, "+254712345678"), 36);
++    const led = db.list("perks_ledger"); assert.strictEqual(led.length, 1);
++    assert.strictEqual(db.read(led[0]).balanceAfter, 36);
++  });
++  await test("validation: price must be a positive whole KES, phone valid", async () => {
++    const db = fresh();
++    await rejects(() => sale(db, "0712345678", [svc(0)]), "invalid-argument");
++    await rejects(() => sale(db, "0712345678", [svc(10.5)]), "invalid-argument");
++    await rejects(() => sale(db, "123", [svc(100)]), "invalid-argument");
++    await rejects(() => op(db, "recordSale", { phone: "0712345678", items: [svc(100)] }), "invalid-argument", /request id/);
++    assert.strictEqual(db.list("perks_tx").length, 0);
++  });
++  await test("idempotency: the same request id records once", async () => {
++    const db = fresh(), k = "same-request-12345";
++    const a = await op(db, "recordSale", { phone: "0712345678", items: [svc(100)], idempotencyKey: k });
++    const b = await op(db, "recordSale", { phone: "0712345678", items: [svc(100)], idempotencyKey: k });
++    assert.strictEqual(a.duplicate, false); assert.strictEqual(b.duplicate, true);
++    assert.strictEqual(db.list("perks_tx").length, 1); assert.strictEqual(bal(db, "+254712345678"), 7);
++  });
++  await test("referral: KES 50 does not qualify, KES 51 does; 50/30 paid exactly once", async () => {
++    const db = fresh();
++    const a = await sale(db, "0711111111", [svc(100)]);
++    const code = a.customer.referralCode;
++    await sale(db, "0722222222", [svc(50)], { referralCode: code });
++    let ref = db.read("perks_referrals/254722222222"); assert.strictEqual(ref.status, "PENDING");
++    assert.strictEqual(bal(db, "+254711111111"), 7);
++    await sale(db, "0722222222", [svc(51)]);
++    ref = db.read("perks_referrals/254722222222"); assert.strictEqual(ref.status, "REWARDED");
++    assert.strictEqual(bal(db, "+254711111111"), 7 + 50);
++    assert.strictEqual(bal(db, "+254722222222"), 3 + 3 + 30);
++    await sale(db, "0722222222", [svc(500)]);
++    assert.strictEqual(bal(db, "+254711111111"), 57, "no second reward");
++    assert.strictEqual(db.list("perks_ledger").filter((p) => db.read(p).type === "REFERRAL").length, 2);
++  });
++  await test("referral on a first sale above KES 50 rewards immediately", async () => {
++    const db = fresh();
++    const a = await sale(db, "0711111111", [svc(100)]);
++    await sale(db, "0722222222", [svc(200)], { referralCode: a.customer.referralCode });
++    assert.strictEqual(bal(db, "+254711111111"), 7 + 50); assert.strictEqual(bal(db, "+254722222222"), 14 + 30);
++  });
++  await test("referral rules: no self-referral, unknown code, first visit only, one referrer", async () => {
++    const db = fresh();
++    const a = await sale(db, "0711111111", [svc(100)]), b = await sale(db, "0722222222", [svc(100)]);
++    await rejects(() => sale(db, "0711111111", [svc(100)], { referralCode: a.customer.referralCode }), "failed-precondition");
++    await rejects(() => sale(db, "0733333333", [svc(100)], { referralCode: "NOPE99" }), "not-found");
++    await rejects(() => sale(db, "0722222222", [svc(100)], { referralCode: a.customer.referralCode }), "failed-precondition", /first visit/);
++    await op(db, "registerReferral", { inviteePhone: "0744444444", code: a.customer.referralCode });
++    await rejects(() => op(db, "registerReferral", { inviteePhone: "0744444444", code: b.customer.referralCode }), "already-exists");
++    await sale(db, "0744444444", [svc(300)]);
++    assert.strictEqual(db.read("perks_referrals/254744444444").status, "REWARDED");
++  });
++  await test("redemption: operator-only rules, minimum 100, never above balance, 100 pts = KES 20", async () => {
++    const db = fresh();
++    await sale(db, "0712345678", [svc(2000)]); // 140 pts
++    await rejects(() => op(db, "redeem", { phone: "0712345678", points: 99, idempotencyKey: key() }), "failed-precondition", /Minimum/);
++    await rejects(() => op(db, "redeem", { phone: "0712345678", points: 141, idempotencyKey: key() }), "failed-precondition", /enough/);
++    const k = key(), r = await op(db, "redeem", { phone: "0712345678", points: 100, idempotencyKey: k });
++    assert.strictEqual(r.redemption.valueKes, 20); assert.strictEqual(bal(db, "+254712345678"), 40);
++    const again = await op(db, "redeem", { phone: "0712345678", points: 100, idempotencyKey: k });
++    assert.strictEqual(again.duplicate, true); assert.strictEqual(bal(db, "+254712345678"), 40);
++    assert.strictEqual(R.redemptionValueKes(150, { pointsValue: 20, pointsValueUnit: 100 }), 30);
++    assert.strictEqual(R.redemptionValueKes(1000, { pointsValue: 20, pointsValueUnit: 100 }), 200);
++  });
++  await test("reversal: ledger adjustment, never deleted, blocked if points were spent", async () => {
++    const db = fresh();
++    const s = await sale(db, "0712345678", [svc(2000)]);
++    await op(db, "reverseSale", { transactionId: s.transaction.id, reason: "wrong amount" });
++    assert.strictEqual(bal(db, "+254712345678"), 0); assert.strictEqual(db.read(`perks_tx/${s.transaction.id}`).status, "REVERSED");
++    assert(db.list("perks_ledger").some((p) => db.read(p).type === "REVERSAL"));
++    await rejects(() => op(db, "reverseSale", { transactionId: s.transaction.id, reason: "again" }), "failed-precondition");
++    const s2 = await sale(db, "0712345678", [svc(2000)]);
++    await op(db, "redeem", { phone: "0712345678", points: 100, idempotencyKey: key() });
++    await rejects(() => op(db, "reverseSale", { transactionId: s2.transaction.id, reason: "oops" }), "failed-precondition", /spent/);
++    await rejects(() => op(db, "reverseSale", { transactionId: s2.transaction.id, reason: "" }), "invalid-argument");
++  });
++  await test("vouchers: single use, status guarded, points vouchers credit the ledger", async () => {
++    const db = fresh();
++    await sale(db, "0712345678", [svc(100)]);
++    const v = await op(db, "createVoucher", { type: "DISCOUNT", value: 50 });
++    await op(db, "assignVoucher", { voucherId: v.id, phone: "0712345678" });
++    await rejects(() => op(db, "assignVoucher", { voucherId: v.id, phone: "0712345678" }), "failed-precondition");
++    await op(db, "setVoucherStatus", { voucherId: v.id, status: "REDEEMED" });
++    await rejects(() => op(db, "setVoucherStatus", { voucherId: v.id, status: "REDEEMED" }), "failed-precondition");
++    await rejects(() => op(db, "setVoucherStatus", { voucherId: v.id, status: "VOID" }), "failed-precondition");
++    const p = await op(db, "createVoucher", { type: "POINTS", value: 25 });
++    await op(db, "assignVoucher", { voucherId: p.id, phone: "0712345678" });
++    assert.strictEqual(bal(db, "+254712345678"), 7 + 25); assert.strictEqual(db.read(`perks_vouchers/${p.id}`).status, "REDEEMED");
++    const bulk = await op(db, "bulkVouchers", { type: "DISCOUNT", value: 20, count: 3 }); assert.strictEqual(bulk.created, 3);
++  });
++  await test("SMS: campaign advert only with marketing consent, STOP line included, retry works", async () => {
++    const db = fresh();
++    const k = await op(db, "saveCampaign", { name: "Samuhia Perks", advert: "Enjoy more rewards at Samuhia Cyber.", destinationUrl: "https://perks.samuhia.co.ke" });
++    await op(db, "setActiveCampaign", { id: k.id });
++    await sale(db, "0712345678", [svc(100)]);
++    assert(sent.length >= 2, "welcome + sale"); assert(sent.every((m) => !/https?:/.test(m.message)), "no advert without consent");
++    await op(db, "setConsent", { phone: "0712345678", marketing: true });
++    sent.length = 0; await sale(db, "0712345678", [svc(100)]);
++    assert(/Enjoy more rewards/.test(sent[0].message) && /perks\.samuhia\.co\.ke/.test(sent[0].message) && /STOP/.test(sent[0].message));
++    const logs = db.list("perks_smsLog").map((p) => db.read(p)); assert(logs.some((l) => l.campaignId === k.id) && logs.some((l) => l.campaignId === null));
++    assert(logs.every((l) => l.estimatedCost === 0.2));
++    failNext = true; await sale(db, "0712345678", [svc(100)]);
++    const failed = db.list("perks_smsLog").map((p) => db.read(p)).find((l) => l.status === "FAILED"); assert(failed);
++    const r = await op(db, "retrySms", { id: failed.id }); assert.strictEqual(r.status, "SENT");
++    await rejects(() => op(db, "retrySms", { id: failed.id }), "failed-precondition");
++    await op(db, "setCampaignActive", { id: k.id, active: false });
++    assert.strictEqual(db.read("perks_settings/main").activeCampaignId, "");
++    await rejects(() => op(db, "setActiveCampaign", { id: k.id }), "failed-precondition");
++  });
++  await test("templates: placeholders checked, adverts/links refused", async () => {
++    const db = fresh();
++    await op(db, "saveTemplate", { id: "sale", body: "Got KES {{amount}}, balance {{pointsBalance}} pts." });
++    await rejects(() => op(db, "saveTemplate", { id: "sale", body: "Hi {{secret}}" }), "invalid-argument");
++    await rejects(() => op(db, "saveTemplate", { id: "sale", body: "Visit https://example.com now" }), "invalid-argument", /Campaigns/);
++    await sale(db, "0712345678", [svc(100)]);
++    assert(sent.some((m) => /Got KES 100, balance 7 pts\./.test(m.message)));
++  });
++  await test("settings and the reward draw: draw needs a console-only approval flag", async () => {
++    const db = fresh();
++    await rejects(() => op(db, "updateSettings", { patch: { drawProductionApproved: true } }), "invalid-argument");
++    await op(db, "updateSettings", { patch: { referralDrawEnabled: true } });
++    await rejects(() => op(db, "runDraw", {}), "failed-precondition", /legal/);
++    const s = await op(db, "updateSettings", { patch: { servicesPointsRate: 8 } });
++    assert.strictEqual(s.servicesPointsRate, 8);
++    const r = await sale(db, "0712345678", [svc(100)]); assert.strictEqual(r.transaction.pointsRateSnapshot.services, 8);
++    await rejects(() => op(db, "updateSettings", { patch: { servicesPointsRate: 5000 } }), "invalid-argument");
++  });
++  await test("customer access: own account only, phone comes from the token, no redeem action", async () => {
++    const db = fresh();
++    await sale(db, "0712345678", [svc(100)]); await sale(db, "0723456789", [svc(300)]);
++    const mine = await handleCustomer(db, { uid: "u1", phone: "+254712345678" }, "summary", {});
++    assert.strictEqual(mine.customer.pointsBalance, 7); assert(!("authUid" in mine.customer));
++    assert(mine.tx.every((t) => t.phone === "+254712345678"));
++    await rejects(() => handleCustomer(db, { uid: "u2", phone: "+254712345678" }, "summary", {}), "permission-denied");
++    await rejects(() => handleCustomer(db, { uid: "u1", phone: "+254712345678" }, "redeem", { points: 100 }), "invalid-argument");
++    assert.deepStrictEqual(await handleCustomer(db, { uid: "u9", phone: "+254799999999" }, "summary", {}), { registered: false });
++    await handleCustomer(db, { uid: "u1", phone: "+254712345678" }, "setMarketing", { value: true });
++    assert.strictEqual(db.read("perks_customers/254712345678").marketingConsent, true);
++    assert(db.list("perks_consentLog").length >= 1);
++  });
++  await test("static: portable folder, credentials from the bundle only, SMS functions bind secrets", () => {
++    const dir = path.join(__dirname, "..", "src", "perks");
++    for (const f of fs.readdirSync(dir)) {
++      const t = fs.readFileSync(path.join(dir, f), "utf8");
++      assert(!/process\.env/.test(t), f + " reads the environment");
++      if (f !== "deps.ts") assert(!/from\s+["']\.\.\//.test(t), f + " imports outside perks/ (only deps.ts may)");
++    }
++    const idx = fs.readFileSync(path.join(dir, "index.ts"), "utf8");
++    assert(/export const perks_op = onCall\(\{[^}]*secrets: SECRETS/.test(idx), "perks_op must bind SECRETS");
++    assert(/export \* from "\.\/perks"/.test(fs.readFileSync(path.join(__dirname, "..", "src", "index.ts"), "utf8")));
++  });
++  console.log(`\nperks: ${passed} passed, ${failed} failed`);
++  process.exit(failed ? 1 : 0);
++})();

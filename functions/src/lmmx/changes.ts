@@ -240,6 +240,8 @@ export async function setDueDay(t: TenantDoc, dueDay: unknown): Promise<{ dueDay
   return { dueDay: d, effectiveFromCycleDate: nextDueDate(cur?.dueDate ?? today, d, 1) };
 }
 export async function setPlan(t: TenantDoc, frequency: Frequency, suggested?: number): Promise<void> {
+  const wd = (await col(COL.locks).doc(`wdcool_phone_${t.phoneHash.slice(0, 40)}`).get()).data()?.at as number | undefined;
+  if (wd && now() - wd < LMMX.WITHDRAW_NEW_PLAN_COOLDOWN_MS) return fail("LMMX_E_STATE", "A withdrawal was made recently, so your plan cannot be changed yet. Please try again in a few days.");
   if (!(["daily", "weekly", "biweekly"] as const).includes(frequency)) return fail("LMMX_E_VALIDATION", "Choose daily, weekly or every two weeks.");
   if (suggested !== undefined && (!isValidCredit(suggested) || suggested > t.rent.amountMinor)) return fail("LMMX_E_AMOUNT", "Enter a whole-shilling amount from KES 10.");
   await col(COL.tenants).doc(t.tenantId).update({ frequency, ...(suggested !== undefined ? { suggestedCreditMinor: suggested } : {}), updatedAt: now() });

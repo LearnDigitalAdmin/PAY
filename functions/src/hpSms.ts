@@ -23,8 +23,15 @@ export interface HpSmsOptions {
   senderId?: string;
   /** Duplicate suppression; default true. */
   duplicateCheck?: boolean;
+  /** Tag the send so delivery reports can be routed back: product handler + a reference (e.g. a Firestore doc path). */
+  track?: { product: string; ref?: string };
 }
-export interface HpSmsResult { success: boolean; raw?: any; error?: string }
+export interface HpSmsResult { success: boolean; raw?: any; error?: string; /** Provider message ids found in the response (for delivery matching). */ providerIds?: string[] }
+
+/** Installed by ./sms (delivery tracking). Kept as a hook so this file stays dependency-free. */
+export type DispatchTracker = (a: { product: string; ref?: string; mobile: string; message: string; raw: unknown }) => Promise<string[]>;
+let dispatchTracker: DispatchTracker | null = null;
+export const setDispatchTracker = (t: DispatchTracker | null): void => { dispatchTracker = t; };
 
 /** Never throws. Logs loudly when a secret is missing, so "no SMS" is never silent again. */
 export async function sendHpSms(opts: HpSmsOptions): Promise<HpSmsResult> {
@@ -46,7 +53,13 @@ export async function sendHpSms(opts: HpSmsOptions): Promise<HpSmsResult> {
     const d = res.data;
     console.log(`HostPinnacle SMS response for ${opts.mobile}:`, JSON.stringify(d));
     const isError = d?.status === "error" || d?.ErrorCode !== undefined || (typeof d?.status === "string" && d.status.toLowerCase().includes("fail"));
-    return isError ? { success: false, raw: d, error: d?.message || "API error" } : { success: true, raw: d };
+    if (isError) return { success: false, raw: d, error: d?.message || "API error" };
+    let providerIds: string[] | undefined;
+    if (dispatchTracker) {
+      try { providerIds = await dispatchTracker({ product: opts.track?.product || "unknown", ref: opts.track?.ref, mobile: opts.mobile, message: opts.message, raw: d }); }
+      catch (e: any) { console.error("SMS dispatch tracking failed (send itself succeeded):", e?.message); }
+    }
+    return { success: true, raw: d, providerIds };
   } catch (err: any) {
     const msg = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
     console.error(`HostPinnacle SMS send error for ${opts.mobile}:`, msg);

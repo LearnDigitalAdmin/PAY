@@ -12,7 +12,7 @@ export const otpKey = (tenantId: string, purpose: string, changeId?: string): st
 
 export interface IssueResult { expiresAt: number; resendsLeft: number }
 /** Creates (or replaces) the single active code for this tenant+purpose, texts it, and returns when it expires. A resend invalidates the old code. */
-export async function issueOtp(p: { tenantId: string; purpose: "setup" | "change" | "cancel"; changeId?: string; payloadHash: string; phoneE164: string; compose: (c4: string) => string }): Promise<IssueResult> {
+export async function issueOtp(p: { tenantId: string; purpose: "setup" | "change" | "cancel" | "withdraw"; changeId?: string; payloadHash: string; phoneE164: string; compose: (c4: string) => string }): Promise<IssueResult> {
   const ref = col(COL.otps).doc(otpKey(p.tenantId, p.purpose, p.changeId));
   const prev = (await ref.get()).data() as OtpDoc | undefined;
   const recent = (prev?.sends ?? []).filter((t) => now() - t < 3_600_000);
@@ -32,7 +32,7 @@ export async function issueOtp(p: { tenantId: string; purpose: "setup" | "change
 
 export type OtpVia = "desk" | "bot" | "tenant";
 /** Checks a 4-digit code. Throws LMMX_E_OTP_* on any problem (and counts wrong tries); returns on success and burns the code. */
-export async function verifyOtp(p: { tenantId: string; purpose: "setup" | "change" | "cancel"; changeId?: string; input: string; expectedPayloadHash: string; via: OtpVia; actorDesk?: string }): Promise<void> {
+export async function verifyOtp(p: { tenantId: string; purpose: "setup" | "change" | "cancel" | "withdraw"; changeId?: string; input: string; expectedPayloadHash: string; via: OtpVia; actorDesk?: string }): Promise<void> {
   const ref = col(COL.otps).doc(otpKey(p.tenantId, p.purpose, p.changeId));
   const input = String(p.input ?? "").replace(/\D/g, "").slice(-4);
   type Out = "ok" | "wrong" | "expired" | "locked" | "none";
@@ -50,7 +50,7 @@ export async function verifyOtp(p: { tenantId: string; purpose: "setup" | "chang
   });
   const outcome = o.v;
   if (outcome === "ok") return;
-  if (outcome === "wrong" || outcome === "locked") await audit({ action: p.purpose === "setup" ? "setup_otp_failed" : "change_otp_failed", actor: { type: p.via === "desk" ? "desk" : p.via === "bot" ? "bot" : "tenant", deskCode: p.actorDesk }, tenantId: p.tenantId, summary: `${p.purpose} code ${outcome} via ${p.via}` });
+  if (outcome === "wrong" || outcome === "locked") await audit({ action: p.purpose === "setup" || p.purpose === "withdraw" ? "setup_otp_failed" : "change_otp_failed", actor: { type: p.via === "desk" ? "desk" : p.via === "bot" ? "bot" : "tenant", deskCode: p.actorDesk }, tenantId: p.tenantId, summary: `${p.purpose} code ${outcome} via ${p.via}` });
   if (outcome === "locked") return fail("LMMX_E_OTP_LOCKED", "Too many wrong codes. Try again later.");
   if (outcome === "expired") return fail("LMMX_E_OTP_EXPIRED", "That code has expired. Ask for a new one.");
   return fail("LMMX_E_OTP_INVALID", "That code is not right.");

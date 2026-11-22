@@ -1,0 +1,248 @@
+diff --git a/docs/perks/DEPLOY.md b/docs/perks/DEPLOY.md
+index 069d8ae..1c0a34f 100644
+--- a/docs/perks/DEPLOY.md
++++ b/docs/perks/DEPLOY.md
+@@ -1,14 +1,15 @@
+ # Perks + delivery webhook: deploy runbook (PAY and PMS)
+ 
+-Only 3 functions are new. Everything below deploys just those, never the other 100+.
++Only 3 functions are new, plus 2 existing login functions that gained a Perks variant. Everything below deploys just those 5, never the other 100+.
+ 
+ | Function | Status | Purpose |
+ |---|---|---|
+ | `perks_op` | new | operator actions |
+ | `perks_me` | new | customer's own account |
+ | `hpSmsWebhook` | new | HostPinnacle delivery reports (shared by all products) |
++| `sendLoginOtp`, `verifyLoginOtp` | updated | add `product: "perks"`: Perks wording, the shared `HP_SMS_*` sender, any Kenyan network (payments behaviour unchanged) |
+ 
+-Optional, only to start delivery-tracking their SMS (they keep working unchanged if not redeployed): `sendLoginOtp`, `mychamaLinkRequestCode`, `lmm_dailySweep`, `lmmx_dailySweep`, `lwBotApi`, `crScheduler`. Payment/reconcile callbacks that also send SMS (`paystackCallback`, `chargeSmsTopUp`, `reconcileMyChamaIntents`, `mychamaPaystackCallback`, `reconcileMyChamaIntentsV2`) are not included by the script; redeploy them by name later if wanted.
++Optional, only to start delivery-tracking their SMS (they keep working unchanged if not redeployed): `mychamaLinkRequestCode`, `lmm_dailySweep`, `lmmx_dailySweep`, `lwBotApi`, `crScheduler`. Payment/reconcile callbacks that also send SMS (`paystackCallback`, `chargeSmsTopUp`, `reconcileMyChamaIntents`, `mychamaPaystackCallback`, `reconcileMyChamaIntentsV2`) are not included by the script; redeploy them by name later if wanted.
+ 
+ ## Steps (in this order)
+ ```bash
+@@ -24,7 +25,7 @@ cd .. && firebase deploy --only firestore:indexes --project plot-9fd6e      # in
+ cd ../PAY && bash scripts/hp-webhook-secret.sh
+ 
+ # 3. Build, test, deploy ONLY the new functions
+-bash scripts/deploy-perks.sh                    # add --with-senders to also redeploy the 6 SMS-sending functions
++bash scripts/deploy-perks.sh                    # add --with-senders to also redeploy the 5 other SMS-sending functions
+ 
+ # 4. Allow the shop owner as Perks operator (uid from Firebase Console > Authentication)
+ cd functions && gcloud auth application-default login && GOOGLE_CLOUD_PROJECT=plot-9fd6e node scripts/perks-operators.js add <UID>
+diff --git a/functions/src/auth/otp.ts b/functions/src/auth/otp.ts
+index c92bf17..13cf61e 100644
+--- a/functions/src/auth/otp.ts
++++ b/functions/src/auth/otp.ts
+@@ -21,6 +21,7 @@ import * as admin from "firebase-admin";
+ import * as crypto from "crypto";
+ import { REGION, normalizeKePhone, plotDb, MYCHAMA_ID_PEPPER } from "../mychama/config";
+ import { sendHpSmsChecked } from "../mychama/sms";
++import { sendHpSms } from "../hpSms";
+ import { BUNDLE_SECRETS } from "../secretsBundle";
+ import { checkSafaricomPhone } from "../phone/safaricom";
+ 
+@@ -43,7 +44,16 @@ function hmac(label: string, value: string): string {
+   return crypto.createHmac("sha256", MYCHAMA_ID_PEPPER.value()).update(`auth-otp:${label}:${value}`).digest("hex");
+ }
+ 
+-function cleanPhone(raw: unknown): string {
++/** Perks customers are walk-in shop customers on any Kenyan network, so (unlike payments) there is no Safaricom-only rule. */
++const isPerks = (data: unknown): boolean => (data as { product?: unknown } | undefined)?.product === "perks";
++
++function cleanPhone(raw: unknown, perks = false): string {
++  if (perks) {
++    if (typeof raw === "string" && (raw.trim().length > 20 || /[^\d\s+\-()]/.test(raw))) throw new HttpsError("invalid-argument", "Enter a valid Kenyan mobile number, for example 0712 345 678.");
++    const p = normalizeKePhone(String(raw ?? "").replace(/[\s()-]/g, ""));
++    if (!KE_MOBILE.test(p)) throw new HttpsError("invalid-argument", "Enter a valid Kenyan mobile number, for example 0712 345 678.");
++    return p;
++  }
+   const check = checkSafaricomPhone(raw);
+   if (!check.ok) throw new HttpsError("invalid-argument", check.message);
+   const phone = normalizeKePhone(check.e164);
+@@ -60,7 +70,8 @@ function callerIp(req: { rawRequest?: { headers?: Record<string, unknown>; ip?:
+ export const sendLoginOtp = onCall(
+   { region: REGION, cors: true, maxInstances: 20, secrets: OTP_SECRETS },
+   async (req): Promise<SendOtpResponse> => {
+-    const phone = cleanPhone(req.data?.phone);
++    const perks = isPerks(req.data);
++    const phone = cleanPhone(req.data?.phone, perks);
+     const db = plotDb();
+     const now = Date.now();
+     const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
+@@ -100,10 +111,13 @@ export const sendLoginOtp = onCall(
+       tx.set(dayRef, { count: admin.firestore.FieldValue.increment(1) }, { merge: true });
+     });
+ 
+-    const sent = await sendHpSmsChecked(
+-      phone,
+-      `Your Samuhia Payments verification code is ${code}. It expires in 5 minutes. Never share this code with anyone.`
+-    );
++    const sent = perks
++      ? (await sendHpSms({ mobile: phone.replace(/^\+/, ""), duplicateCheck: false, track: { product: "perks-otp" },
++          message: `Your Samuhia Perks verification code is ${code}. It expires in 5 minutes. Never share this code with anyone.` })).success
++      : await sendHpSmsChecked(
++          phone,
++          `Your Samuhia Payments verification code is ${code}. It expires in 5 minutes. Never share this code with anyone.`
++        );
+     if (!sent) {
+       // Nothing reached the phone: invalidate the code and lift the cooldown so the person can retry at once.
+       await chRef.set({ codeHash: null, lastSentAt: 0 }, { merge: true });
+@@ -118,7 +132,8 @@ type Check = { ok: true } | { ok: false; reason: "none" | "expired" | "locked" |
+ export const verifyLoginOtp = onCall(
+   { region: REGION, cors: true, maxInstances: 20, secrets: OTP_SECRETS },
+   async (req): Promise<VerifyOtpResponse> => {
+-    const phone = cleanPhone(req.data?.phone);
++    const perks = isPerks(req.data);
++    const phone = cleanPhone(req.data?.phone, perks);
+     const code = String(req.data?.code ?? "").replace(/\D/g, "");
+     if (code.length !== 6) throw new HttpsError("invalid-argument", "Enter the 6-digit code.");
+ 
+diff --git a/functions/src/perks/handlers.ts b/functions/src/perks/handlers.ts
+index 714172a..b5e90b1 100644
+--- a/functions/src/perks/handlers.ts
++++ b/functions/src/perks/handlers.ts
+@@ -9,9 +9,11 @@ type Db = firestore.Firestore;
+ type Rec = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+ const LISTABLE: Record<string, string> = { customers: P.customers, tx: P.tx, ledger: P.ledger, referrals: P.referrals, redemptions: P.redemptions, vouchers: P.vouchers, campaigns: P.campaigns, templates: P.templates, smsLog: P.smsLog, audit: P.audit };
+ 
+-async function recent(db: Db, coll: string, n: number): Promise<Rec[]> {
+-  const q = await db.collection(coll).orderBy("createdAt", "desc").limit(n).get();
+-  return q.docs.map((d) => d.data() as Rec);
++async function recent(db: Db, coll: string, n: number, since?: number): Promise<Rec[]> {
++  let q: firestore.Query = db.collection(coll);
++  if (since) q = q.where("createdAt", ">=", since);
++  const snap = await q.orderBy("createdAt", "desc").limit(n).get();
++  return snap.docs.map((d) => d.data() as Rec);
+ }
+ async function forCustomer(db: Db, coll: string, cid: string, n: number): Promise<Rec[]> {
+   const q = await db.collection(coll).where("customerId", "==", cid).orderBy("createdAt", "desc").limit(n).get();
+@@ -25,6 +27,7 @@ export async function handleOperator(db: Db, send: Sender, uid: string, action:
+     case "recordSale": return sms(await ops.recordSale(db, { ...p, ...withUid } as never));
+     case "redeem": return sms(await ops.redeem(db, { ...p, ...withUid } as never));
+     case "reverseSale": return ops.reverseSale(db, { ...withUid, transactionId: p.transactionId, reason: p.reason });
++    case "createCustomer": return sms(await ops.createCustomer(db, { operatorUid: uid, phone: p.phone }));
+     case "registerReferral": return ops.registerReferral(db, { ...withUid, inviteePhone: p.inviteePhone, code: p.code });
+     case "createVoucher": return ops.createVoucher(db, { ...withUid, type: p.type, value: p.value, expiresAt: p.expiresAt, campaignId: p.campaignId });
+     case "bulkVouchers": {
+@@ -56,7 +59,8 @@ export async function handleOperator(db: Db, send: Sender, uid: string, action:
+     case "list": {
+       const coll = LISTABLE[String(p.collection)];
+       if (!coll) throw new PerksError("invalid-argument", "Unknown collection.");
+-      return { items: await recent(db, coll, Math.min(200, Math.max(1, Number(p.limit) || 50))) };
++      const since = Number(p.since) > 0 ? Number(p.since) : undefined;
++      return { items: await recent(db, coll, Math.min(1000, Math.max(1, Number(p.limit) || 50)), since) };
+     }
+     default: throw new PerksError("invalid-argument", "Unknown action.");
+   }
+diff --git a/functions/src/perks/ops.ts b/functions/src/perks/ops.ts
+index dd46e73..323673c 100644
+--- a/functions/src/perks/ops.ts
++++ b/functions/src/perks/ops.ts
+@@ -133,6 +133,21 @@ export async function redeem(db: Db, a: { operatorUid: string; phone: unknown; p
+   });
+ }
+ 
++/** Operator adds a customer by phone (no name, no sale). Idempotent: an existing customer is returned unchanged. */
++export async function createCustomer(db: Db, a: { operatorUid: string; phone: unknown }, now = Date.now()) {
++  const phone = toE164(a.phone), cid = customerId(phone);
++  return db.runTransaction(async (tx) => {
++    const cRef = db.doc(`${P.customers}/${cid}`), snap = await tx.get(cRef);
++    if (snap.exists) return { created: false, customer: snap.data() as Rec, notifications: [] as Notification[] };
++    const code = await allocCode(tx, db);
++    const customer = { id: cid, phone, pointsBalance: 0, totalEligibleSpend: 0, txCount: 0, referralCode: code, referredBy: null, loyaltyConsent: true, marketingConsent: false, authUid: null, createdAt: now, updatedAt: now };
++    tx.set(cRef, customer);
++    tx.set(db.doc(`${P.codes}/${code}`), { customerId: cid, createdAt: now });
++    audit(tx, db, a.operatorUid, "CUSTOMER_CREATED", cid, {}, now);
++    return { created: true, customer: customer as Rec, notifications: [{ customerId: cid, type: "welcome", vars: { referralCode: code } }] as Notification[] };
++  });
++}
++
+ // ───────────────────────── referrals ─────────────────────────
+ export async function registerReferral(db: Db, a: { operatorUid: string; inviteePhone: unknown; code: unknown }, now = Date.now()) {
+   const phone = toE164(a.inviteePhone), cid = customerId(phone), code = normCode(a.code);
+diff --git a/functions/test/fake-orderby.js b/functions/test/fake-orderby.js
+index 8e9d8f1..2de9543 100644
+--- a/functions/test/fake-orderby.js
++++ b/functions/test/fake-orderby.js
+@@ -2,11 +2,17 @@
+ const { FakeDb } = require("./desk-fake-firestore");
+ const C = Object.getPrototypeOf(new FakeDb().collection("x"));
+ if (!C.__orderByPatched) {
+-  const get0 = C.get, lim0 = C.limit;
++  const get0 = C.get, lim0 = C.limit, where0 = C.where;
++  C.where = function (f, op, v) {
++    if (op === "==") { const c = where0.call(this, f, op, v); c._o = this._o; c._r = this._r; return c; }
++    if (op !== ">=" && op !== "<") throw new Error("fake: unsupported op " + op);
++    const c = new this.constructor(this._db, this.path, this._f, this._l); c._o = this._o; c._r = [...(this._r || []), { f, op, v }]; return c;
++  };
+   C.orderBy = function (f, d = "asc") { const n = Object.create(this); n._o = [f, d]; return n; };
+-  C.limit = function (n) { const c = lim0.call(this, n); c._o = this._o; c._lim = n; c._l = null; return c; };
++  C.limit = function (n) { const c = lim0.call(this, n); c._o = this._o; c._r = this._r; c._lim = n; c._l = null; return c; };
+   C.get = async function () {
+     const q = await get0.call(this); let docs = q.docs;
++    for (const r of this._r || []) docs = docs.filter((d) => (r.op === ">=" ? d.data()[r.f] >= r.v : d.data()[r.f] < r.v));
+     if (this._o) { const [f, d] = this._o; docs = [...docs].sort((a, b) => (a.data()[f] < b.data()[f] ? -1 : a.data()[f] > b.data()[f] ? 1 : 0) * (d === "desc" ? -1 : 1)); }
+     if (this._lim) docs = docs.slice(0, this._lim);
+     return { docs, size: docs.length, empty: !docs.length };
+diff --git a/functions/test/perks.check.js b/functions/test/perks.check.js
+index f348c05..f215507 100644
+--- a/functions/test/perks.check.js
++++ b/functions/test/perks.check.js
+@@ -197,6 +197,25 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
+     await hit({ msgid: l0.providerMessageId, mobile: "254712345678", status: "DELIVRD", donetime: "2026-11-22 10:15:00" });
+     assert.strictEqual(row().delivery, "DELIVERED"); assert(row().deliveredAt > 0);
+   });
++  await test("createCustomer: idempotent, welcome SMS once, usable for a first sale, unknown phone rejected", async () => {
++    const db = fresh();
++    const a = await op(db, "createCustomer", { phone: "0712345678" });
++    assert.strictEqual(a.created, true); assert(a.customer.referralCode);
++    assert(sent.some((m) => /Welcome to Samuhia Perks/.test(m.message) && m.message.includes(a.customer.referralCode)));
++    const n = sent.length, b = await op(db, "createCustomer", { phone: "+254712345678" });
++    assert.strictEqual(b.created, false); assert.strictEqual(sent.length, n, "no second welcome");
++    await rejects(() => op(db, "createCustomer", { phone: "12" }), "invalid-argument");
++    const s = await sale(db, "0712345678", [svc(100)]); assert.strictEqual(s.customer.referralCode, a.customer.referralCode);
++    assert.strictEqual(db.list("perks_customers").length, 1);
++  });
++  await test("list: newest first, since filter, limit up to 1000, unknown collection refused", async () => {
++    const db = fresh();
++    await sale(db, "0712345678", [svc(100)]); await sale(db, "0712345678", [svc(200)]);
++    const all = (await op(db, "list", { collection: "tx", limit: 1000 })).items; assert.strictEqual(all.length, 2); assert(all[0].createdAt >= all[1].createdAt);
++    const none = (await op(db, "list", { collection: "tx", since: Date.now() + 60_000 })).items; assert.strictEqual(none.length, 0);
++    const some = (await op(db, "list", { collection: "tx", since: Date.now() - 60_000 })).items; assert.strictEqual(some.length, 2);
++    await rejects(() => op(db, "list", { collection: "authOtp" }), "invalid-argument");
++  });
+   await test("static: portable folder, credentials from the bundle only, SMS functions bind secrets", () => {
+     const dir = path.join(__dirname, "..", "src", "perks");
+     for (const f of fs.readdirSync(dir)) {
+@@ -207,6 +226,9 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
+     const idx = fs.readFileSync(path.join(dir, "index.ts"), "utf8");
+     assert(/export const perks_op = onCall\(\{[^}]*secrets: SECRETS/.test(idx), "perks_op must bind SECRETS");
+     assert(/export \* from "\.\/perks"/.test(fs.readFileSync(path.join(__dirname, "..", "src", "index.ts"), "utf8")));
++    const otp = fs.readFileSync(path.join(__dirname, "..", "src", "auth", "otp.ts"), "utf8");
++    assert(/product === "perks"/.test(otp) && /Samuhia Perks verification code/.test(otp) && /Samuhia Payments verification code/.test(otp), "OTP keeps payments text and adds a perks variant");
++    assert((otp.match(/cleanPhone\(req\.data\?\.phone, perks\)/g) || []).length === 2, "both send and verify use the perks-aware phone check");
+   });
+   console.log(`\nperks: ${passed} passed, ${failed} failed`);
+   process.exit(failed ? 1 : 0);
+diff --git a/scripts/deploy-perks.sh b/scripts/deploy-perks.sh
+index c205113..e761389 100755
+--- a/scripts/deploy-perks.sh
++++ b/scripts/deploy-perks.sh
+@@ -1,14 +1,14 @@
+ #!/usr/bin/env bash
+ # Deploys ONLY the Perks + delivery-webhook functions (not the other 100+). Builds and tests first.
+-#   bash scripts/deploy-perks.sh                  perks_op, perks_me, hpSmsWebhook   (the 3 new functions)
++#   bash scripts/deploy-perks.sh                  perks_op, perks_me, hpSmsWebhook (new) + sendLoginOtp, verifyLoginOtp (Perks customer login)
+ #   bash scripts/deploy-perks.sh --with-senders   ...plus the SMS-sending functions whose sends should now be delivery-tracked
+ # Payment/reconcile callbacks are deliberately NOT included; redeploy those by name only when you want their SMS tracked.
+ set -euo pipefail
+ PROJECT="${PROJECT:-plot-9fd6e}"
+ cd "$(dirname "$0")/.."
+-ONLY="functions:perks_op,functions:perks_me,functions:hpSmsWebhook"
++ONLY="functions:perks_op,functions:perks_me,functions:hpSmsWebhook,functions:sendLoginOtp,functions:verifyLoginOtp"
+ if [ "${1:-}" = "--with-senders" ]; then
+-  ONLY="$ONLY,functions:sendLoginOtp,functions:mychamaLinkRequestCode,functions:lmm_dailySweep,functions:lmmx_dailySweep,functions:lwBotApi,functions:crScheduler"
++  ONLY="$ONLY,functions:mychamaLinkRequestCode,functions:lmm_dailySweep,functions:lmmx_dailySweep,functions:lwBotApi,functions:crScheduler"
+ fi
+ ( cd functions && npm run build && node test/perks.check.js && node test/sms-dlr.check.js && node test/no-env-credentials.check.js )
+ echo "Deploying: $ONLY"

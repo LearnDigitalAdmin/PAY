@@ -31,7 +31,7 @@ export const S = {
   signOut: 'Sign out',
 
   // Tabs
-  tabs: { home: 'Home', pay: 'Pay', history: 'History', settings: 'Settings' },
+  tabs: { home: 'Home', pay: 'Pay', money: 'Money', history: 'History', settings: 'Settings' },
 
   // Dashboard
   loading: 'Loading…',
@@ -155,6 +155,24 @@ export const S = {
 } as const;
 
 /** What the tenant reads for each server error code (the server's own message is shown only when we have nothing better). */
+export const MONEY = {
+  title: 'My money', availableLabel: 'Rent paid in and not yet sent to your landlord',
+  explain: (min: string) => `You do not type an amount: we move everything you have here. You need at least ${min}. Requests are done within 24 hours.`,
+  none: (min: string) => `You need at least ${min} paid in before you can do this.`,
+  pending: 'A request is already on its way. It will be done within 24 hours.',
+  payTitle: 'Pay my landlord now', payExplain: 'We send it all to your landlord within 24 hours, instead of waiting for your due date.',
+  payConfirm: (amt: string) => `Send ${amt} to your landlord now?`, payButton: 'Pay my landlord now', payYes: 'Yes, send it', payNo: 'Cancel',
+  wdTitle: 'Withdraw to my M-PESA', wdExplain: 'It goes only to the M-PESA number on your account. We text a code to that number first. A 15% service fee and the M-PESA transfer fee come out of the amount.',
+  wdPhone: 'Your M-PESA number', wdPhoneHint: 'It must be the same number you signed in with.', wdSend: 'Send me a code', wdSending: 'Sending…',
+  wdSummary: (avail: string, service: string, mpesa: string, net: string) => `You have ${avail}. After the 15% service fee (${service}) and the M-PESA fee (${mpesa}), ${net} will be sent to you.`,
+  wdFeeLines: (service: string, mpesa: string, net: string) => `15% service fee: ${service}. M-PESA fee: ${mpesa}. You receive: ${net}.`,
+  wdOpens: (date: string) => `Withdrawals open on ${date}, after your plan has been active for 2 weeks. You can still pay your landlord now.`,
+  wdRules: 'Withdrawals cost a 15% service fee, so paying your landlord is cheaper. A withdrawal is not available for a payment bigger than the limit for your plan, and for 3 days after a withdrawal a new plan cannot be set up.',
+  wdCodeTitle: 'Enter the code we texted you', wdConfirm: 'Confirm withdrawal', wdDone: 'Done',
+  badPhone: 'Enter a valid Safaricom number, like 0712 345 678.',
+} as const;
+/** Server messages for these codes are specific and safe to show ("You need at least KES 50...", "A withdrawal is already on its way."). */
+export const SHOW_SERVER_MESSAGE: readonly string[] = ['LMMX_E_AMOUNT', 'LMMX_E_STATE', 'LMMX_E_VALIDATION', 'LMMX_E_DISABLED', 'LMMX_E_TAMPER', 'LMMX_E_FROZEN', 'LMMX_E_RATE'];
 export const ERROR_TEXT: Partial<Record<LmmxErrorCode, string>> = {
   LMMX_E_AUTH: 'Please sign in again.',
   LMMX_E_FORBIDDEN: 'You cannot do that with this account.',

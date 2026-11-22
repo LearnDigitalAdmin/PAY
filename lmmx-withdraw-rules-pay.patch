@@ -1,0 +1,700 @@
+diff --git a/functions/src/lmmx/changes.ts b/functions/src/lmmx/changes.ts
+index 9d55796..67d6141 100644
+--- a/functions/src/lmmx/changes.ts
++++ b/functions/src/lmmx/changes.ts
+@@ -240,6 +240,8 @@ export async function setDueDay(t: TenantDoc, dueDay: unknown): Promise<{ dueDay
+   return { dueDay: d, effectiveFromCycleDate: nextDueDate(cur?.dueDate ?? today, d, 1) };
+ }
+ export async function setPlan(t: TenantDoc, frequency: Frequency, suggested?: number): Promise<void> {
++  const wd = (await col(COL.locks).doc(`wdcool_phone_${t.phoneHash.slice(0, 40)}`).get()).data()?.at as number | undefined;
++  if (wd && now() - wd < LMMX.WITHDRAW_NEW_PLAN_COOLDOWN_MS) return fail("LMMX_E_STATE", "A withdrawal was made recently, so your plan cannot be changed yet. Please try again in a few days.");
+   if (!(["daily", "weekly", "biweekly"] as const).includes(frequency)) return fail("LMMX_E_VALIDATION", "Choose daily, weekly or every two weeks.");
+   if (suggested !== undefined && (!isValidCredit(suggested) || suggested > t.rent.amountMinor)) return fail("LMMX_E_AMOUNT", "Enter a whole-shilling amount from KES 10.");
+   await col(COL.tenants).doc(t.tenantId).update({ frequency, ...(suggested !== undefined ? { suggestedCreditMinor: suggested } : {}), updatedAt: now() });
+diff --git a/functions/src/lmmx/contract.ts b/functions/src/lmmx/contract.ts
+index c92bbb5..0449307 100644
+--- a/functions/src/lmmx/contract.ts
++++ b/functions/src/lmmx/contract.ts
+@@ -12,7 +12,7 @@
+  * Dates are Africa/Nairobi calendar days "YYYY-MM-DD". User-facing brand: "Lipa Mdogo Mdogo". Internal names keep "lmm"/"lmmx".
+  */
+ 
+-export const LMMX_CONTRACT_VERSION = 3;
++export const LMMX_CONTRACT_VERSION = 4;
+ export const LMMX_REGION = "africa-south1";           // every lmmx_* callable
+ export const LMMX_BRAND = "Lipa Mdogo Mdogo";
+ export const LMMX_TOP_DESK = "COG-0000";
+@@ -56,6 +56,9 @@ export const LMMX = {
+   CANCEL_PREFIX: "LMC", WITHDRAW_PREFIX: "LMW",
+   /** Withdrawals and pay-my-landlord-now requests: the least that can be moved (KES 50), how often, and the quiet hour before a withdrawal is sent (within 24 hours in all cases). */
+   MIN_PAYOUT_MINOR: 5_000, PAYOUT_REQUESTS_PER_DAY: 5, WITHDRAW_HOLD_MS: 60 * 60_000,
++  /** WITHDRAWALS ONLY (paying the landlord is never limited by these): a 15% service fee on every withdrawal; the plan must have been active for 2 weeks; every instalment behind the balance
++   *  must be within the cap (KES 300 a day, scaled by the plan: weekly x7, biweekly x14); and for 72 hours after a withdrawal no new plan can be set up (same phone or ID) or changed. */
++  WITHDRAW_SERVICE_BPS: 1_500, WITHDRAW_MIN_ACTIVE_MS: 14 * 86_400_000, WITHDRAW_CAP_PER_DAY_MINOR: 30_000, WITHDRAW_NEW_PLAN_COOLDOWN_MS: 72 * 3_600_000,
+   SETUP_EXPIRY_MS: 72 * 3_600_000,
+   CHANGE_COOLING_OFF_MS: 48 * 3_600_000,
+   CHANGE_DEFER_DAYS_BEFORE_DUE: 3,
+@@ -180,6 +183,15 @@ export function transferCostMinor(amountMinor: number, channel: Channel): number
+ /** F: what one payout of `amountMinor` must reserve from the tenant (cost x 1.2, whole shilling, + KES 5). */
+ export const transferReserveMinor = (amountMinor: number, channel: Channel): number =>
+   wholeShilling(ceilDiv(transferCostMinor(amountMinor, channel) * LMMX.TRANSFER_UPLIFT_BPS, 10_000)) + LMMX.TRANSFER_BUFFER_MINOR;
++/** What a withdrawal of `grossMinor` costs: 15% service fee (rounded UP to a whole shilling) plus the same M-PESA transfer reserve a landlord payout pays. Everything left is sent. */
++export function withdrawBreakdown(grossMinor: number): { serviceFeeMinor: number; transferFeeMinor: number; feeMinor: number; netMinor: number } {
++  const serviceFeeMinor = wholeShilling(ceilDiv(grossMinor * LMMX.WITHDRAW_SERVICE_BPS, 10_000));
++  const transferFeeMinor = transferReserveMinor(grossMinor, "phone");
++  return { serviceFeeMinor, transferFeeMinor, feeMinor: serviceFeeMinor + transferFeeMinor, netMinor: grossMinor - serviceFeeMinor - transferFeeMinor };
++}
++/** The largest single instalment that can sit behind a withdrawal: KES 300 for a daily plan, x7 weekly, x14 biweekly. */
++export const withdrawInstalmentCapMinor = (f: Frequency): number => LMMX.WITHDRAW_CAP_PER_DAY_MINOR * (f === "daily" ? 1 : f === "weekly" ? 7 : 14);
++
+ export function serviceBps(creditMinor: number): number {
+   let bps: number = LMMX.SERVICE_BANDS[0].bps;
+   for (const b of LMMX.SERVICE_BANDS) if (creditMinor >= b.fromMinor) bps = b.bps;
+@@ -261,7 +273,7 @@ export const lmmxText = {
+     fitSms(`Samuhia: ${smsSafe(p.tenantFirstName, 16)} will pay you ${kes(p.rentMinor)} rent monthly via ${LMMX_BRAND}, in small amounts, sent in full on day ${p.dueDay}. Not right? Call ${p.supportPhone}. Collect rent free: ${LMMX_LANDLORD_URL}`),
+   /** M7 to the TENANT: the code that confirms a withdrawal of everything available to their own M-PESA number. */
+   withdraw: (p: { netMinor: number; phone: string; supportPhone: string; code4: string }) =>
+-    fitSms(`${LMMX_BRAND}: withdraw ${kes(p.netMinor)} to your M-PESA ${p.phone}. Code ${withdrawText(p.code4)} valid 30 min. Tap to confirm: ${botConfirmLink(p.code4, "LMW")} Not you? Ignore this and call ${p.supportPhone}.`),
++    fitSms(`${LMMX_BRAND}: withdraw ${kes(p.netMinor)} to your M-PESA ${p.phone} (after a 15% service fee and the M-PESA fee). Code ${withdrawText(p.code4)} valid 30 min. Tap to confirm: ${botConfirmLink(p.code4, "LMW")} Not you? Ignore this and call ${p.supportPhone}.`),
+   /** M4 to the TENANT for a change that needs their OTP. */
+   change: (p: { deskCode: string; summary: string; code4: string }) =>
+     fitSms(`${LMMX_BRAND}: desk ${p.deskCode} asks to change ${smsSafe(p.summary, 80)}. Code ${otpText(p.code4)} valid 30 min. Share it only if you agree. Confirm: ${botConfirmLink(p.code4)}`),
+@@ -368,6 +380,8 @@ export interface TenantSummaryOut {
+   suggestedCreditMinor: number; pendingChange?: PendingChangeView; awaitingSetup?: { otpExpiresAt: number; summary: string }; frozen?: boolean; supportPhone: string;
+   /** Rent paid in and not yet sent to the landlord: what a withdrawal or a pay-my-landlord-now request would move. `payoutPending` = a request is already waiting. */
+   availableMinor?: number; withdrawFeeMinor?: number; payoutPending?: boolean;
++  /** Epoch ms when withdrawals open for this plan (2 weeks after it became active). Paying the landlord now has no such wait. */
++  withdrawEligibleAt?: number;
+ }
+ export interface TenantHistoryIn { cursor?: string }
+ export interface TenantHistoryOut { items: InstalmentView[]; nextCursor?: string }
+@@ -378,9 +392,9 @@ export interface TenantPayOut { reference: string; displayText: string; chargeMi
+ /** A request to pay the landlord everything available now, or to withdraw it to the tenant's own M-PESA. Nobody types an amount: the server takes everything available. Both are processed within 24 hours. */
+ export interface PayoutRequestOut { requestedMinor: number; message: string }
+ export interface WithdrawStartIn { phone: string }                // must equal the phone on the tenant's account
+-export interface WithdrawStartOut { availableMinor: number; feeMinor: number; netMinor: number; otpExpiresAt: number }
++export interface WithdrawStartOut { availableMinor: number; serviceFeeMinor: number; transferFeeMinor: number; feeMinor: number; netMinor: number; otpExpiresAt: number }
+ export interface WithdrawConfirmIn { otp: string }                // "LMW4683" or "4683"
+-export interface WithdrawConfirmOut { requestedMinor: number; feeMinor: number; netMinor: number; message: string }
++export interface WithdrawConfirmOut { requestedMinor: number; serviceFeeMinor: number; transferFeeMinor: number; feeMinor: number; netMinor: number; message: string }
+ export interface TenantSetDueDayIn { dueDay: number }
+ export interface TenantSetDueDayOut { dueDay: number; effectiveFromCycleDate: string }
+ export interface TenantSetPlanIn { frequency: Frequency; suggestedCreditMinor?: number }
+@@ -408,7 +422,7 @@ export const BOT_SIG_MAX_AGE_MS = 5 * 60_000;
+ export type BotKind = "standalone" | "legacy" | "none";
+ export interface BotLookupIn extends BotAuth { phone: string; idNumber: string }   // phone = the WhatsApp sender in E.164
+ /** `none` and a phone/ID mismatch return the identical shape (no enumeration). */
+-export interface BotLookupOut { kind: BotKind; standalone?: { firstName: string; rentMinor: number; remainingMinor: number; dueDate: string; payByDate: string; suggestedCreditMinor: number; frozen?: boolean; awaitingSetup?: boolean; availableMinor?: number; withdrawFeeMinor?: number } }
++export interface BotLookupOut { kind: BotKind; standalone?: { firstName: string; rentMinor: number; remainingMinor: number; dueDate: string; payByDate: string; suggestedCreditMinor: number; frozen?: boolean; awaitingSetup?: boolean; availableMinor?: number; withdrawFeeMinor?: number; withdrawEligibleAt?: number } }
+ export interface BotQuoteIn extends BotAuth { phone: string; idNumber: string; creditMinor: number }
+ export interface BotQuoteOut extends TenantQuoteOut {}
+ export interface BotPayIn extends BotAuth { phone: string; idNumber: string; quoteId: string; payerPhone: string }
+diff --git a/functions/src/lmmx/index.ts b/functions/src/lmmx/index.ts
+index fba9203..7768a5a 100644
+--- a/functions/src/lmmx/index.ts
++++ b/functions/src/lmmx/index.ts
+@@ -175,8 +175,8 @@ export const lmmx_bot_lookup = fn("lmmx_bot_lookup", async (r): Promise<BotLooku
+     if (t.status === "awaiting_confirmation") return { kind: "standalone", standalone: { firstName: "", rentMinor: t.rent.amountMinor, remainingMinor: t.rent.amountMinor, dueDate: "", payByDate: "", suggestedCreditMinor: t.suggestedCreditMinor, awaitingSetup: true } };
+     const cyc = await loadCycles(t.tenantId); const cur = cyc.find((c) => remainingOf(c) > 0) ?? cyc[0];
+     const s = await tenantSummary({ uid: "", tenantId: t.tenantId, tenant: t, phone, ip: "" });
+-    const bal = t.status === "active" || t.status === "paused" ? await summaryBalance(t) : { availableMinor: 0, withdrawFeeMinor: 0 };
+-    return { kind: "standalone", standalone: { availableMinor: bal.availableMinor, withdrawFeeMinor: bal.withdrawFeeMinor, firstName: s.firstName, rentMinor: t.rent.amountMinor, remainingMinor: cur ? remainingOf(cur) : t.rent.amountMinor, dueDate: cur?.dueDate ?? "", payByDate: cur?.payByDate ?? "", suggestedCreditMinor: s.suggestedCreditMinor, ...(t.frozen ? { frozen: true } : {}) } };
++    const bal: { availableMinor: number; withdrawFeeMinor: number; withdrawEligibleAt?: number } = t.status === "active" || t.status === "paused" ? await summaryBalance(t) : { availableMinor: 0, withdrawFeeMinor: 0 };
++    return { kind: "standalone", standalone: { availableMinor: bal.availableMinor, withdrawFeeMinor: bal.withdrawFeeMinor, ...(bal.withdrawEligibleAt ? { withdrawEligibleAt: bal.withdrawEligibleAt } : {}), firstName: s.firstName, rentMinor: t.rent.amountMinor, remainingMinor: cur ? remainingOf(cur) : t.rent.amountMinor, dueDate: cur?.dueDate ?? "", payByDate: cur?.payByDate ?? "", suggestedCreditMinor: s.suggestedCreditMinor, ...(t.frozen ? { frozen: true } : {}) } };
+   }
+   // PMS stores a tenant's National ID (`localId`) as a NUMBER on most accounts and as a string on some, so ask for both forms.
+   const idForms: (string | number)[] = [id, ...(/^\d+$/.test(id) ? [Number(id)] : [])];
+diff --git a/functions/src/lmmx/payments.ts b/functions/src/lmmx/payments.ts
+index c485682..95386ee 100644
+--- a/functions/src/lmmx/payments.ts
++++ b/functions/src/lmmx/payments.ts
+@@ -13,7 +13,8 @@ import { getOrCreateFlatSplit } from "../desk/split";
+ import { COL, X } from "./config";
+ import { LMMX, LMMX_BRAND, LMMX_PAYMENT_REF_PREFIX, LMMX_TOP_DESK, eatDate, fitSms, isValidCredit, kes, quoteCoversCosts, quoteInstalment, shortDate } from "./contract";
+ import type { Quote, TenantQuoteOut } from "./contract";
+-import { H, readToken, sha256, signToken } from "./crypto";
++import { LMM_SEAL_KEY } from "../lmm/seal";
++import { H, hmacHex, readToken, sha256, signToken } from "./crypto";
+ import { fail } from "./errors";
+ import { alert, audit, col, db, FV, flags, ledger, now } from "./store";
+ import { addBusinessDays, cycleSeal, holidays, remainingOf, sealOk, targetCycle } from "./cycles";
+@@ -41,6 +42,10 @@ async function quoteState(t: TenantDoc, credit: number) {
+   return { tc, q, r, remaining };
+ }
+ 
++/** Signs what a withdrawal's instalment limit depends on: which payment, how much, when, and under which plan. */
++export const paymentSeal = (x: { reference: string; tenantId: string; cycleId: string; creditMinor: number; creditedAt: number; freq: string }): string =>
++  hmacHex(LMM_SEAL_KEY.value(), `pay|${x.reference}|${x.tenantId}|${x.cycleId}|${x.creditMinor}|${x.creditedAt}|${x.freq}`);
++
+ export async function makeQuote(t: TenantDoc, credit: number): Promise<TenantQuoteOut> {
+   const { tc, q, remaining } = await quoteState(t, credit);
+   const exp = now() + X.QUOTE_TTL_MS;
+@@ -80,7 +85,7 @@ export async function startPayment(t: TenantDoc, quoteId: unknown, payerPhone: u
+   const reference = `${LMMX_PAYMENT_REF_PREFIX}${t.tenantId}_${now().toString(36)}${crypto.randomBytes(3).toString("hex")}`.slice(0, 60);
+   const p: PaymentDoc = {
+     reference, paymentId: reference, tenantId: t.tenantId, cycleId: tc.cycle.cycleId, quoteId: sha256(String(quoteId)).slice(0, 16), phone: phone.e164, status: "initiating", creditMinor: q.creditMinor, reserveMinor: q.transferReserveMinor,
+-    serviceMinor: q.serviceFeeMinor, chargeMinor: q.chargeMinor, feesMinor: q.feesMinor, deskShareMinor: deskShare, ...(deskShare ? { deskUid: t.deskUid, deskCode: t.deskCode, splitCode } : {}), createdAt: now(), payerHash: H("phone", phone.e164),
++    serviceMinor: q.serviceFeeMinor, chargeMinor: q.chargeMinor, feesMinor: q.feesMinor, deskShareMinor: deskShare, ...(deskShare ? { deskUid: t.deskUid, deskCode: t.deskCode, splitCode } : {}), createdAt: now(), payerHash: H("phone", phone.e164), freq: t.frequency,
+   };
+   await col(COL.payments).doc(reference).create(JSON.parse(JSON.stringify(p)));
+   try {
+@@ -124,7 +129,8 @@ export async function creditPayment(reference: string, webhookAmount: number): P
+     if (!sealOk(c)) return { tampered: true as const, tenantId: t.tenantId };
+     const credited = c.creditedMinor + p.creditMinor;
+     const status = credited >= c.rentMinor ? (c.settledMinor === 0 && c.inflightMinor === 0 ? "funded" : c.status) : c.status;
+-    tx.update(pref, { status: "credited", creditedAt: now(), availableOn, paystackFeeMinor: v.fees });
++    const creditedAt = now();
++    tx.update(pref, { status: "credited", creditedAt, availableOn, paystackFeeMinor: v.fees, paySeal: paymentSeal({ reference, tenantId: p.tenantId, cycleId: p.cycleId, creditMinor: p.creditMinor, creditedAt, freq: p.freq ?? t.frequency }), ...(p.freq ? {} : { freq: t.frequency }) });
+     tx.update(cref, { creditedMinor: credited, balSeal: cycleSeal({ ...c, creditedMinor: credited }), instalments: FV.increment(1), legReserveCollectedMinor: FV.increment(p.reserveMinor), lastCreditAt: now(), lastAvailableOn: availableOn, status, ...(c.firstCreditAt ? {} : { firstCreditAt: now() }) });
+     const leftNow = Math.max(0, c.rentMinor - credited);
+     tx.update(tref, { lastPaymentAt: now(), missedCount: 0, cur: { creditedMinor: credited, remainingMinor: leftNow, dueDate: c.dueDate } });
+diff --git a/functions/src/lmmx/payouts.ts b/functions/src/lmmx/payouts.ts
+index a059d99..1dfe297 100644
+--- a/functions/src/lmmx/payouts.ts
++++ b/functions/src/lmmx/payouts.ts
+@@ -6,33 +6,58 @@ import { dearLine } from "../lmm/dear";
+ import { LMM_SEAL_KEY } from "../lmm/seal";
+ import { X } from "./config";
+ import { COL } from "./config";
+-import { LMMX, LMMX_BRAND, fitSms, kes, lmmxText, maskName, maskPhone, transferCostMinor, transferReserveMinor } from "./contract";
++import { LMMX, LMMX_BRAND, eatDate, fitSms, kes, lmmxText, maskName, maskPhone, shortDate, transferCostMinor, withdrawBreakdown, withdrawInstalmentCapMinor } from "./contract";
+ import type { PayoutRequestOut, WithdrawConfirmOut, WithdrawStartOut } from "./contract";
+ import { H, sha256 } from "./crypto";
+ import { fail } from "./errors";
+-import { audit, col, db, flags, FV, now, rateOk } from "./store";
++import { audit, col, db, flags, FV, ledger, now, rateOk } from "./store";
+ import { issueOtp, verifyOtp } from "./otp";
+ import type { OtpVia } from "./otp";
+ import { cycleSeal, loadCycles, remainingOf, sealOk } from "./cycles";
+ import { ensureWalletRecipient } from "./recipients";
+ import { dayKey, freezeForTamper, refOf, sealOfSettlement, settleCycle } from "./settle";
+-import { loadRecipient, nameOf, phoneOf, sms } from "./tenants";
++import { activationSealOf, loadRecipient, nameOf, phoneOf, sms } from "./tenants";
++import { paymentSeal } from "./payments";
+ import { normalizeKePhone } from "./contract";
+-import type { CycleDoc, SettlementDoc, TenantDoc } from "./types";
++import type { CycleDoc, PaymentDoc, PayRecordDoc, SettlementDoc, TenantDoc } from "./types";
++import { safeEq } from "./crypto";
+ 
+ void LMM_SEAL_KEY;
+ const held = (c: CycleDoc): number => Math.max(0, c.creditedMinor - c.settledMinor - c.inflightMinor);
+-/** The fee a withdrawal pays: the same transfer reserve every landlord payout pays for a wallet transfer. */
+-export const withdrawFeeFor = (grossMinor: number): number => transferReserveMinor(grossMinor, "phone");
++export type Eligibility = { ok: true } | { ok: false; kind: "state" | "tamper"; message: string };
++/** The extra rules for WITHDRAWALS ONLY (paying the landlord is never limited by them). Pure: it gets the data and decides, so it can run inside the reservation transaction.
++ *  1) the plan has been active for 2 weeks (when it became active is signed, and cross-checked with the sealed setup record);
++ *  2) every instalment behind the balance is within the cap for the plan (KES 300 a day; weekly x7, biweekly x14; the stricter of the plan at payment time and the plan now).
++ *  The signatures on the activation date and on each payment are checked, so editing them in the database is caught instead of trusted. */
++export function withdrawEligibility(x: { tenant: TenantDoc; payRecord?: PayRecordDoc; payments: PaymentDoc[]; heldCycleIds: ReadonlySet<string>; nowMs: number }): Eligibility {
++  const t = x.tenant;
++  if (t.status !== "active") return { ok: false, kind: "state", message: "Withdrawals are only for an active plan." };
++  if (typeof t.consentAt !== "number") return { ok: false, kind: "tamper", message: "activation date missing" };
++  if (t.activeSeal && !safeEq(t.activeSeal, activationSealOf(t.tenantId, t.consentAt))) return { ok: false, kind: "tamper", message: "activation date does not match its seal" };
++  const recAt = x.payRecord?.setupCompletedAt;
++  if (typeof recAt !== "number" || Math.abs(recAt - t.consentAt) > 10 * 60_000) return { ok: false, kind: "tamper", message: "activation date does not match the setup record" };
++  const opensAt = Math.max(t.consentAt, recAt) + LMMX.WITHDRAW_MIN_ACTIVE_MS;
++  if (x.nowMs < opensAt) return { ok: false, kind: "state", message: `Withdrawals open after your plan has been active for 2 weeks, from ${shortDate(eatDate(opensAt))}. You can still use Pay my landlord now.` };
++  for (const p of x.payments) {
++    if (p.status !== "credited" || !x.heldCycleIds.has(p.cycleId)) continue;
++    if (p.paySeal && !safeEq(p.paySeal, paymentSeal({ reference: p.reference, tenantId: p.tenantId, cycleId: p.cycleId, creditMinor: p.creditMinor, creditedAt: p.creditedAt ?? 0, freq: p.freq ?? t.frequency }))) return { ok: false, kind: "tamper", message: `payment ${p.reference} does not match its seal` };
++    const cap = Math.min(withdrawInstalmentCapMinor((p.freq as TenantDoc["frequency"] | undefined) ?? t.frequency), withdrawInstalmentCapMinor(t.frequency));
++    if (p.creditMinor > cap) return { ok: false, kind: "state", message: `One of your payments (${kes(p.creditMinor)}) is more than the withdrawal limit for your plan (${kes(cap)} at a time). You can still use Pay my landlord now.` };
++  }
++  return { ok: true };
++}
++/** When withdrawals open for this tenant (2 weeks after the plan became active). */
++export const withdrawOpensAt = (t: Pick<TenantDoc, "consentAt">): number | undefined => (typeof t.consentAt === "number" ? t.consentAt + LMMX.WITHDRAW_MIN_ACTIVE_MS : undefined);
+ 
+ export async function balanceOf(tenantId: string): Promise<{ cycles: CycleDoc[]; availableMinor: number; tampered: boolean }> {
+   const cycles = await loadCycles(tenantId);
+   return { cycles, availableMinor: cycles.reduce((n, c) => n + held(c), 0), tampered: cycles.some((c) => !sealOk(c)) };
+ }
+-export async function summaryBalance(t: TenantDoc): Promise<{ availableMinor: number; withdrawFeeMinor: number; payoutPending: boolean }> {
++export async function summaryBalance(t: TenantDoc): Promise<{ availableMinor: number; withdrawFeeMinor: number; payoutPending: boolean; withdrawEligibleAt?: number }> {
+   const { cycles, availableMinor } = await balanceOf(t.tenantId);
+   const wd = await col(COL.settlements).where("tenantId", "==", t.tenantId).where("reason", "==", "withdraw").where("status", "==", "locked").limit(1).get();
+-  return { availableMinor, withdrawFeeMinor: availableMinor >= LMMX.MIN_PAYOUT_MINOR ? withdrawFeeFor(availableMinor) : 0, payoutPending: !wd.empty || cycles.some((c) => c.payoutRequested) };
++  const opens = withdrawOpensAt(t);
++  return { availableMinor, withdrawFeeMinor: availableMinor >= LMMX.MIN_PAYOUT_MINOR ? withdrawBreakdown(availableMinor).feeMinor : 0, payoutPending: !wd.empty || cycles.some((c) => c.payoutRequested), ...(opens ? { withdrawEligibleAt: opens } : {}) };
+ }
+ const tooLittle = (have: number): never => fail("LMMX_E_AMOUNT", `You need at least ${kes(LMMX.MIN_PAYOUT_MINOR)} paid in to do this. You have ${kes(have)}.`);
+ const ops = (key: string, text: string) => sms(key, X.ALERT_MOBILE, fitSms(text));
+@@ -71,10 +96,19 @@ export async function startWithdraw(t: TenantDoc, phoneInput: unknown, via: OtpV
+   const b = await balanceOf(t.tenantId);
+   if (b.tampered) { await freezeForTamper(t.tenantId, "cycle money numbers do not match their seal (withdraw start)"); return fail("LMMX_E_TAMPER", "We could not check your balance. Please contact Samuhia support."); }
+   if (b.availableMinor < LMMX.MIN_PAYOUT_MINOR) return tooLittle(b.availableMinor);
+-  const fee = withdrawFeeFor(b.availableMinor), net = b.availableMinor - fee;
++  const held0 = new Set(b.cycles.filter((c) => held(c) > 0).map((c) => c.cycleId));
++  const payRec = (await col(COL.payRecords).doc(t.tenantId).get()).data() as PayRecordDoc | undefined;
++  const pays = (await col(COL.payments).where("tenantId", "==", t.tenantId).where("status", "==", "credited").get()).docs.map((d) => d.data() as PaymentDoc);
++  const el = withdrawEligibility({ tenant: t, payRecord: payRec, payments: pays, heldCycleIds: held0, nowMs: now() });
++  if (!el.ok) {
++    if (el.kind === "tamper") { await freezeForTamper(t.tenantId, `withdraw eligibility: ${el.message}`); return fail("LMMX_E_TAMPER", "We could not check your account. Please contact Samuhia support."); }
++    return fail("LMMX_E_STATE", el.message);
++  }
++  const bd = withdrawBreakdown(b.availableMinor), fee = bd.feeMinor, net = bd.netMinor;
++  if (net < LMMX.MIN_CREDIT_MINOR) return tooLittle(b.availableMinor);
+   const res = await issueOtp({ tenantId: t.tenantId, purpose: "withdraw", payloadHash: wdHash(t), phoneE164: phone, compose: (c4) => lmmxText.withdraw({ netMinor: net, phone: maskPhone(phone), supportPhone: X.SUPPORT_PHONE, code4: c4 }) });
+   await audit({ action: "withdraw_started", actor: { type: via === "bot" ? "bot" : "tenant" }, tenantId: t.tenantId, summary: `withdraw code sent (available ${b.availableMinor / 100}) via ${via}` });
+-  return { availableMinor: b.availableMinor, feeMinor: fee, netMinor: net, otpExpiresAt: res.expiresAt };
++  return { availableMinor: b.availableMinor, serviceFeeMinor: bd.serviceFeeMinor, transferFeeMinor: bd.transferFeeMinor, feeMinor: fee, netMinor: net, otpExpiresAt: res.expiresAt };
+ }
+ 
+ /** Step 2: the right code reserves everything available, in one transaction, and queues one sealed transfer to the tenant's own wallet. */
+@@ -91,6 +125,8 @@ export async function confirmWithdraw(t: TenantDoc, otp: string, via: OtpVia): P
+     const cs = (await tx.get(col(COL.cycles).where("tenantId", "==", t.tenantId).where("status", "in", ["open", "funded", "partial_settled"]))).docs;
+     const cycles = cs.map((d) => ({ ref: d.ref, c: d.data() as CycleDoc }));
+     if (cycles.some((x) => !sealOk(x.c))) return { tamper: true as const };
++    const payRec = (await tx.get(col(COL.payRecords).doc(t.tenantId))).data() as PayRecordDoc | undefined;
++    const pays = (await tx.get(col(COL.payments).where("tenantId", "==", t.tenantId).where("status", "==", "credited"))).docs.map((d) => d.data() as PaymentDoc);
+     const open = await tx.get(col(COL.settlements).where("tenantId", "==", t.tenantId).where("reason", "==", "withdraw").where("status", "==", "locked"));
+     if (!open.empty) return fail("LMMX_E_STATE", "A withdrawal is already on its way.");
+     const dayRef = col(COL.counters).doc(`out_${dayKey()}`);
+@@ -98,7 +134,10 @@ export async function confirmWithdraw(t: TenantDoc, otp: string, via: OtpVia): P
+     const allocations = cycles.filter((x) => held(x.c) > 0).map((x) => ({ cycleId: x.c.cycleId, amountMinor: held(x.c) }));
+     const gross = allocations.reduce((n, a) => n + a.amountMinor, 0);
+     if (gross < LMMX.MIN_PAYOUT_MINOR) return tooLittle(gross);
+-    const fee = withdrawFeeFor(gross), net = gross - fee;
++    const el = withdrawEligibility({ tenant: tt, payRecord: payRec, payments: pays, heldCycleIds: new Set(allocations.map((a) => a.cycleId)), nowMs: now() });
++    if (!el.ok) { if (el.kind === "tamper") return { tamper: true as const }; return fail("LMMX_E_STATE", el.message); }
++    const bd = withdrawBreakdown(gross), fee = bd.feeMinor, net = bd.netMinor;
++    if (net < LMMX.MIN_CREDIT_MINOR) return tooLittle(gross);
+     if (outToday + net > X.OUTFLOW_CAP_MINOR) return fail("LMMX_E_DISABLED", "Withdrawals are very busy today. Please try again tomorrow.");
+     const seq = (tt.withdrawSeq ?? 0) + 1, id = `${t.tenantId}_W${seq}`, reference = refOf(id, 1);
+     let cur = tt.cur;
+@@ -113,11 +152,15 @@ export async function confirmWithdraw(t: TenantDoc, otp: string, via: OtpVia): P
+     tx.create(col(COL.settlements).doc(id), JSON.parse(JSON.stringify(st)));
+     tx.update(tref, { withdrawSeq: seq, ...(cur ? { cur } : {}), updatedAt: now() });
+     tx.set(dayRef, { outMinor: FV.increment(net) }, { merge: true });
+-    return { id, gross, fee, net };
++    ledger(tx, [{ tenantId: t.tenantId, cycleId: `WD_${t.tenantId}`, type: "withdraw_service", amountMinor: bd.serviceFeeMinor, direction: "in", ref: id }]);
++    // for 72 hours after a withdrawal this phone and this ID cannot set up a new plan (see createTenant / setPlan)
++    tx.set(col(COL.locks).doc(`wdcool_phone_${t.phoneHash.slice(0, 40)}`), { at: now(), tenantId: t.tenantId });
++    tx.set(col(COL.locks).doc(`wdcool_id_${t.idHash.slice(0, 40)}`), { at: now(), tenantId: t.tenantId });
++    return { id, gross, fee, net, service: bd.serviceFeeMinor, transfer: bd.transferFeeMinor };
+   });
+   if ("tamper" in res) { await freezeForTamper(t.tenantId, "cycle money numbers do not match their seal (withdraw confirm)"); return fail("LMMX_E_TAMPER", "We could not check your balance. Please contact Samuhia support."); }
+   await audit({ action: "withdraw_requested", actor: { type: via === "bot" ? "bot" : "tenant" }, tenantId: t.tenantId, summary: `withdrawal ${res.id}: ${res.gross / 100} taken, ${res.net / 100} to be sent (fee ${res.fee / 100}) via ${via}` });
+-  await sms(`lmmx_wd_req_${res.id}`, phoneOf(t), fitSms(`${dearLine(nameOf(t))} we received your ${LMMX_BRAND} withdrawal: ${kes(res.net)} (after a ${kes(res.fee)} fee) goes to your M-PESA within 24 hours.`));
++  await sms(`lmmx_wd_req_${res.id}`, phoneOf(t), fitSms(`${dearLine(nameOf(t))} we received your ${LMMX_BRAND} withdrawal: ${kes(res.net)} goes to your M-PESA within 24 hours (after the ${kes(res.service)} service fee and the ${kes(res.transfer)} M-PESA fee).`));
+   await ops(`lmmx_wd_req_ops_${res.id}`, `LMMX WITHDRAWAL REQUEST ${kes(res.gross)} (send ${kes(res.net)}) tenant ${t.tenantId} ${maskName(nameOf(t))} ${maskPhone(phoneOf(t))} ref ${res.id}. Sends within 24h.`);
+-  return { requestedMinor: res.gross, feeMinor: res.fee, netMinor: res.net, message: `Withdrawal requested. ${kes(res.net)} will be sent to your M-PESA within 24 hours.` };
++  return { requestedMinor: res.gross, serviceFeeMinor: res.service, transferFeeMinor: res.transfer, feeMinor: res.fee, netMinor: res.net, message: `Withdrawal requested. ${kes(res.net)} will be sent to your M-PESA within 24 hours (${kes(res.service)} service fee and ${kes(res.transfer)} M-PESA fee taken).` };
+ }
+diff --git a/functions/src/lmmx/tenants.ts b/functions/src/lmmx/tenants.ts
+index db48b8c..442df0e 100644
+--- a/functions/src/lmmx/tenants.ts
++++ b/functions/src/lmmx/tenants.ts
+@@ -6,7 +6,7 @@ import { sendOnce } from "../lmm/sms";
+ import { toMsisdn } from "../phone/safaricom";
+ import { COL, X } from "./config";
+ import {
+-  LMMX, LMMX_TOP_DESK, canonicalJson, kes as kesTxt, earningsTable, eatDate, firstDueDate, isValidCredit, lmmxText, maskId, maskName, maskPhone, normalizeKePhone, validIdNumber,
++  LMMX, LMMX_TOP_DESK, canonicalJson, kes as kesTxt, earningsTable, eatDate, firstDueDate, isValidCredit, lmmxText, maskId, maskName, maskPhone, normalizeKePhone, shortDate, validIdNumber,
+ } from "./contract";
+ import type { DeskCreateTenantIn, DeskCreateTenantOut, DeskGetTenantOut, DeskListTenantsIn, DeskListTenantsOut, Frequency, TenantLinkOut, TenantSummaryOut, TenantStatus } from "./contract";
+ import { H, dec, enc, hmacHex, normName, randId, sha256, safeEq } from "./crypto";
+@@ -25,6 +25,8 @@ export const sms = (key: string, phoneE164: string, text: string): Promise<boole
+ /** What the tenant's code approves: exactly who is paid, how much, and when. Any change to these makes an old code useless. */
+ export const termsHashOf = (t: Pick<TenantDoc, "tenantId" | "dueDay" | "rent">, r: Pick<RecipientDoc, "recipientId" | "acctKey">, rentMinor = t.rent.amountMinor, dueDay = t.dueDay): string =>
+   sha256(canonicalJson({ tenantId: t.tenantId, recipientId: r.recipientId, acctKey: r.acctKey, rentMinor, dueDay }));
++/** Signs WHEN the plan became active (it decides when withdrawals open), so editing that date in the database is caught. */
++export const activationSealOf = (tenantId: string, at: number): string => hmacHex(LMM_SEAL_KEY.value(), `act|${tenantId}|${at}`);
+ export const termsSigOf = (termsHash: string): string => hmacHex(LMM_SEAL_KEY.value(), `terms|${termsHash}`);
+ 
+ const nameTokens = (full: string): string[] => {
+@@ -85,6 +87,11 @@ export async function createTenant(desk: DeskCtx, i: DeskCreateTenantIn): Promis
+   if (!desk.isTop && !(await rateOk(`new|${desk.uid}`, LMMX.DESK_NEW_TENANTS_PER_DAY, 86_400_000))) return fail("LMMX_E_RATE", "You have reached today's limit for new tenants.");
+ 
+   const phoneHash = H("phone", phone), idHash = H("id", normId(String(p.idNumber)));
++  // After a withdrawal, nobody on this phone or ID can set up a new plan for 72 hours (applies to every desk, the top desk included).
++  for (const key of [`wdcool_phone_${phoneHash.slice(0, 40)}`, `wdcool_id_${idHash.slice(0, 40)}`]) {
++    const at = (await col(COL.locks).doc(key).get()).data()?.at as number | undefined;
++    if (at && now() - at < LMMX.WITHDRAW_NEW_PLAN_COOLDOWN_MS) return fail("LMMX_E_STATE", `A withdrawal was made recently, so a new plan cannot be set up for this tenant until ${shortDate(eatDate(at + LMMX.WITHDRAW_NEW_PLAN_COOLDOWN_MS))}.`);
++  }
+   const rec = await createOrReuseRecipient(desk, phone, i.recipient);
+   const needsReview = rec.status === "needs_review";
+   if (rec.status !== "verified" && !needsReview) return fail("LMMX_E_RECIPIENT_BLOCKED", "This landlord account cannot be used.");
+@@ -183,7 +190,8 @@ export async function activateTenant(t: TenantDoc, r: RecipientDoc, via: OtpVia
+     const tref = col(COL.tenants).doc(t.tenantId), rref = col(COL.recipients).doc(r.recipientId);
+     const [ts, rs] = await Promise.all([tx.get(tref), tx.get(rref)]);
+     if ((ts.data() as TenantDoc).status !== "awaiting_confirmation" || (rs.data() as RecipientDoc).status !== "verified") fail("LMMX_E_STATE", "This setup changed. Please start again.");
+-    tx.update(tref, { status: "active", consentAt: now(), updatedAt: now(), setupExpiresAt: FV.delete(), landlordNoticeAt: now(), cur: { creditedMinor: 0, remainingMinor: cycle.rentMinor, dueDate: due } });
++    const at = now();
++    tx.update(tref, { status: "active", consentAt: at, activeSeal: activationSealOf(t.tenantId, at), updatedAt: now(), setupExpiresAt: FV.delete(), landlordNoticeAt: now(), cur: { creditedMinor: 0, remainingMinor: cycle.rentMinor, dueDate: due } });
+     tx.update(rref, { activeTenantCount: FV.increment(1), deskCodes: FV.arrayUnion(t.deskCode) });
+     tx.set(col(COL.payRecords).doc(t.tenantId), rec);
+     tx.create(col(COL.cycles).doc(cycle.cycleId), cycle);
+diff --git a/functions/src/lmmx/types.ts b/functions/src/lmmx/types.ts
+index ef5144f..e5a0943 100644
+--- a/functions/src/lmmx/types.ts
++++ b/functions/src/lmmx/types.ts
+@@ -7,7 +7,7 @@ export interface TenantDoc {
+   email?: string; unitNumber?: string; propertyName?: string;
+   consentAt?: number; landlordNoticeAt?: number; rent: { amountMinor: number; effectiveFromDue?: string }; dueDay: number; dueDayChangedCycleId?: string;
+   frequency: Frequency; suggestedCreditMinor: number; activeRecipientId: string; pendingRecipientId?: string;
+-  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string; lastSmsAt?: number; missedCount?: number; walletRecipientId?: string; withdrawSeq?: number;
++  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string; lastSmsAt?: number; missedCount?: number; walletRecipientId?: string; withdrawSeq?: number; activeSeal?: string;
+   cur?: { creditedMinor: number; remainingMinor: number; dueDate: string };
+ }
+ export interface RecipientDoc {
+@@ -26,7 +26,7 @@ export interface CycleDoc {
+ export interface PaymentDoc {
+   reference: string; paymentId: string; tenantId: string; cycleId: string; quoteId: string; phone: string; status: "initiating" | "pending" | "credited" | "failed" | "rejected";
+   creditMinor: number; reserveMinor: number; serviceMinor: number; chargeMinor: number; feesMinor: number; deskShareMinor: number; deskUid?: string; deskCode?: string; splitCode?: string;
+-  createdAt: number; creditedAt?: number; availableOn?: string; paystackFeeMinor?: number; payerHash: string;
++  createdAt: number; creditedAt?: number; availableOn?: string; paystackFeeMinor?: number; payerHash: string; freq?: string; paySeal?: string;
+ }
+ export interface SettlementDoc {
+   id: string; tenantId: string; cycleId: string; recipientId: string; recipientCode: string; amountMinor: number; reason: "full" | "due_date" | "topup" | "withdraw";
+diff --git a/functions/test/lmmx.check.js b/functions/test/lmmx.check.js
+index af4a8cd..91703cf 100644
+--- a/functions/test/lmmx.check.js
++++ b/functions/test/lmmx.check.js
+@@ -354,7 +354,8 @@ ok("a top-desk tenant held for review is activated without a code when COG-0000
+ });
+ 
+ // ------------------------------------------------------------------------------------------------------------- reminders and milestones (parity with legacy)
+-const rtenant = (o = {}) => ({ tenantId: "LMTREMINDER1", nameEnc: cr.enc("Mary Wanjiru"), phoneEnc: cr.enc("+254712345678"), status: "active", frequency: "weekly", createdAt: Date.now() - 20 * 86_400_000, lastPaymentAt: 0, lastSmsAt: 0, missedCount: 0, ...o });
++const rtenantBase = (o = {}) => ({ tenantId: "LMTREMINDER1", nameEnc: cr.enc("Mary Wanjiru"), phoneEnc: cr.enc("+254712345678"), status: "active", frequency: "weekly", createdAt: Date.now() - 20 * 86_400_000, lastPaymentAt: 0, lastSmsAt: 0, missedCount: 0, ...o });
++const rtenant = rtenantBase;
+ const rcycle = (o = {}) => ({ cycleId: "LMTREMINDER1_202612", dueDate: "2026-12-05", payByDate: "2026-12-03", rentMinor: 1_000_000, creditedMinor: 0, settledMinor: 0, status: "open", ...o });
+ const kinds = (t, c, today, nowMs = Date.now()) => sweep.planReminders(t, c, today, nowMs).map((r) => r.kind);
+ ok("reminders: 5-day warning, pay-by day, due day, overdue every 3 days, nothing once the rent is covered", () => {
+@@ -365,13 +366,13 @@ ok("reminders: 5-day warning, pay-by day, due day, overdue every 3 days, nothing
+   assert.strictEqual(k1, k2); assert.notStrictEqual(k1, k3);
+ });
+ ok("missed-instalment reminder follows the legacy rules: after the plan's quiet period, not within 3 days of another SMS, at most 3, never in the last week", () => {
+-  const far = "2026-11-10"; const now = Date.parse("2026-11-10T08:00:00Z");
++  const far = "2026-11-10"; const now = Date.parse("2026-11-10T08:00:00Z"); const rtenant = (o = {}) => rtenantBase({ createdAt: now - 20 * 86_400_000, ...o });   // times relative to the fixed "now", so the test does not drift
+   assert.deepStrictEqual(kinds(rtenant(), rcycle(), far, now), ["missed"]);
+   assert.deepStrictEqual(kinds(rtenant({ lastSmsAt: now - 86_400_000 }), rcycle(), far, now), [], "an SMS went out yesterday");
+   assert.deepStrictEqual(kinds(rtenant({ missedCount: 3 }), rcycle(), far, now), [], "3 already sent");
+   assert.deepStrictEqual(kinds(rtenant({ lastPaymentAt: now - 86_400_000 }), rcycle(), far, now), [], "paid yesterday");
+   assert.deepStrictEqual(kinds(rtenant({ status: "paused" }), rcycle(), far, now), []);
+-  assert.ok(!kinds(rtenant(), rcycle(), "2026-12-02", Date.parse("2026-12-02T08:00:00Z")).includes("missed"), "the last-week warnings take over");
++  assert.ok(!kinds(rtenantBase({ createdAt: Date.parse("2026-12-02T08:00:00Z") - 20 * 86_400_000 }), rcycle(), "2026-12-02", Date.parse("2026-12-02T08:00:00Z")).includes("missed"), "the last-week warnings take over");
+   assert.ok(sweep.planReminders(rtenant(), rcycle(), far, now)[0].text.includes("Lipa Mdogo Mdogo"));
+ });
+ ok("milestones: one SMS each at 25/50/75 of the rent per cycle, 100 only recorded; a payment resets the missed count", async () => {
+@@ -393,21 +394,24 @@ const pouts = L("payouts"), sweepM = L("sweep");
+ const OPS = "254791286165";
+ const wdCode = () => (tenantSms().filter((m) => /LMW\d{4}/.test(m)).pop().match(/LMW(\d{4})/) || [])[1];
+ const firstCycle = () => db.list("lmmx_cycles").map((p) => db.store.get(p))[0];
+-const funded = async (credit = 400_000) => { world(); const s = await activate(); await payAndCredit(s.id, credit); await new Promise((r) => setTimeout(r, 30)); return s; };
++const DAY = 86_400_000;
++/** an active plan that is 15 days old (past the 2-week wait), with a balance of `credit` paid in as one instalment */
++const age = (id, days = 15) => { const t = db.store.get(`lmm_tenants/${id}`); const at = Date.now() - days * DAY; t.consentAt = at; t.activeSeal = tenants.activationSealOf(id, at); db.store.get(`lmm_pay_records/${id}`).setupCompletedAt = at; };
++const funded = async (credit = 200_000) => { world(); const s = await activate(); age(s.id); await payAndCredit(s.id, credit); await new Promise((r) => setTimeout(r, 30)); return s; };
+ ok("withdraw: the number must be the phone on record; the code goes to that phone; nothing moves until the right code", async () => {
+   const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+   await rej(pouts.startWithdraw(t(), "0799999999", "tenant"), "LMMX_E_VALIDATION"); assert.ok(!tenantSms().some((m) => /LMW\d{4}/.test(m)));
+   const st = await pouts.startWithdraw(t(), "0712345678", "tenant");
+-  assert.strictEqual(st.availableMinor, 400_000); assert.strictEqual(st.feeMinor, C.transferReserveMinor(400_000, "phone")); assert.strictEqual(st.netMinor, 400_000 - st.feeMinor);
++  assert.strictEqual(st.availableMinor, 200_000); assert.strictEqual(st.feeMinor, C.withdrawBreakdown(200_000).feeMinor); assert.strictEqual(st.netMinor, 200_000 - st.feeMinor);
+   const m = tenantSms().pop(); assert.match(m, /LMW\d{4} valid 30 min/); assert.match(m, /wa\.me\/254101716473\?text=LMW\d{4}/); assert.ok(m.length <= 280);
+-  assert.strictEqual(firstCycle().creditedMinor, 400_000, "no money moved yet"); assert.strictEqual(db.list("lmmx_settlements").length, 0);
+-  await rej(pouts.confirmWithdraw(t(), "0000" === wdCode() ? "1111" : "0000", "tenant"), "LMMX_E_OTP_INVALID"); assert.strictEqual(firstCycle().creditedMinor, 400_000);
++  assert.strictEqual(firstCycle().creditedMinor, 200_000, "no money moved yet"); assert.strictEqual(db.list("lmmx_settlements").length, 0);
++  await rej(pouts.confirmWithdraw(t(), "0000" === wdCode() ? "1111" : "0000", "tenant"), "LMMX_E_OTP_INVALID"); assert.strictEqual(firstCycle().creditedMinor, 200_000);
+ });
+ ok("withdraw confirm: takes everything available in one step, queues ONE sealed transfer to the tenant's own wallet after a quiet hour, tells the company phone", async () => {
+   const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); const code = wdCode(); sms.length = 0;
+   const w = await pouts.confirmWithdraw(t(), code, "tenant");
+-  assert.strictEqual(w.requestedMinor, 400_000); assert.strictEqual(w.netMinor, 400_000 - w.feeMinor);
+-  const cy = firstCycle(); assert.strictEqual(cy.creditedMinor, 0); assert.strictEqual(cy.withdrawnMinor, 400_000); assert.strictEqual(cy.balSeal, L("cycles").cycleSeal(cy)); assert.strictEqual(cy.status, "open");
++  assert.strictEqual(w.requestedMinor, 200_000); assert.strictEqual(w.netMinor, 200_000 - w.feeMinor);
++  const cy = firstCycle(); assert.strictEqual(cy.creditedMinor, 0); assert.strictEqual(cy.withdrawnMinor, 200_000); assert.strictEqual(cy.balSeal, L("cycles").cycleSeal(cy)); assert.strictEqual(cy.status, "open");
+   const st = db.list("lmmx_settlements").map((p) => db.store.get(p))[0]; assert.strictEqual(st.reason, "withdraw"); assert.strictEqual(st.amountMinor, w.netMinor); assert.ok(st.notBefore > Date.now() + 59 * 60_000);
+   assert.ok(sms.some((x) => x.mobile === OPS && /WITHDRAWAL REQUEST/.test(x.msg) && x.msg.includes(s.id)), "company phone told"); assert.ok(tenantSms().some((m) => /within 24 hours/.test(m)));
+   const ws = db.store.get(`lmmx_recipients/${st.recipientId}`); assert.strictEqual(ws.kind, "wallet"); assert.strictEqual(ws.accountNumber, "0712345678");
+@@ -455,12 +459,12 @@ ok("withdraw: if the transfer fails 3 times the credit goes back to the tenant,
+   const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant");
+   const sid = db.list("lmmx_settlements")[0].split("/")[1]; db.store.get(`lmmx_settlements/${sid}`).notBefore = 1;
+   for (let i = 0; i < 3; i++) { await settle.sendSettlement(sid); const st = db.store.get(`lmmx_settlements/${sid}`); if (st.status !== "locked") break; await settle.onTransferEvent("transfer.failed", { reference: st.reference, amount: st.amountMinor, recipient: { recipient_code: st.recipientCode } }); }
+-  const st = db.read(`lmmx_settlements/${sid}`); assert.strictEqual(st.status, "failed"); const cy = firstCycle(); assert.strictEqual(cy.creditedMinor, 400_000); assert.strictEqual(cy.withdrawnMinor, 0); assert.strictEqual(cy.balSeal, L("cycles").cycleSeal(cy));
++  const st = db.read(`lmmx_settlements/${sid}`); assert.strictEqual(st.status, "failed"); const cy = firstCycle(); assert.strictEqual(cy.creditedMinor, 200_000); assert.strictEqual(cy.withdrawnMinor, 0); assert.strictEqual(cy.balSeal, L("cycles").cycleSeal(cy));
+ });
+ ok("withdrawals count against the same daily outflow cap as landlord payouts", async () => {
+   const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); const code = wdCode();
+   const day = L("settle").dayKey(); db.seed(`lmm_counters/out_${day}`, { outMinor: 1_999_999_00 });
+-  await rej(pouts.confirmWithdraw(t(), code, "tenant"), "LMMX_E_DISABLED"); assert.strictEqual(firstCycle().creditedMinor, 400_000, "nothing was taken");
++  await rej(pouts.confirmWithdraw(t(), code, "tenant"), "LMMX_E_DISABLED"); assert.strictEqual(firstCycle().creditedMinor, 200_000, "nothing was taken");
+   db.seed(`lmm_counters/out_${day}`, { outMinor: 0 }); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant");
+   assert.ok(db.read(`lmm_counters/out_${day}`).outMinor > 0, "counted");
+ });
+@@ -469,17 +473,17 @@ ok("a tenant's own wallet is never offered to a desk as a landlord account", asy
+   const c = await L("recipients").checkRecipient(DESK2, { channel: "phone", accountNumber: "0712345678", enteredName: "Mary Wanjiru" }); assert.strictEqual(c.exists, false);
+ });
+ ok("pay my landlord now: asks for everything available, every normal safety check still applies, then pays EXACTLY what was credited", async () => {
+-  const s = await funded(400_000); const t = () => db.store.get(`lmm_tenants/${s.id}`); sms.length = 0;
+-  const r = await pouts.requestLandlordPayout(t(), "tenant"); assert.strictEqual(r.requestedMinor, 400_000); assert.match(r.message, /safety check/);
++  const s = await funded(200_000); const t = () => db.store.get(`lmm_tenants/${s.id}`); sms.length = 0;
++  const r = await pouts.requestLandlordPayout(t(), "tenant"); assert.strictEqual(r.requestedMinor, 200_000); assert.match(r.message, /safety check/);
+   assert.ok(sms.some((x) => x.mobile === OPS && /payout request/.test(x.msg))); assert.strictEqual(transfers.length, 0); assert.strictEqual(firstCycle().payoutRequested, true);
+   backdate(s.id); await sweepM.settlementWorker();
+-  assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, 400_000, "uncut"); assert.strictEqual(transfers[0].recipient, db.store.get(`lmmx_recipients/${t().activeRecipientId}`).recipientCode);
+-  await settle.onTransferEvent("transfer.success", { reference: transfers[0].reference, amount: 400_000 }); assert.strictEqual(db.list("lmmx_settlements").map((p) => db.store.get(p))[0].status, "paid");
++  assert.strictEqual(transfers.length, 1); assert.strictEqual(transfers[0].amount, 200_000, "uncut"); assert.strictEqual(transfers[0].recipient, db.store.get(`lmmx_recipients/${t().activeRecipientId}`).recipientCode);
++  await settle.onTransferEvent("transfer.success", { reference: transfers[0].reference, amount: 200_000 }); assert.strictEqual(db.list("lmmx_settlements").map((p) => db.store.get(p))[0].status, "paid");
+ });
+ ok("tenant summary and bot lookup show what is available and the withdrawal fee", async () => {
+   const s = await funded(); const t = db.store.get(`lmm_tenants/${s.id}`);
+-  const b = await pouts.summaryBalance(t); assert.strictEqual(b.availableMinor, 400_000); assert.strictEqual(b.withdrawFeeMinor, C.transferReserveMinor(400_000, "phone")); assert.strictEqual(b.payoutPending, false);
+-  const lk = await idx.lmmx_bot_lookup.run({ data: signed("lmmx_bot_lookup", { phone: "+254712345678", idNumber: "12345678" }) }); assert.strictEqual(lk.standalone.availableMinor, 400_000);
++  const b = await pouts.summaryBalance(t); assert.strictEqual(b.availableMinor, 200_000); assert.strictEqual(b.withdrawFeeMinor, C.withdrawBreakdown(200_000).feeMinor); assert.strictEqual(b.payoutPending, false);
++  const lk = await idx.lmmx_bot_lookup.run({ data: signed("lmmx_bot_lookup", { phone: "+254712345678", idNumber: "12345678" }) }); assert.strictEqual(lk.standalone.availableMinor, 200_000);
+ });
+ ok("bot: a withdrawal code only works from the tenant's own WhatsApp number; the bot cannot change account settings", async () => {
+   const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
+@@ -491,6 +495,62 @@ ok("bot: a withdrawal code only works from the tenant's own WhatsApp number; the
+   const exportsList = Object.keys(idx).filter((k) => k.startsWith("lmmx_bot_")); for (const k of exportsList) assert.ok(!/setDueDay|setPlan|updateTenant|requestChange|profile|name|idNumber/i.test(k), "bot has no account-settings ops: " + k);
+   void t;
+ });
++
++// ------------------------------------------------------------------------------------------------------------- withdrawal-only rules: 15% fee, 2 weeks, instalment cap, 72 hours
++ok("withdrawal fees: 15% service fee (whole shilling, rounded up) plus the normal M-PESA fee, shown separately and deducted from what is sent", async () => {
++  assert.deepStrictEqual(C.withdrawBreakdown(200_000), { serviceFeeMinor: 30_000, transferFeeMinor: 5_300, feeMinor: 35_300, netMinor: 164_700 });
++  assert.strictEqual(C.withdrawBreakdown(5_050 + 50).serviceFeeMinor, 800, "15% of KES 51 is KES 7.65: rounded up to KES 8");
++  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
++  const st = await pouts.startWithdraw(t(), "0712345678", "tenant"); assert.deepStrictEqual([st.serviceFeeMinor, st.transferFeeMinor, st.feeMinor, st.netMinor], [30_000, 5_300, 35_300, 164_700]);
++  assert.match(tenantSms().pop(), /15% service fee/);
++  const w = await pouts.confirmWithdraw(t(), wdCode(), "tenant"); assert.deepStrictEqual([w.serviceFeeMinor, w.netMinor], [30_000, 164_700]); assert.match(w.message, /service fee/);
++  const stl = db.list("lmmx_settlements").map((p) => db.store.get(p))[0]; assert.strictEqual(stl.amountMinor, 164_700); assert.strictEqual(stl.grossMinor, 200_000);
++  assert.ok(db.list("lmmx_ledger").map((p) => db.store.get(p)).some((r) => r.type === "withdraw_service" && r.amountMinor === 30_000), "the service fee is booked");
++  assert.strictEqual((await pouts.summaryBalance(t())).withdrawFeeMinor, 0, "nothing left, so no fee quoted");
++});
++ok("2-week rule: a plan under 14 days old cannot withdraw (it can still pay the landlord now); after 14 days it can", async () => {
++  world(); const s = await activate(); const t = () => db.store.get(`lmm_tenants/${s.id}`); await payAndCredit(s.id, 200_000); await new Promise((r) => setTimeout(r, 30));
++  await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_STATE"); try { await pouts.startWithdraw(t(), "0712345678", "tenant"); } catch (e) { assert.match(e.message, /2 weeks/); assert.match(e.message, /Pay my landlord now/); }
++  assert.ok((await pouts.summaryBalance(t())).withdrawEligibleAt > Date.now() + 13 * DAY, "the date it opens is shown");
++  assert.strictEqual((await pouts.requestLandlordPayout(t(), "tenant")).requestedMinor, 200_000, "paying the landlord has no such wait");
++  age(s.id, 13); await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_STATE"); age(s.id, 15); assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0);
++});
++ok("2-week rule cannot be dodged by editing dates in the database: the activation date is signed and cross-checked", async () => {
++  let s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`);
++  t().consentAt = Date.now() - 40 * DAY; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER"); assert.strictEqual(t().frozen, true);
++  s = await funded(); db.store.get(`lmm_pay_records/${s.id}`).setupCompletedAt = Date.now() - 40 * DAY; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER");
++  s = await funded(); t().consentAt = Date.now() - 40 * DAY; db.store.get(`lmm_pay_records/${s.id}`).setupCompletedAt = t().consentAt; await rej(pouts.confirmWithdraw(t(), "0000", "tenant"), "LMMX_E_OTP_INVALID");   // a fresh plan edited consistently still fails the signature
++  await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER");
++});
++ok("instalment cap: KES 300 a day, x7 weekly, x14 biweekly, for every payment behind the balance; the stricter of the plan then and now; payments are signed", async () => {
++  assert.deepStrictEqual(["daily", "weekly", "biweekly"].map((f) => C.withdrawInstalmentCapMinor(f)), [30_000, 210_000, 420_000]);
++  let s = await funded(220_000); const t = () => db.store.get(`lmm_tenants/${s.id}`);   // weekly plan: KES 2,200 is over KES 2,100
++  try { await pouts.startWithdraw(t(), "0712345678", "tenant"); assert.fail("should refuse"); } catch (e) { assert.strictEqual((e.details && e.details.lmmx) || e.lmmx, "LMMX_E_STATE"); assert.match(e.message, /KES 2,200/); assert.match(e.message, /KES 2,100/); assert.match(e.message, /Pay my landlord now/); }
++  assert.strictEqual((await pouts.requestLandlordPayout(t(), "tenant")).requestedMinor, 220_000, "the landlord can always be paid");
++  s = await funded(210_000); assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0, "exactly the weekly cap is allowed");
++  s = await funded(25_000); t().frequency = "daily"; assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0, "KES 250 is under the daily cap");
++  s = await funded(100_000); t().frequency = "daily"; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_STATE");   // paid on a weekly plan, now daily: the stricter cap applies
++  s = await funded(25_000); t().frequency = "biweekly"; assert.ok((await pouts.startWithdraw(t(), "0712345678", "tenant")).netMinor > 0);
++  s = await funded(220_000); const pay = db.list("lmmx_payments").map((p) => db.store.get(p)).find((p) => p.status === "credited"); assert.ok(pay.paySeal && pay.freq === "weekly", "each credited payment is signed with its plan");
++  pay.creditMinor = 100_000; await rej(pouts.startWithdraw(t(), "0712345678", "tenant"), "LMMX_E_TAMPER"); assert.strictEqual(t().frozen, true);   // someone lowered the amount in the database
++});
++ok("the cap is checked again inside the reservation: a big payment made AFTER the code was sent still blocks the withdrawal and nothing moves", async () => {
++  const s = await funded(100_000); const t = () => db.store.get(`lmm_tenants/${s.id}`); await pouts.startWithdraw(t(), "0712345678", "tenant"); const code = wdCode();
++  await payAndCredit(s.id, 220_000); await new Promise((r) => setTimeout(r, 30));   // over the weekly cap of KES 2,100
++  await rej(pouts.confirmWithdraw(t(), code, "tenant"), "LMMX_E_STATE");
++  assert.strictEqual(db.list("lmmx_settlements").length, 0); assert.strictEqual(firstCycle().creditedMinor, 320_000); assert.ok(!firstCycle().withdrawnMinor);
++});
++ok("72 hours after a withdrawal the same phone or ID cannot set up a new plan (any desk, top desk too) or change the plan; after 72 hours it can", async () => {
++  const s = await funded(); const t = () => db.store.get(`lmm_tenants/${s.id}`); seedTopForCool(); await pouts.startWithdraw(t(), "0712345678", "tenant"); await pouts.confirmWithdraw(t(), wdCode(), "tenant");
++  await rej(chg.setPlan(t(), "daily", undefined), "LMMX_E_STATE");
++  await tenants.closeTenant(t(), "test");   // the old plan is gone; a new plan for the same person is what is blocked
++  await rej(tenants.createTenant(DESK, input()), "LMMX_E_STATE"); await rej(tenants.createTenant(TOP, input()), "LMMX_E_STATE");
++  await rej(tenants.createTenant(DESK, input({ profile: { ...input().profile, phone: "0744555666" } })), "LMMX_E_STATE");      // same ID, new phone
++  await rej(tenants.createTenant(DESK, input({ profile: { ...input().profile, idNumber: "87654321" } })), "LMMX_E_STATE");     // same phone, new ID
++  for (const k of db.list("lmmx_locks").filter((p) => p.includes("wdcool_"))) db.store.get(k).at = Date.now() - 73 * 3_600_000;
++  assert.strictEqual((await tenants.createTenant(DESK, input())).status, "awaiting_confirmation");
++});
++const seedTopForCool = () => db.seed("desk_agents/T1", { agentId: "T1", agentCode: "COG-0000", status: "active", rank: "internal", phone: "+254700000000" });
+ // ------------------------------------------------------------------------------------------------------------- audit
+ ok("the audit chain verifies, and a tampered row is detected", async () => {
+   world(); await activate(); await new Promise((r) => setTimeout(r, 20));
+diff --git a/src/lmmx/MoneyPanel.tsx b/src/lmmx/MoneyPanel.tsx
+index 5727ae6..d09b53e 100644
+--- a/src/lmmx/MoneyPanel.tsx
++++ b/src/lmmx/MoneyPanel.tsx
+@@ -2,7 +2,7 @@
+ // does it within 24 hours. A withdrawal goes only to the phone on the account, after a code texted to that phone. Nothing here is trusted: the amounts
+ // shown come from the server, and the server re-checks everything when the request is made.
+ import { useState } from 'react';
+-import { LMMX, kes, normalizeKePhone, type TenantSummaryOut, type WithdrawStartOut } from './contract';
++import { LMMX, eatDate, kes, normalizeKePhone, shortDate, withdrawBreakdown, type TenantSummaryOut, type WithdrawStartOut } from './contract';
+ import { LmmxApiError, errorMessage, lmmx } from './api';
+ import { ERROR_FALLBACK, ERROR_TEXT, MONEY, SHOW_SERVER_MESSAGE } from './strings';
+ import { Alert, Btn, Card, Field, Title, inputClass } from './ui';
+@@ -15,6 +15,9 @@ export default function MoneyPanel({ s, defaultPhone, onChanged }: { s: TenantSu
+   const avail = s.availableMinor ?? 0;
+   const min = kes(LMMX.MIN_PAYOUT_MINOR);
+   const blocked = !!s.frozen || avail < LMMX.MIN_PAYOUT_MINOR || !!s.payoutPending;
++  const opensAt = s.withdrawEligibleAt;
++  const tooNew = typeof opensAt === 'number' && Date.now() < opensAt;   // the server enforces this too; this only explains it
++  const bd = avail >= LMMX.MIN_PAYOUT_MINOR ? withdrawBreakdown(avail) : null;
+   const [payStage, setPayStage] = useState<'idle' | 'confirm' | 'busy'>('idle');
+   const [payNote, setPayNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+   const [phone, setPhone] = useState(defaultPhone);
+@@ -66,17 +69,19 @@ export default function MoneyPanel({ s, defaultPhone, onChanged }: { s: TenantSu
+       <Card>
+         <h3 className="font-semibold text-gray-900">{MONEY.wdTitle}</h3>
+         <p className="mt-1 text-sm text-gray-600">{MONEY.wdExplain}</p>
++        {tooNew && opensAt && <div className="mt-3"><Alert kind="info">{MONEY.wdOpens(shortDate(eatDate(opensAt)))}</Alert></div>}
++        {!tooNew && bd && !wd && !wdDone && <p className="mt-2 text-sm font-medium text-gray-800">{MONEY.wdFeeLines(kes(bd.serviceFeeMinor), kes(bd.transferFeeMinor), kes(bd.netMinor))}</p>}
+         {!wd && !wdDone && (
+           <div className="mt-3 grid gap-3">
+             <Field label={MONEY.wdPhone} hint={MONEY.wdPhoneHint} error={phone !== '' && !phoneOk ? MONEY.badPhone : undefined}>
+               <input className={inputClass} inputMode="tel" autoComplete="tel" value={phone} onChange={(e) => setPhone(e.target.value)} disabled={wdBusy} />
+             </Field>
+-            <Btn disabled={blocked || !phoneOk || wdBusy} onClick={start}>{wdBusy ? MONEY.wdSending : MONEY.wdSend}</Btn>
++            <Btn disabled={blocked || tooNew || !phoneOk || wdBusy} onClick={start}>{wdBusy ? MONEY.wdSending : MONEY.wdSend}</Btn>
+           </div>
+         )}
+         {wd && !wdDone && (
+           <div className="mt-3">
+-            <Alert kind="info">{MONEY.wdSummary(kes(wd.availableMinor), kes(wd.feeMinor), kes(wd.netMinor))}</Alert>
++            <Alert kind="info">{MONEY.wdSummary(kes(wd.availableMinor), kes(wd.serviceFeeMinor), kes(wd.transferFeeMinor), kes(wd.netMinor))}</Alert>
+             <CodeBox title={MONEY.wdCodeTitle} kind="withdraw" placeholder="LMW1234" button={MONEY.wdConfirm} tone="primary"
+               submit={async (code) => { const r = await lmmx('lmmx_tenant_withdrawConfirm', { otp: code }); setWdMsg(r.message); setWdDone(true); setWd(null); onChanged(); return r.message; }} />
+             <div className="mt-2"><Btn tone="ghost" onClick={() => setWd(null)}>{MONEY.payNo}</Btn></div>
+@@ -84,6 +89,7 @@ export default function MoneyPanel({ s, defaultPhone, onChanged }: { s: TenantSu
+         )}
+         {wdDone && <div className="mt-3"><Alert kind="ok">{wdMsg || MONEY.wdDone}</Alert></div>}
+         {wdNote && <div className="mt-3"><Alert kind={wdNote.kind}>{wdNote.text}</Alert></div>}
++        <p className="mt-3 text-xs text-gray-500">{MONEY.wdRules}</p>
+       </Card>
+     </div>
+   );
+diff --git a/src/lmmx/contract.ts b/src/lmmx/contract.ts
+index c92bbb5..0449307 100644
+--- a/src/lmmx/contract.ts
++++ b/src/lmmx/contract.ts
+@@ -12,7 +12,7 @@
+  * Dates are Africa/Nairobi calendar days "YYYY-MM-DD". User-facing brand: "Lipa Mdogo Mdogo". Internal names keep "lmm"/"lmmx".
+  */
+ 
+-export const LMMX_CONTRACT_VERSION = 3;
++export const LMMX_CONTRACT_VERSION = 4;
+ export const LMMX_REGION = "africa-south1";           // every lmmx_* callable
+ export const LMMX_BRAND = "Lipa Mdogo Mdogo";
+ export const LMMX_TOP_DESK = "COG-0000";
+@@ -56,6 +56,9 @@ export const LMMX = {
+   CANCEL_PREFIX: "LMC", WITHDRAW_PREFIX: "LMW",
+   /** Withdrawals and pay-my-landlord-now requests: the least that can be moved (KES 50), how often, and the quiet hour before a withdrawal is sent (within 24 hours in all cases). */
+   MIN_PAYOUT_MINOR: 5_000, PAYOUT_REQUESTS_PER_DAY: 5, WITHDRAW_HOLD_MS: 60 * 60_000,
++  /** WITHDRAWALS ONLY (paying the landlord is never limited by these): a 15% service fee on every withdrawal; the plan must have been active for 2 weeks; every instalment behind the balance
++   *  must be within the cap (KES 300 a day, scaled by the plan: weekly x7, biweekly x14); and for 72 hours after a withdrawal no new plan can be set up (same phone or ID) or changed. */
++  WITHDRAW_SERVICE_BPS: 1_500, WITHDRAW_MIN_ACTIVE_MS: 14 * 86_400_000, WITHDRAW_CAP_PER_DAY_MINOR: 30_000, WITHDRAW_NEW_PLAN_COOLDOWN_MS: 72 * 3_600_000,
+   SETUP_EXPIRY_MS: 72 * 3_600_000,
+   CHANGE_COOLING_OFF_MS: 48 * 3_600_000,
+   CHANGE_DEFER_DAYS_BEFORE_DUE: 3,
+@@ -180,6 +183,15 @@ export function transferCostMinor(amountMinor: number, channel: Channel): number
+ /** F: what one payout of `amountMinor` must reserve from the tenant (cost x 1.2, whole shilling, + KES 5). */
+ export const transferReserveMinor = (amountMinor: number, channel: Channel): number =>
+   wholeShilling(ceilDiv(transferCostMinor(amountMinor, channel) * LMMX.TRANSFER_UPLIFT_BPS, 10_000)) + LMMX.TRANSFER_BUFFER_MINOR;
++/** What a withdrawal of `grossMinor` costs: 15% service fee (rounded UP to a whole shilling) plus the same M-PESA transfer reserve a landlord payout pays. Everything left is sent. */
++export function withdrawBreakdown(grossMinor: number): { serviceFeeMinor: number; transferFeeMinor: number; feeMinor: number; netMinor: number } {
++  const serviceFeeMinor = wholeShilling(ceilDiv(grossMinor * LMMX.WITHDRAW_SERVICE_BPS, 10_000));
++  const transferFeeMinor = transferReserveMinor(grossMinor, "phone");
++  return { serviceFeeMinor, transferFeeMinor, feeMinor: serviceFeeMinor + transferFeeMinor, netMinor: grossMinor - serviceFeeMinor - transferFeeMinor };
++}
++/** The largest single instalment that can sit behind a withdrawal: KES 300 for a daily plan, x7 weekly, x14 biweekly. */
++export const withdrawInstalmentCapMinor = (f: Frequency): number => LMMX.WITHDRAW_CAP_PER_DAY_MINOR * (f === "daily" ? 1 : f === "weekly" ? 7 : 14);
++
+ export function serviceBps(creditMinor: number): number {
+   let bps: number = LMMX.SERVICE_BANDS[0].bps;
+   for (const b of LMMX.SERVICE_BANDS) if (creditMinor >= b.fromMinor) bps = b.bps;
+@@ -261,7 +273,7 @@ export const lmmxText = {
+     fitSms(`Samuhia: ${smsSafe(p.tenantFirstName, 16)} will pay you ${kes(p.rentMinor)} rent monthly via ${LMMX_BRAND}, in small amounts, sent in full on day ${p.dueDay}. Not right? Call ${p.supportPhone}. Collect rent free: ${LMMX_LANDLORD_URL}`),
+   /** M7 to the TENANT: the code that confirms a withdrawal of everything available to their own M-PESA number. */
+   withdraw: (p: { netMinor: number; phone: string; supportPhone: string; code4: string }) =>
+-    fitSms(`${LMMX_BRAND}: withdraw ${kes(p.netMinor)} to your M-PESA ${p.phone}. Code ${withdrawText(p.code4)} valid 30 min. Tap to confirm: ${botConfirmLink(p.code4, "LMW")} Not you? Ignore this and call ${p.supportPhone}.`),
++    fitSms(`${LMMX_BRAND}: withdraw ${kes(p.netMinor)} to your M-PESA ${p.phone} (after a 15% service fee and the M-PESA fee). Code ${withdrawText(p.code4)} valid 30 min. Tap to confirm: ${botConfirmLink(p.code4, "LMW")} Not you? Ignore this and call ${p.supportPhone}.`),
+   /** M4 to the TENANT for a change that needs their OTP. */
+   change: (p: { deskCode: string; summary: string; code4: string }) =>
+     fitSms(`${LMMX_BRAND}: desk ${p.deskCode} asks to change ${smsSafe(p.summary, 80)}. Code ${otpText(p.code4)} valid 30 min. Share it only if you agree. Confirm: ${botConfirmLink(p.code4)}`),
+@@ -368,6 +380,8 @@ export interface TenantSummaryOut {
+   suggestedCreditMinor: number; pendingChange?: PendingChangeView; awaitingSetup?: { otpExpiresAt: number; summary: string }; frozen?: boolean; supportPhone: string;
+   /** Rent paid in and not yet sent to the landlord: what a withdrawal or a pay-my-landlord-now request would move. `payoutPending` = a request is already waiting. */
+   availableMinor?: number; withdrawFeeMinor?: number; payoutPending?: boolean;
++  /** Epoch ms when withdrawals open for this plan (2 weeks after it became active). Paying the landlord now has no such wait. */
++  withdrawEligibleAt?: number;
+ }
+ export interface TenantHistoryIn { cursor?: string }
+ export interface TenantHistoryOut { items: InstalmentView[]; nextCursor?: string }
+@@ -378,9 +392,9 @@ export interface TenantPayOut { reference: string; displayText: string; chargeMi
+ /** A request to pay the landlord everything available now, or to withdraw it to the tenant's own M-PESA. Nobody types an amount: the server takes everything available. Both are processed within 24 hours. */
+ export interface PayoutRequestOut { requestedMinor: number; message: string }
+ export interface WithdrawStartIn { phone: string }                // must equal the phone on the tenant's account
+-export interface WithdrawStartOut { availableMinor: number; feeMinor: number; netMinor: number; otpExpiresAt: number }
++export interface WithdrawStartOut { availableMinor: number; serviceFeeMinor: number; transferFeeMinor: number; feeMinor: number; netMinor: number; otpExpiresAt: number }
+ export interface WithdrawConfirmIn { otp: string }                // "LMW4683" or "4683"
+-export interface WithdrawConfirmOut { requestedMinor: number; feeMinor: number; netMinor: number; message: string }
++export interface WithdrawConfirmOut { requestedMinor: number; serviceFeeMinor: number; transferFeeMinor: number; feeMinor: number; netMinor: number; message: string }
+ export interface TenantSetDueDayIn { dueDay: number }
+ export interface TenantSetDueDayOut { dueDay: number; effectiveFromCycleDate: string }
+ export interface TenantSetPlanIn { frequency: Frequency; suggestedCreditMinor?: number }
+@@ -408,7 +422,7 @@ export const BOT_SIG_MAX_AGE_MS = 5 * 60_000;
+ export type BotKind = "standalone" | "legacy" | "none";
+ export interface BotLookupIn extends BotAuth { phone: string; idNumber: string }   // phone = the WhatsApp sender in E.164
+ /** `none` and a phone/ID mismatch return the identical shape (no enumeration). */
+-export interface BotLookupOut { kind: BotKind; standalone?: { firstName: string; rentMinor: number; remainingMinor: number; dueDate: string; payByDate: string; suggestedCreditMinor: number; frozen?: boolean; awaitingSetup?: boolean; availableMinor?: number; withdrawFeeMinor?: number } }
++export interface BotLookupOut { kind: BotKind; standalone?: { firstName: string; rentMinor: number; remainingMinor: number; dueDate: string; payByDate: string; suggestedCreditMinor: number; frozen?: boolean; awaitingSetup?: boolean; availableMinor?: number; withdrawFeeMinor?: number; withdrawEligibleAt?: number } }
+ export interface BotQuoteIn extends BotAuth { phone: string; idNumber: string; creditMinor: number }
+ export interface BotQuoteOut extends TenantQuoteOut {}
+ export interface BotPayIn extends BotAuth { phone: string; idNumber: string; quoteId: string; payerPhone: string }
+diff --git a/src/lmmx/mock.ts b/src/lmmx/mock.ts
+index 026e692..df08876 100644
+--- a/src/lmmx/mock.ts
++++ b/src/lmmx/mock.ts
+@@ -2,7 +2,7 @@
+ // sessionStorage), so an awaiting tenant really becomes active after the right code, and a payment really shows up after a
+ // few seconds. Nothing here talks to a server.
+ import {
+-  LMMX, kes, normalizeKePhone, transferReserveMinor, parseLmmxCode, quoteInstalment, nextDueDate, eatDate,
++  LMMX, kes, normalizeKePhone, withdrawBreakdown, parseLmmxCode, quoteInstalment, nextDueDate, eatDate,
+   type LmmxCallableMap, type LmmxErrorCode, type PendingChangeView, type InstalmentView, type TenantSummaryOut,
+ } from './contract';
+ 
+@@ -100,7 +100,7 @@ export async function mockCall(op: keyof LmmxCallableMap, d: Record<string, unkn
+       if (id === '99999999') throw new MockError('LMMX_E_RATE', 'rate');
+       throw new MockError('LMMX_E_NOT_FOUND', 'no match'); // same failure for a wrong phone and a wrong ID
+     }
+-    case 'lmmx_tenant_summary': { const avail = st.status === 'active' ? st.credited : 0; return { ...summary(), availableMinor: avail, withdrawFeeMinor: avail >= LMMX.MIN_PAYOUT_MINOR ? transferReserveMinor(avail, 'phone') : 0, payoutPending: st.wdPending }; }
++    case 'lmmx_tenant_summary': { const avail = st.status === 'active' ? st.credited : 0; return { ...summary(), availableMinor: avail, withdrawFeeMinor: avail >= LMMX.MIN_PAYOUT_MINOR ? withdrawBreakdown(avail).feeMinor : 0, payoutPending: st.wdPending, withdrawEligibleAt: Date.now() - 86_400_000 }; }
+     case 'lmmx_tenant_payLandlord': {
+       if (st.status === 'frozen') throw new MockError('LMMX_E_FROZEN', 'frozen');
+       if (st.credited < LMMX.MIN_PAYOUT_MINOR) throw new MockError('LMMX_E_AMOUNT', `You need at least ${kes(LMMX.MIN_PAYOUT_MINOR)} paid in to do this. You have ${kes(st.credited)}.`);
+@@ -110,12 +110,12 @@ export async function mockCall(op: keyof LmmxCallableMap, d: Record<string, unkn
+       if (st.status === 'frozen') throw new MockError('LMMX_E_FROZEN', 'frozen');
+       if (normalizeKePhone(d.phone) !== '+254712345678') throw new MockError('LMMX_E_VALIDATION', 'Withdrawals go only to the M-PESA number on your account.');
+       if (st.credited < LMMX.MIN_PAYOUT_MINOR) throw new MockError('LMMX_E_AMOUNT', `You need at least ${kes(LMMX.MIN_PAYOUT_MINOR)} paid in to do this. You have ${kes(st.credited)}.`);
+-      const fee = transferReserveMinor(st.credited, 'phone'); return { availableMinor: st.credited, feeMinor: fee, netMinor: st.credited - fee, otpExpiresAt: Date.now() + LMMX.OTP_TTL_MS };
++      const bd = withdrawBreakdown(st.credited); return { availableMinor: st.credited, serviceFeeMinor: bd.serviceFeeMinor, transferFeeMinor: bd.transferFeeMinor, feeMinor: bd.feeMinor, netMinor: bd.netMinor, otpExpiresAt: Date.now() + LMMX.OTP_TTL_MS };
+     }
+     case 'lmmx_tenant_withdrawConfirm': {
+       checkCode(d.otp, 'withdraw');
+-      const fee = transferReserveMinor(st.credited, 'phone'), gross = st.credited; st.credited = 0; st.wdPending = true;
+-      return { requestedMinor: gross, feeMinor: fee, netMinor: gross - fee, message: `Withdrawal requested. ${kes(gross - fee)} will be sent to your M-PESA within 24 hours.` };
++      const gross = st.credited, bd = withdrawBreakdown(gross); st.credited = 0; st.wdPending = true;
++      return { requestedMinor: gross, serviceFeeMinor: bd.serviceFeeMinor, transferFeeMinor: bd.transferFeeMinor, feeMinor: bd.feeMinor, netMinor: bd.netMinor, message: `Withdrawal requested. ${kes(bd.netMinor)} will be sent to your M-PESA within 24 hours (${kes(bd.serviceFeeMinor)} service fee and ${kes(bd.transferFeeMinor)} M-PESA fee taken).` };
+     }
+     case 'lmmx_tenant_history': {
+       const page = d.cursor === 'more';
+diff --git a/src/lmmx/strings.ts b/src/lmmx/strings.ts
+index aa8c3a3..055aa3a 100644
+--- a/src/lmmx/strings.ts
++++ b/src/lmmx/strings.ts
+@@ -162,9 +162,12 @@ export const MONEY = {
+   pending: 'A request is already on its way. It will be done within 24 hours.',
+   payTitle: 'Pay my landlord now', payExplain: 'We send it all to your landlord within 24 hours, instead of waiting for your due date.',
+   payConfirm: (amt: string) => `Send ${amt} to your landlord now?`, payButton: 'Pay my landlord now', payYes: 'Yes, send it', payNo: 'Cancel',
+-  wdTitle: 'Withdraw to my M-PESA', wdExplain: 'It goes only to the M-PESA number on your account. We text a code to that number first. The M-PESA transfer fee comes out of the amount.',
++  wdTitle: 'Withdraw to my M-PESA', wdExplain: 'It goes only to the M-PESA number on your account. We text a code to that number first. A 15% service fee and the M-PESA transfer fee come out of the amount.',
+   wdPhone: 'Your M-PESA number', wdPhoneHint: 'It must be the same number you signed in with.', wdSend: 'Send me a code', wdSending: 'Sending…',
+-  wdSummary: (avail: string, fee: string, net: string) => `You have ${avail}. After the ${fee} fee, ${net} will be sent to you.`,
++  wdSummary: (avail: string, service: string, mpesa: string, net: string) => `You have ${avail}. After the 15% service fee (${service}) and the M-PESA fee (${mpesa}), ${net} will be sent to you.`,
++  wdFeeLines: (service: string, mpesa: string, net: string) => `15% service fee: ${service}. M-PESA fee: ${mpesa}. You receive: ${net}.`,
++  wdOpens: (date: string) => `Withdrawals open on ${date}, after your plan has been active for 2 weeks. You can still pay your landlord now.`,
++  wdRules: 'Withdrawals cost a 15% service fee, so paying your landlord is cheaper. A withdrawal is not available for a payment bigger than the limit for your plan, and for 3 days after a withdrawal a new plan cannot be set up.',
+   wdCodeTitle: 'Enter the code we texted you', wdConfirm: 'Confirm withdrawal', wdDone: 'Done',
+   badPhone: 'Enter a valid Safaricom number, like 0712 345 678.',
+ } as const;

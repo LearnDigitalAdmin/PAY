@@ -1,0 +1,700 @@
+diff --git a/docs/perks/BACKEND.md b/docs/perks/BACKEND.md
+index 7e8b6d7..15d55fc 100644
+--- a/docs/perks/BACKEND.md
++++ b/docs/perks/BACKEND.md
+@@ -24,6 +24,7 @@ Composite indexes (customerId asc, createdAt desc) are in PMS `firestore.indexes
+ Only `perks/deps.ts` imports from the rest of PAY (Firestore handle, region, secrets binding, SMS sender). Copy the folder, re-implement those four exports, done. `test/perks.check.js` fails if another file reaches outside the folder.
+ 
+ ## Known gaps
+-- Inbound STOP replies are not handled yet (needs a HostPinnacle inbound webhook); opt-out is currently operator- or customer-app-driven.
++- The sender ID is transactional (no replies), so there is no STOP keyword: promotional SMS point to the opt-out toggle in the Perks app (`Opt out: perks.samuhia.co.ke`).
++- Delivery status comes from the shared HostPinnacle webhook (`docs/sms/HP_WEBHOOK.md`): `perks_smsLog.delivery` is `UNKNOWN`, `DELIVERED`, `UNDELIVERED`, `EXPIRED`, `REJECTED` or `FAILED`; a failure report flips a `SENT` row to `FAILED` so the operator can retry.
+ - Operators with the same uid in `perks_config/operators` have full access; there is no per-action role split yet.
+ - Reversing a sale does not claw back a referral reward it triggered.
+diff --git a/docs/sms/HP_WEBHOOK.md b/docs/sms/HP_WEBHOOK.md
+new file mode 100644
+index 0000000..a22a4f4
+--- /dev/null
++++ b/docs/sms/HP_WEBHOOK.md
+@@ -0,0 +1,26 @@
++# HostPinnacle delivery reports (shared by every product)
++
++Code: `functions/src/sms/` (webhook `hpSmsWebhook`, parser, dispatch records) plus a hook in `hpSms.ts`.
++
++## What it does
++- Every SMS sent through `sendHpSms` (Perks, LMM, OTP login, notifications...) now leaves a row in `sms_dispatch` once HostPinnacle accepts it: product, a reference, the recipient, the provider message id(s), message length and a short hash. **The message body is never stored** (it can contain OTPs). Rows expire after 90 days (`expireAt`).
++- HostPinnacle calls `hpSmsWebhook` with delivery reports. Each report is matched to its send (provider id first, otherwise the newest unfinished send to that number), the status moves forward only (`SENT` to `DELIVERED` or a failure state; `DELIVERED` is never downgraded), and the owning product's handler is called once per change.
++- Every authenticated request is also saved raw in `sms_dlr_inbox` and each event is de-duplicated in `sms_dlr_events`. Inbound or unrecognised callbacks are recorded and ignored (the transactional sender cannot receive replies).
++- MyChama's two direct senders call `trackDispatch` as well, so its sends are tracked too.
++
++## Setup (one time)
++1. Add `HP_WEBHOOK_TOKEN` (a long random string) to the JSON in the `app-secrets-bundle` secret. Without it the webhook answers 503 to everything.
++2. Deploy: `firebase deploy --only functions:hpSmsWebhook` (and the PMS rules/indexes patch).
++3. In the HostPinnacle portal, set the delivery-report callback URL to `https://<hpSmsWebhook URL>/?t=<HP_WEBHOOK_TOKEN>` (GET or POST). If a separate HostPinnacle account is used (MyChama), set the same URL there.
++4. Enable Firestore TTL so old rows disappear:
++   `gcloud firestore fields ttls update expireAt --collection-group=sms_dispatch --enable-ttl` (repeat for `sms_dlr_inbox`, `sms_dlr_events`).
++5. **Verify with real traffic.** The exact callback parameter names are set by HostPinnacle and are not assumed: the parser matches many common names case-insensitively. Send one real SMS, then open `sms_dlr_inbox` and `sms_dispatch`. If `events` is 0 or `matched` is 0 on the inbox row, adjust the alias lists at the top of `sms/parse.ts` (the test file shows how), or ask HostPinnacle for their callback specification.
++
++## Using it from a product
++- Tag the send: `sendHpSms({ mobile, message, track: { product: "lmm", ref: "lmm_sms/<docId>" } })`. The result has `providerIds`.
++- React to reports: `registerSmsProduct("lmm", async (event, dispatch) => { /* update your own log row from dispatch.ref */ })`. Perks does this in `perks/deps.ts` + `perks/dlr.ts`.
++- Untagged sends are still tracked under product `unknown`.
++
++## Limits
++- The token travels in the URL (HostPinnacle callback config usually allows only a URL). Keep the function logs private and rotate the token if it leaks. If HostPinnacle publishes source IPs, add an allow-list in front.
++- Mobile-number fallback matching can mis-attribute when two sends to the same number are unfinished at once; provider-id matching is exact.
+diff --git a/functions/src/hpSms.ts b/functions/src/hpSms.ts
+index 8793629..8421e8c 100644
+--- a/functions/src/hpSms.ts
++++ b/functions/src/hpSms.ts
+@@ -23,8 +23,15 @@ export interface HpSmsOptions {
+   senderId?: string;
+   /** Duplicate suppression; default true. */
+   duplicateCheck?: boolean;
++  /** Tag the send so delivery reports can be routed back: product handler + a reference (e.g. a Firestore doc path). */
++  track?: { product: string; ref?: string };
+ }
+-export interface HpSmsResult { success: boolean; raw?: any; error?: string }
++export interface HpSmsResult { success: boolean; raw?: any; error?: string; /** Provider message ids found in the response (for delivery matching). */ providerIds?: string[] }
++
++/** Installed by ./sms (delivery tracking). Kept as a hook so this file stays dependency-free. */
++export type DispatchTracker = (a: { product: string; ref?: string; mobile: string; message: string; raw: unknown }) => Promise<string[]>;
++let dispatchTracker: DispatchTracker | null = null;
++export const setDispatchTracker = (t: DispatchTracker | null): void => { dispatchTracker = t; };
+ 
+ /** Never throws. Logs loudly when a secret is missing, so "no SMS" is never silent again. */
+ export async function sendHpSms(opts: HpSmsOptions): Promise<HpSmsResult> {
+@@ -46,7 +53,13 @@ export async function sendHpSms(opts: HpSmsOptions): Promise<HpSmsResult> {
+     const d = res.data;
+     console.log(`HostPinnacle SMS response for ${opts.mobile}:`, JSON.stringify(d));
+     const isError = d?.status === "error" || d?.ErrorCode !== undefined || (typeof d?.status === "string" && d.status.toLowerCase().includes("fail"));
+-    return isError ? { success: false, raw: d, error: d?.message || "API error" } : { success: true, raw: d };
++    if (isError) return { success: false, raw: d, error: d?.message || "API error" };
++    let providerIds: string[] | undefined;
++    if (dispatchTracker) {
++      try { providerIds = await dispatchTracker({ product: opts.track?.product || "unknown", ref: opts.track?.ref, mobile: opts.mobile, message: opts.message, raw: d }); }
++      catch (e: any) { console.error("SMS dispatch tracking failed (send itself succeeded):", e?.message); }
++    }
++    return { success: true, raw: d, providerIds };
+   } catch (err: any) {
+     const msg = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
+     console.error(`HostPinnacle SMS send error for ${opts.mobile}:`, msg);
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index 2267528..fd37d53 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -82,6 +82,7 @@ import {
+ // ─── MyChama connector / auth wiring (P0) — see docs/mychama/CONNECTOR_CONTRACT.md ───
+ export * from "./mychama";
+ export * from "./auth";
++export * from "./sms"; // shared HostPinnacle delivery tracking + webhook (see docs/sms/HP_WEBHOOK.md)
+ export * from "./perks"; // Samuhia Perks loyalty backend (self-contained folder; see docs/perks/BACKEND.md)
+ 
+ 
+diff --git a/functions/src/mychama/sms.ts b/functions/src/mychama/sms.ts
+index 2ce74ee..b426cac 100644
+--- a/functions/src/mychama/sms.ts
++++ b/functions/src/mychama/sms.ts
+@@ -7,6 +7,7 @@
+ // at runtime and the SMS silently fails (the legacy paystackCallback does not
+ // bind them today — see docs/mychama/CONNECTOR_CONTRACT.md §9).
+ import axios from "axios";
++import { trackDispatch } from "../sms";
+ import { BUNDLE_SECRETS, bundleSecret } from "../secretsBundle";
+ 
+ // MyChama's own HostPinnacle credentials — separate from PAY's shared
+@@ -19,7 +20,7 @@ const MYCHAMA_HP_APIKEY = bundleSecret("MYCHAMA_HP_SMS_APIKEY");
+ const MYCHAMA_HP_SENDERID = bundleSecret("MYCHAMA_HP_SMS_SENDERID");
+ 
+ export async function sendMyChamaSms(phoneE164: string, message: string): Promise<void> {
+-  await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", {
++  const sent = await axios.post("https://smsportal.hostpinnacle.co.ke/SMSApi/send", {
+     userid: MYCHAMA_HP_USERID.value(),
+     password: MYCHAMA_HP_PASSWORD.value(),
+     apikey: MYCHAMA_HP_APIKEY.value(),
+@@ -31,6 +32,7 @@ export async function sendMyChamaSms(phoneE164: string, message: string): Promis
+     output: "json",
+     duplicatecheck: "true",
+   });
++  await trackDispatch({ product: "mychama", mobile: phoneE164, message, raw: sent?.data });
+ }
+ 
+ /**
+@@ -58,6 +60,7 @@ export async function sendHpSmsChecked(phoneE164: string, message: string): Prom
+     const isError = d?.status === "error" || d?.ErrorCode !== undefined ||
+       (typeof d?.status === "string" && d.status.toLowerCase().includes("fail"));
+     if (isError) console.error("HostPinnacle rejected the send:", JSON.stringify(d));
++    else await trackDispatch({ product: "mychama", mobile: phoneE164, message, raw: d });
+     return !isError;
+   } catch (e) {
+     console.error("HostPinnacle request failed:", (e as Error).message);
+diff --git a/functions/src/perks/deps.ts b/functions/src/perks/deps.ts
+index 465d217..087e077 100644
+--- a/functions/src/perks/deps.ts
++++ b/functions/src/perks/deps.ts
+@@ -6,13 +6,17 @@ import { HttpsError } from "firebase-functions/v2/https";
+ import { plotDb } from "../mychama/config";
+ import { MYCHAMA_REGION } from "../mychama/contract";
+ import { HP_SECRETS, sendHpSms } from "../hpSms";
++import { registerSmsProduct } from "../sms/registry";
++import { perksDlr } from "./dlr";
+ 
+ export { HttpsError };
+ export const REGION = MYCHAMA_REGION;
+ /** Bind on every Perks function that can send SMS. Credentials: the shared HP_SMS_* secrets in app-secrets-bundle. */
+ export const SECRETS = HP_SECRETS;
+ export const db = (): admin.firestore.Firestore => plotDb();
+-export const sendSms = async (e164: string, message: string): Promise<{ success: boolean; error?: string }> => {
+-  const r = await sendHpSms({ mobile: e164.replace(/^\+/, ""), message });
+-  return { success: r.success, error: r.error };
++export const sendSms = async (e164: string, message: string, link?: { ref: string }): Promise<{ success: boolean; error?: string; providerId?: string }> => {
++  const r = await sendHpSms({ mobile: e164.replace(/^\+/, ""), message, track: { product: "perks", ref: link?.ref } });
++  return { success: r.success, error: r.error, providerId: (r.providerIds || [])[0] };
+ };
++// Delivery reports for sends tagged product "perks" update perks_smsLog (see ./dlr.ts). Webhook itself lives in ../sms.
++registerSmsProduct("perks", (ev, d) => perksDlr(db(), ev, d));
+diff --git a/functions/src/perks/dlr.ts b/functions/src/perks/dlr.ts
+new file mode 100644
+index 0000000..2a58ee4
+--- /dev/null
++++ b/functions/src/perks/dlr.ts
+@@ -0,0 +1,16 @@
++// Applies a HostPinnacle delivery report to the matching perks_smsLog row. Structural types only (no imports outside perks/).
++import type { firestore } from "firebase-admin";
++import { P } from "./types";
++
++const FAIL = ["FAILED", "UNDELIVERED", "EXPIRED", "REJECTED"];
++export async function perksDlr(db: firestore.Firestore, ev: { status: string; at: number; code: string | null; description: string | null }, dispatch: { ref?: string | null }): Promise<void> {
++  const path = dispatch.ref || "";
++  if (!path.startsWith(P.smsLog + "/") || path.split("/").length !== 2) return; // only ever touch our own log rows
++  const ref = db.doc(path), snap = await ref.get();
++  if (!snap.exists) return;
++  const cur = snap.data() as { status?: string; delivery?: string };
++  const patch: Record<string, unknown> = { delivery: ev.status, dlrAt: ev.at, dlrCode: ev.code, dlrDescription: ev.description };
++  if (ev.status === "DELIVERED") { patch.deliveredAt = ev.at; if (cur.status === "FAILED") { patch.status = "SENT"; patch.error = null; } }
++  else if (FAIL.includes(ev.status) && cur.status === "SENT" && cur.delivery !== "DELIVERED") { patch.status = "FAILED"; patch.error = `Not delivered: ${ev.description || ev.code || ev.status}`.slice(0, 300); }
++  await ref.set(patch, { merge: true });
++}
+diff --git a/functions/src/perks/notify.ts b/functions/src/perks/notify.ts
+index d722999..052eeec 100644
+--- a/functions/src/perks/notify.ts
++++ b/functions/src/perks/notify.ts
+@@ -5,7 +5,8 @@ import { campaignLive, composeSms, DEFAULT_TEMPLATES, type CampaignLike } from "
+ import { settingsFrom } from "./ops";
+ 
+ type Db = firestore.Firestore;
+-export type Sender = (e164: string, message: string) => Promise<{ success: boolean; error?: string }>;
++/** link.ref lets the delivery webhook find this log row again; providerId is the provider's message id when known. */
++export type Sender = (e164: string, message: string, link?: { ref: string }) => Promise<{ success: boolean; error?: string; providerId?: string }>;
+ export const MAX_RETRIES = 3;
+ 
+ export async function dispatch(db: Db, send: Sender, list: Notification[], now: () => number = Date.now): Promise<void> {
+@@ -31,8 +32,8 @@ async function dispatchOne(db: Db, send: Sender, n: Notification, now: () => num
+   const ref = db.collection(P.smsLog).doc();
+   await ref.set({ id: ref.id, customerId: n.customerId, phone: c.phone, transactionId: n.transactionId ?? null, templateId: n.type, campaignId: campaign ? campaign.id : null,
+     message, status: "PENDING", estimatedCost: s.smsCost, createdAt: now(), sentAt: null, error: null, retryCount: 0 });
+-  const r = await send(c.phone, message);
+-  await ref.set(r.success ? { status: "SENT", sentAt: now(), error: null } : { status: "FAILED", error: String(r.error || "send failed").slice(0, 300) }, { merge: true });
++  const r = await send(c.phone, message, { ref: `${P.smsLog}/${ref.id}` });
++  await ref.set(r.success ? { status: "SENT", sentAt: now(), error: null, delivery: "UNKNOWN", providerMessageId: r.providerId ?? null } : { status: "FAILED", error: String(r.error || "send failed").slice(0, 300) }, { merge: true });
+ }
+ 
+ export async function retrySms(db: Db, send: Sender, a: { id: string }, now: () => number = Date.now): Promise<{ status: string }> {
+@@ -42,8 +43,8 @@ export async function retrySms(db: Db, send: Sender, a: { id: string }, now: ()
+   const m = snap.data() as { status: string; phone: string; message: string; retryCount?: number };
+   if (m.status !== "FAILED") throw new PerksError("failed-precondition", "Only failed messages can be retried.");
+   if ((m.retryCount || 0) >= MAX_RETRIES) throw new PerksError("failed-precondition", "Retry limit reached.");
+-  const r = await send(m.phone, m.message);
++  const r = await send(m.phone, m.message, { ref: `${P.smsLog}/${String(a.id)}` });
+   const status = r.success ? "SENT" : "FAILED";
+-  await ref.set({ status, retryCount: (m.retryCount || 0) + 1, retriedAt: now(), sentAt: r.success ? now() : null, error: r.success ? null : String(r.error || "send failed").slice(0, 300) }, { merge: true });
++  await ref.set({ status, retryCount: (m.retryCount || 0) + 1, retriedAt: now(), sentAt: r.success ? now() : null, error: r.success ? null : String(r.error || "send failed").slice(0, 300), ...(r.success ? { delivery: "UNKNOWN", providerMessageId: r.providerId ?? null } : {}) }, { merge: true });
+   return { status };
+ }
+diff --git a/functions/src/perks/rules.ts b/functions/src/perks/rules.ts
+index 0ffdcad..c6fac2e 100644
+--- a/functions/src/perks/rules.ts
++++ b/functions/src/perks/rules.ts
+@@ -68,8 +68,10 @@ export function campaignLive(c: CampaignLike | null | undefined, now: number): c
+   return (!c.startDate || c.startDate <= day) && (!c.endDate || c.endDate >= day);
+ }
+ 
+-/** TRANSACTION TEMPLATE + CAMPAIGN ADVERT + LINK, advert only with explicit marketing consent. */
++/** The sender ID is transactional and cannot receive replies, so opting out is a toggle in the Perks app, not a STOP keyword. */
++export const OPT_OUT_TEXT = "Opt out: perks.samuhia.co.ke";
++/** TRANSACTION TEMPLATE + CAMPAIGN ADVERT + LINK + opt-out pointer, advert only with explicit marketing consent. */
+ export function composeSms(body: string, vars: Record<string, string | number>, campaign: CampaignLike | null, marketingConsent: boolean): string {
+   const base = body.replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, k: string) => String(vars[k] ?? ""));
+-  return marketingConsent && campaign ? `${base} ${campaign.advert} ${campaign.destinationUrl} Reply STOP to opt out.` : base;
++  return marketingConsent && campaign ? `${base} ${campaign.advert} ${campaign.destinationUrl} ${OPT_OUT_TEXT}` : base;
+ }
+diff --git a/functions/src/sms/dispatch.ts b/functions/src/sms/dispatch.ts
+new file mode 100644
+index 0000000..544f6d4
+--- /dev/null
++++ b/functions/src/sms/dispatch.ts
+@@ -0,0 +1,39 @@
++// Dispatch records (one per accepted send) and delivery-report application. Pure Firestore logic: db is injected.
++import { createHash } from "crypto";
++import type { firestore } from "firebase-admin";
++import { extractProviderIds } from "./parse";
++import { FAILURE_STATUSES, RETENTION_MS, SMS_COLL, type DeliveryStatus, type DispatchDoc, type DlrEvent } from "./types";
++
++type Db = firestore.Firestore;
++const sha = (s: string) => createHash("sha256").update(s).digest("hex");
++const idDoc = (pid: string) => "p_" + pid.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 100);
++
++export interface RecordArgs { product: string; ref?: string | null; mobile: string; message: string; raw: unknown; providerIds?: string[] }
++/** Best-effort bookkeeping after the provider ACCEPTED a send. Returns the provider ids it could find (possibly none). */
++export async function recordDispatch(db: Db, a: RecordArgs, now = Date.now()): Promise<string[]> {
++  const mobile = a.mobile.replace(/\D/g, "").replace(/^0/, "254");
++  const ids = (a.providerIds && a.providerIds.length ? a.providerIds : extractProviderIds(a.raw)).slice(0, 20);
++  const base = { product: a.product || "unknown", ref: a.ref ?? null, mobile, msgLen: a.message.length, msgHash: sha(a.message).slice(0, 12),
++    delivery: "SENT" as DeliveryStatus, createdAt: now, expireAt: now + RETENTION_MS, rawResponse: JSON.stringify(a.raw ?? null).slice(0, 1500) };
++  if (!ids.length) { const id = `m_${mobile}_${now}`; await db.doc(`${SMS_COLL.dispatch}/${id}`).set({ id, providerId: null, ...base }); return []; }
++  for (const pid of ids) { const id = idDoc(pid); await db.doc(`${SMS_COLL.dispatch}/${id}`).set({ id, providerId: pid, ...base }); }
++  return ids;
++}
++
++const isFinal = (s: DeliveryStatus) => s === "DELIVERED" || FAILURE_STATUSES.includes(s);
++export interface ApplyResult { matched: boolean; dispatch: DispatchDoc | null; changed: boolean }
++/** Match a delivery report to its send (provider id first, then the newest unfinished send to that number) and move its status forward. */
++export async function applyDlr(db: Db, ev: DlrEvent): Promise<ApplyResult> {
++  let ref: firestore.DocumentReference | null = null, doc: DispatchDoc | null = null, by = "";
++  if (ev.providerId) { const r = db.doc(`${SMS_COLL.dispatch}/${idDoc(ev.providerId)}`), s = await r.get(); if (s.exists) { ref = r; doc = s.data() as DispatchDoc; by = "providerId"; } }
++  if (!ref && ev.mobile) {
++    const q = await db.collection(SMS_COLL.dispatch).where("mobile", "==", ev.mobile).orderBy("createdAt", "desc").limit(5).get();
++    const hit = q.docs.find((d) => !isFinal((d.data() as DispatchDoc).delivery));
++    if (hit) { ref = hit.ref; doc = hit.data() as DispatchDoc; by = "mobile"; }
++  }
++  if (!ref || !doc) return { matched: false, dispatch: null, changed: false };
++  if (ev.status === "UNKNOWN" || ev.status === "SENT" || doc.delivery === "DELIVERED") return { matched: true, dispatch: doc, changed: false };
++  const patch = { delivery: ev.status, dlrAt: ev.at, dlrCode: ev.code, dlrDescription: ev.description, matchedBy: by };
++  await ref.set(patch, { merge: true });
++  return { matched: true, dispatch: { ...doc, ...patch }, changed: true };
++}
+diff --git a/functions/src/sms/index.ts b/functions/src/sms/index.ts
+new file mode 100644
+index 0000000..f01544d
+--- /dev/null
++++ b/functions/src/sms/index.ts
+@@ -0,0 +1,28 @@
++// Shared HostPinnacle delivery tracking. Importing this module (from src/index.ts) installs the tracker into sendHpSms, so EVERY
++// product that sends through hpSms.ts is tracked with no code change; products that want to react to delivery reports call
++// registerSmsProduct(product, handler) and tag sends with track: { product, ref }.
++import { onRequest } from "firebase-functions/v2/https";
++import { setDispatchTracker } from "../hpSms";
++import { plotDb } from "../mychama/config";
++import { MYCHAMA_REGION } from "../mychama/contract";
++import { BUNDLE_SECRETS, bundleSecret } from "../secretsBundle";
++import { recordDispatch, type RecordArgs } from "./dispatch";
++import { handleHpWebhook } from "./webhook";
++
++export { registerSmsProduct } from "./registry";
++/** Add key HP_WEBHOOK_TOKEN to the app-secrets-bundle JSON (a long random string). */
++const HP_WEBHOOK_TOKEN = bundleSecret("HP_WEBHOOK_TOKEN");
++
++/** For senders that do not go through hpSms.ts (e.g. MyChama's own HostPinnacle account). Never throws. */
++export async function trackDispatch(a: RecordArgs): Promise<string[]> {
++  try { return await recordDispatch(plotDb(), a); } catch (e) { console.error("trackDispatch failed:", (e as Error).message); return []; }
++}
++setDispatchTracker(trackDispatch);
++
++/** Callback URL for the HostPinnacle portal: https://<function-url>/?t=<HP_WEBHOOK_TOKEN>  (GET or POST). */
++export const hpSmsWebhook = onRequest({ region: MYCHAMA_REGION, secrets: BUNDLE_SECRETS, maxInstances: 5, timeoutSeconds: 30, cors: false }, async (req, res) => {
++  try {
++    const r = await handleHpWebhook(plotDb(), { method: req.method, query: req.query as Record<string, unknown>, body: req.body, headers: req.headers as Record<string, unknown> }, HP_WEBHOOK_TOKEN.value());
++    res.status(r.status).type("text/plain").send(r.body);
++  } catch (e) { console.error("hpSmsWebhook fatal:", (e as Error).message); res.status(500).send("error"); }
++});
+diff --git a/functions/src/sms/parse.ts b/functions/src/sms/parse.ts
+new file mode 100644
+index 0000000..6b9b811
+--- /dev/null
++++ b/functions/src/sms/parse.ts
+@@ -0,0 +1,90 @@
++// Tolerant parser for HostPinnacle callbacks. The exact payload shape is configured/documented by HostPinnacle and is NOT assumed:
++// field names are matched case-insensitively against aliases, single events or arrays are accepted, and every raw payload is also
++// stored in sms_dlr_inbox so aliases can be adjusted from real traffic.
++import type { DeliveryStatus, DlrEvent } from "./types";
++
++const A = {
++  id: ["msgid", "messageid", "message_id", "transactionid", "transaction_id", "guid", "requestid", "request_id", "smsid", "uuid", "id"],
++  mobile: ["mobile", "msisdn", "to", "destination", "recipient", "phone", "mobileno", "mobile_no", "number"],
++  status: ["dlrstatus", "dlr_status", "deliverystatus", "delivery_status", "messagestatus", "message_status", "status", "state", "dlr"],
++  code: ["errorcode", "error_code", "errcode", "err", "reasoncode", "reason_code", "code"],
++  desc: ["description", "statusdesc", "status_desc", "reason", "errormessage", "error_message", "error", "remarks"],
++  time: ["donetime", "done_time", "deliverytime", "delivery_time", "dlrtime", "timestamp", "time", "date", "senttime"],
++  inboundText: ["message", "msg", "text", "sms", "content"], inboundFrom: ["from", "sender", "source"],
++};
++type Obj = Record<string, unknown>;
++const isObj = (v: unknown): v is Obj => !!v && typeof v === "object" && !Array.isArray(v);
++const scalar = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : typeof v === "number" && Number.isFinite(v) ? String(v) : null);
++
++/** First scalar whose key matches an alias (alias order = priority); looks one level into nested objects. */
++export function pick(o: Obj, aliases: string[]): string | null {
++  const lower: Record<string, unknown> = {};
++  for (const [k, v] of Object.entries(o)) lower[k.toLowerCase()] = v;
++  for (const a of aliases) { const s = scalar(lower[a]); if (s !== null) return s; }
++  for (const v of Object.values(lower)) if (isObj(v)) { const s = pick(v, aliases); if (s !== null) return s; }
++  return null;
++}
++
++export function normalizeStatus(raw: string | null): DeliveryStatus {
++  const s = (raw || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
++  if (!s) return "UNKNOWN";
++  if (/^(DELIVRD|DELIVERED|DELIVERY_SUCCESS|DELIVERED_TO_HANDSET|DLVRD|SUCCESS_DELIVERED)$/.test(s)) return "DELIVERED";
++  if (/^(UNDELIV|UNDELIVERED|UNDELIVERABLE|NOT_DELIVERED)$/.test(s)) return "UNDELIVERED";
++  if (/^(EXPIRED|EXPIRD)$/.test(s)) return "EXPIRED";
++  if (/^(REJECTD|REJECTED|REJECT)$/.test(s)) return "REJECTED";
++  if (/^(FAILED|FAIL|FAILURE|ERROR|BLOCKED|DND|DELIVERY_FAILED)$/.test(s)) return "FAILED";
++  if (/^(ENROUTE|ACCEPTD|ACCEPTED|SUBMITTED|QUEUED|SENT|PENDING|BUFFERED)$/.test(s)) return "SENT";
++  return "UNKNOWN";
++}
++export function normalizeMobile(raw: string | null): string | null {
++  if (!raw) return null;
++  const d = raw.replace(/\D/g, "");
++  if (/^0[17]\d{8}$/.test(d)) return "254" + d.slice(1);
++  if (/^254[17]\d{8}$/.test(d)) return d;
++  return d.length >= 9 ? d : null;
++}
++function parseTime(raw: string | null, now: number): number {
++  if (!raw) return now;
++  if (/^\d{10}$/.test(raw)) return Number(raw) * 1000;
++  if (/^\d{13}$/.test(raw)) return Number(raw);
++  const t = Date.parse(raw.replace(" ", "T"));
++  return Number.isFinite(t) ? t : now;
++}
++
++/** Every id-like value anywhere in a send response, for matching later callbacks. */
++export function extractProviderIds(raw: unknown, out = new Set<string>(), depth = 0): string[] {
++  if (depth > 4 || raw === null || typeof raw !== "object") return [...out];
++  if (Array.isArray(raw)) { for (const v of raw.slice(0, 50)) extractProviderIds(v, out, depth + 1); return [...out].slice(0, 20); }
++  for (const [k, v] of Object.entries(raw as Obj)) {
++    if (A.id.includes(k.toLowerCase())) { const s = scalar(v); if (s && s.length <= 80) out.add(s); }
++    else if (v && typeof v === "object") extractProviderIds(v, out, depth + 1);
++  }
++  return [...out].slice(0, 20);
++}
++
++export interface ParsedCallback { events: DlrEvent[]; inbound: number; items: number }
++function itemsOf(body: unknown, query: Obj): Obj[] {
++  const lists: Obj[][] = [];
++  const walk = (v: unknown, d: number) => {
++    if (d > 3) return;
++    if (Array.isArray(v)) { const objs = v.filter(isObj); if (objs.length) lists.push(objs); }
++    else if (isObj(v)) for (const x of Object.values(v)) if (Array.isArray(x) || isObj(x)) walk(x, d + 1);
++  };
++  walk(body, 0);
++  if (lists.length) return lists.flat();
++  const merged: Obj = { ...query, ...(isObj(body) ? body : {}) };
++  return Object.keys(merged).length ? [merged] : [];
++}
++export function parseCallback(input: { query?: Obj; body?: unknown }, now = Date.now()): ParsedCallback {
++  const items = itemsOf(input.body, input.query || {});
++  const events: DlrEvent[] = []; let inbound = 0;
++  for (const it of items) {
++    const statusRaw = pick(it, A.status);
++    if (statusRaw === null && pick(it, A.inboundText) !== null && pick(it, A.inboundFrom) !== null) { inbound++; continue; }
++    if (statusRaw === null && pick(it, A.id) === null) continue;
++    const rawTime = pick(it, A.time);
++    events.push({ providerId: pick(it, A.id), mobile: normalizeMobile(pick(it, A.mobile)), status: normalizeStatus(statusRaw), rawStatus: statusRaw || "",
++      code: pick(it, A.code), description: pick(it, A.desc), at: parseTime(rawTime, now), rawTime });
++  }
++  return { events, inbound, items: items.length };
++}
+diff --git a/functions/src/sms/registry.ts b/functions/src/sms/registry.ts
+new file mode 100644
+index 0000000..376b71c
+--- /dev/null
++++ b/functions/src/sms/registry.ts
+@@ -0,0 +1,5 @@
++// Products register a handler to react to delivery reports for the sends they tagged (track.product).
++import type { ProductHandler } from "./types";
++const handlers = new Map<string, ProductHandler>();
++export const registerSmsProduct = (product: string, h: ProductHandler): void => { handlers.set(product, h); };
++export const getSmsProduct = (product: string): ProductHandler | undefined => handlers.get(product);
+diff --git a/functions/src/sms/types.ts b/functions/src/sms/types.ts
+new file mode 100644
+index 0000000..96946bb
+--- /dev/null
++++ b/functions/src/sms/types.ts
+@@ -0,0 +1,17 @@
++// Shared SMS delivery-tracking types. Product-agnostic: any product (Perks, LMM, MyChama, DESK...) can plug in.
++export type DeliveryStatus = "UNKNOWN" | "SENT" | "DELIVERED" | "FAILED" | "UNDELIVERED" | "EXPIRED" | "REJECTED";
++export const FAILURE_STATUSES: DeliveryStatus[] = ["FAILED", "UNDELIVERED", "EXPIRED", "REJECTED"];
++
++export interface DlrEvent {
++  providerId: string | null; mobile: string | null; status: DeliveryStatus; rawStatus: string;
++  code: string | null; description: string | null; at: number; rawTime: string | null;
++}
++/** What we remember about one accepted send. The message BODY is never stored (it can contain OTPs): length and a short hash only. */
++export interface DispatchDoc {
++  id: string; product: string; ref: string | null; mobile: string; providerId: string | null; msgLen: number; msgHash: string;
++  delivery: DeliveryStatus; createdAt: number; expireAt: number; rawResponse: string;
++  dlrAt?: number; dlrCode?: string | null; dlrDescription?: string | null; matchedBy?: string;
++}
++export const SMS_COLL = { dispatch: "sms_dispatch", inbox: "sms_dlr_inbox", events: "sms_dlr_events" } as const;
++export const RETENTION_MS = 90 * 24 * 3600 * 1000;
++export type ProductHandler = (event: DlrEvent, dispatch: DispatchDoc) => Promise<void>;
+diff --git a/functions/src/sms/webhook.ts b/functions/src/sms/webhook.ts
+new file mode 100644
+index 0000000..b2f18b8
+--- /dev/null
++++ b/functions/src/sms/webhook.ts
+@@ -0,0 +1,45 @@
++// HostPinnacle callback endpoint logic (delivery reports; inbound/other events are recorded and ignored).
++// Security: fail closed without a configured token; constant-time token check; every accepted request is stored in sms_dlr_inbox
++// (replayable audit, auto-expires) and processed idempotently. Always answers 200 once stored so the provider does not retry-storm.
++import { createHash, timingSafeEqual } from "crypto";
++import type { firestore } from "firebase-admin";
++import { applyDlr } from "./dispatch";
++import { parseCallback } from "./parse";
++import { getSmsProduct } from "./registry";
++import { RETENTION_MS, SMS_COLL } from "./types";
++
++type Db = firestore.Firestore;
++export interface WebhookReq { method: string; query: Record<string, unknown>; body: unknown; headers: Record<string, unknown> }
++const sha = (s: string) => createHash("sha256").update(s).digest("hex");
++const safeEq = (a: string, b: string) => { const x = Buffer.from(sha(a)), y = Buffer.from(sha(b)); return timingSafeEqual(x, y); };
++const cut = (v: unknown, n: number) => (JSON.stringify(v ?? null) || "null").slice(0, n);
++
++export async function handleHpWebhook(db: Db, req: WebhookReq, token: string, now = Date.now()): Promise<{ status: number; body: string }> {
++  if (!token) { console.error("hpSmsWebhook: HP_WEBHOOK_TOKEN is not configured; refusing all callbacks."); return { status: 503, body: "not configured" }; }
++  if (req.method !== "GET" && req.method !== "POST") return { status: 405, body: "method not allowed" };
++  const given = String(req.query.t ?? (req.headers["x-webhook-token"] as string | undefined) ?? "");
++  if (!given || !safeEq(given, token)) { console.warn("hpSmsWebhook: rejected (bad token)"); return { status: 401, body: "unauthorized" }; }
++  const { t: _t, ...query } = req.query; // never persist the token // eslint-disable-line @typescript-eslint/no-unused-vars
++  const inbox = db.collection(SMS_COLL.inbox).doc();
++  await inbox.set({ id: inbox.id, receivedAt: now, method: req.method, query: cut(query, 2000), body: cut(req.body, 8000), ua: String(req.headers["user-agent"] ?? "").slice(0, 120), expireAt: now + RETENTION_MS });
++  try {
++    const parsed = parseCallback({ query, body: req.body }, now);
++    let matched = 0, skipped = 0;
++    for (const ev of parsed.events) {
++      const key = sha([ev.providerId, ev.mobile, ev.status, ev.rawStatus, ev.code, ev.rawTime].join("|")).slice(0, 40);
++      try { await db.doc(`${SMS_COLL.events}/${key}`).create({ key, providerId: ev.providerId, mobile: ev.mobile, status: ev.status, createdAt: now, expireAt: now + RETENTION_MS }); }
++      catch (e) { if ((e as { code?: number }).code === 6) { skipped++; continue; } throw e; }
++      const r = await applyDlr(db, ev);
++      if (r.matched) matched++;
++      if (r.matched && r.changed && r.dispatch) {
++        const h = getSmsProduct(r.dispatch.product);
++        if (h) { try { await h(ev, r.dispatch); } catch (e) { console.error(`hpSmsWebhook: product handler ${r.dispatch.product} failed:`, (e as Error).message); } }
++      }
++    }
++    await inbox.set({ events: parsed.events.length, matched, duplicates: skipped, inbound: parsed.inbound, items: parsed.items }, { merge: true });
++  } catch (e) {
++    console.error("hpSmsWebhook processing error:", (e as Error).message);
++    await inbox.set({ processError: String((e as Error).message).slice(0, 300) }, { merge: true });
++  }
++  return { status: 200, body: "OK" };
++}
+diff --git a/functions/test/fake-orderby.js b/functions/test/fake-orderby.js
+new file mode 100644
+index 0000000..8e9d8f1
+--- /dev/null
++++ b/functions/test/fake-orderby.js
+@@ -0,0 +1,16 @@
++/* Adds orderBy(field, dir).limit(n) support to the shared FakeDb collection queries (it only has where(==) and limit). */
++const { FakeDb } = require("./desk-fake-firestore");
++const C = Object.getPrototypeOf(new FakeDb().collection("x"));
++if (!C.__orderByPatched) {
++  const get0 = C.get, lim0 = C.limit;
++  C.orderBy = function (f, d = "asc") { const n = Object.create(this); n._o = [f, d]; return n; };
++  C.limit = function (n) { const c = lim0.call(this, n); c._o = this._o; c._lim = n; c._l = null; return c; };
++  C.get = async function () {
++    const q = await get0.call(this); let docs = q.docs;
++    if (this._o) { const [f, d] = this._o; docs = [...docs].sort((a, b) => (a.data()[f] < b.data()[f] ? -1 : a.data()[f] > b.data()[f] ? 1 : 0) * (d === "desc" ? -1 : 1)); }
++    if (this._lim) docs = docs.slice(0, this._lim);
++    return { docs, size: docs.length, empty: !docs.length };
++  };
++  C.__orderByPatched = true;
++}
++module.exports = { FakeDb };
+diff --git a/functions/test/perks.check.js b/functions/test/perks.check.js
+index b54fb05..f348c05 100644
+--- a/functions/test/perks.check.js
++++ b/functions/test/perks.check.js
+@@ -3,28 +3,18 @@
+ const assert = require("assert");
+ const fs = require("fs");
+ const path = require("path");
+-const { FakeDb } = require("./desk-fake-firestore");
++const { FakeDb } = require("./fake-orderby");
+ const lib = (p) => require(path.join(__dirname, "..", "lib", "perks", p));
+ const R = lib("rules"), { handleOperator, handleCustomer } = lib("handlers"), { PerksError } = lib("types");
+ 
+-// The shared fake has where(==)/limit only; add orderBy so the real queries run unchanged.
+-const C = Object.getPrototypeOf(new FakeDb().collection("x")), get0 = C.get, lim0 = C.limit;
+-C.orderBy = function (f, d = "asc") { const n = Object.create(this); n._o = [f, d]; return n; };
+-C.limit = function (n) { const c = lim0.call(this, n); c._o = this._o; c._lim = n; c._l = null; return c; };
+-C.get = async function () {
+-  const q = await get0.call(this); let docs = q.docs;
+-  if (this._o) { const [f, d] = this._o; docs = [...docs].sort((a, b) => (a.data()[f] < b.data()[f] ? -1 : a.data()[f] > b.data()[f] ? 1 : 0) * (d === "desc" ? -1 : 1)); }
+-  if (this._lim) docs = docs.slice(0, this._lim);
+-  return { docs, size: docs.length, empty: !docs.length };
+-};
+-
+ let passed = 0, failed = 0, n = 0;
+ const test = async (name, fn) => { try { await fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
+ const rejects = async (fn, code, re) => { try { await fn(); } catch (e) { assert(e instanceof PerksError, "expected PerksError, got " + e); if (code) assert.strictEqual(e.code, code); if (re) assert(re.test(e.message), e.message); return; } assert.fail("expected rejection"); };
+ 
+ const sent = [];
+ let failNext = false;
+-const send = async (phone, message) => { if (failNext) { failNext = false; return { success: false, error: "gateway down" }; } sent.push({ phone, message }); return { success: true }; };
++let pid = 0;
++const send = async (phone, message, link) => { if (failNext) { failNext = false; return { success: false, error: "gateway down" }; } sent.push({ phone, message, link }); return { success: true, providerId: "P" + (++pid) }; };
+ const fresh = () => { sent.length = 0; return new FakeDb(); };
+ const key = () => `key-${++n}-abcdefgh`;
+ const op = (db, action, p) => handleOperator(db, send, "op1", action, p);
+@@ -138,7 +128,7 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
+     assert.strictEqual(bal(db, "+254712345678"), 7 + 25); assert.strictEqual(db.read(`perks_vouchers/${p.id}`).status, "REDEEMED");
+     const bulk = await op(db, "bulkVouchers", { type: "DISCOUNT", value: 20, count: 3 }); assert.strictEqual(bulk.created, 3);
+   });
+-  await test("SMS: campaign advert only with marketing consent, STOP line included, retry works", async () => {
++  await test("SMS: campaign advert only with marketing consent, opt-out pointer (no STOP keyword), retry works", async () => {
+     const db = fresh();
+     const k = await op(db, "saveCampaign", { name: "Samuhia Perks", advert: "Enjoy more rewards at Samuhia Cyber.", destinationUrl: "https://perks.samuhia.co.ke" });
+     await op(db, "setActiveCampaign", { id: k.id });
+@@ -146,7 +136,7 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
+     assert(sent.length >= 2, "welcome + sale"); assert(sent.every((m) => !/https?:/.test(m.message)), "no advert without consent");
+     await op(db, "setConsent", { phone: "0712345678", marketing: true });
+     sent.length = 0; await sale(db, "0712345678", [svc(100)]);
+-    assert(/Enjoy more rewards/.test(sent[0].message) && /perks\.samuhia\.co\.ke/.test(sent[0].message) && /STOP/.test(sent[0].message));
++    assert(/Enjoy more rewards/.test(sent[0].message) && /perks\.samuhia\.co\.ke/.test(sent[0].message) && /Opt out: perks\.samuhia\.co\.ke/.test(sent[0].message) && !/STOP|Reply/i.test(sent[0].message));
+     const logs = db.list("perks_smsLog").map((p) => db.read(p)); assert(logs.some((l) => l.campaignId === k.id) && logs.some((l) => l.campaignId === null));
+     assert(logs.every((l) => l.estimatedCost === 0.2));
+     failNext = true; await sale(db, "0712345678", [svc(100)]);
+@@ -188,6 +178,25 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
+     assert.strictEqual(db.read("perks_customers/254712345678").marketingConsent, true);
+     assert(db.list("perks_consentLog").length >= 1);
+   });
++  await test("delivery reports: webhook updates the log row; failure re-opens retry; late DELIVERED fixes it", async () => {
++    const { handleHpWebhook } = require(path.join(__dirname, "..", "lib", "sms", "webhook"));
++    const { registerSmsProduct } = require(path.join(__dirname, "..", "lib", "sms", "registry"));
++    const { recordDispatch } = require(path.join(__dirname, "..", "lib", "sms", "dispatch"));
++    const { perksDlr } = lib("dlr");
++    const db = fresh();
++    registerSmsProduct("perks", (ev, d) => perksDlr(db, ev, d));
++    await sale(db, "0712345678", [svc(100)]);
++    const row = () => db.list("perks_smsLog").map((p) => db.read(p)).find((l) => l.templateId === "sale");
++    const l0 = row(); assert(l0.providerMessageId && l0.delivery === "UNKNOWN");
++    // mirror what hpSms does after an accepted send (the stub sender bypasses it)
++    await recordDispatch(db, { product: "perks", ref: `perks_smsLog/${l0.id}`, mobile: "254712345678", message: l0.message, raw: { status: "success", transactionId: l0.providerMessageId } });
++    const hit = (q) => handleHpWebhook(db, { method: "GET", query: { t: "tok", ...q }, body: {}, headers: {} }, "tok");
++    assert.strictEqual((await hit({ msgid: l0.providerMessageId, mobile: "254712345678", status: "UNDELIV", errorcode: "13", description: "Absent subscriber" })).status, 200);
++    assert.strictEqual(row().status, "FAILED"); assert.strictEqual(row().delivery, "UNDELIVERED"); assert(/Absent subscriber/.test(row().error));
++    const r = await op(db, "retrySms", { id: l0.id }); assert.strictEqual(r.status, "SENT");
++    await hit({ msgid: l0.providerMessageId, mobile: "254712345678", status: "DELIVRD", donetime: "2026-11-22 10:15:00" });
++    assert.strictEqual(row().delivery, "DELIVERED"); assert(row().deliveredAt > 0);
++  });
+   await test("static: portable folder, credentials from the bundle only, SMS functions bind secrets", () => {
+     const dir = path.join(__dirname, "..", "src", "perks");
+     for (const f of fs.readdirSync(dir)) {
+diff --git a/functions/test/sms-dlr.check.js b/functions/test/sms-dlr.check.js
+new file mode 100644
+index 0000000..a8d99bf
+--- /dev/null
++++ b/functions/test/sms-dlr.check.js
+@@ -0,0 +1,102 @@
++/* Shared HostPinnacle delivery tracking: parser, dispatch records, webhook security/idempotency, product routing.
++ * Run:  cd functions && npm run build && node test/sms-dlr.check.js */
++const assert = require("assert");
++const fs = require("fs");
++const path = require("path");
++const { FakeDb } = require("./fake-orderby");
++const L = (p) => require(path.join(__dirname, "..", "lib", "sms", p));
++const { parseCallback, normalizeStatus, extractProviderIds, normalizeMobile } = L("parse");
++const { recordDispatch, applyDlr } = L("dispatch");
++const { handleHpWebhook } = L("webhook");
++const { registerSmsProduct } = L("registry");
++
++let passed = 0, failed = 0;
++const test = async (name, fn) => { try { await fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
++const call = (db, over = {}) => handleHpWebhook(db, { method: "GET", query: {}, body: {}, headers: {}, ...over, query: { t: "secret", ...(over.query || {}) } }, "secret", 1_700_000_000_000);
++
++(async () => {
++  await test("status normalisation covers the usual SMPP/portal words", () => {
++    const t = { DELIVRD: "DELIVERED", delivered: "DELIVERED", UNDELIV: "UNDELIVERED", EXPIRED: "EXPIRED", REJECTD: "REJECTED", failed: "FAILED", ENROUTE: "SENT", "Delivered to handset": "DELIVERED", "": "UNKNOWN", WHAT: "UNKNOWN" };
++    for (const [k, v] of Object.entries(t)) assert.strictEqual(normalizeStatus(k), v, k);
++    assert.strictEqual(normalizeMobile("0712 345 678"), "254712345678"); assert.strictEqual(normalizeMobile("+254712345678"), "254712345678");
++  });
++  await test("parser: query-style, JSON object, JSON array, nested wrapper, mixed-case keys, inbound ignored", () => {
++    const a = parseCallback({ query: { msgId: "A1", MOBILE: "0712345678", Status: "DELIVRD", ErrorCode: "000" } }).events[0];
++    assert.deepStrictEqual([a.providerId, a.mobile, a.status, a.code], ["A1", "254712345678", "DELIVERED", "000"]);
++    assert.strictEqual(parseCallback({ body: { messageid: "B1", msisdn: "254722222222", dlrstatus: "FAILED", reason: "DND" } }).events[0].description, "DND");
++    const arr = parseCallback({ body: [{ transactionId: 1, to: "0733333333", status: "DELIVERED" }, { transactionId: 2, to: "0744444444", status: "UNDELIVERED" }] });
++    assert.strictEqual(arr.events.length, 2); assert.strictEqual(arr.events[1].status, "UNDELIVERED");
++    assert.strictEqual(parseCallback({ body: { response: { reports: [{ guid: "G", mobile: "0711111111", status: "EXPIRED" }] } } }).events[0].status, "EXPIRED");
++    const inb = parseCallback({ body: { from: "254799999999", message: "hello" } }); assert.strictEqual(inb.events.length, 0); assert.strictEqual(inb.inbound, 1);
++    assert.strictEqual(parseCallback({ body: { random: "x" } }).events.length, 0);
++    assert.strictEqual(parseCallback({ body: { id: "T", status: "DELIVRD", donetime: "1700000000" } }).events[0].at, 1_700_000_000_000);
++  });
++  await test("provider ids are found anywhere in a send response", () => {
++    assert.deepStrictEqual(extractProviderIds({ status: "success", transactionId: "123" }), ["123"]);
++    assert.deepStrictEqual(extractProviderIds({ response: { status: "success", data: [{ msgId: "a" }, { msgId: "b" }] } }).sort(), ["a", "b"]);
++    assert.deepStrictEqual(extractProviderIds({ status: "success" }), []);
++  });
++  await test("dispatch record never stores the message body (OTP safety) and supports id-less sends", async () => {
++    const db = new FakeDb();
++    await recordDispatch(db, { product: "auth", mobile: "+254712345678", message: "Your code is 482913", raw: { status: "success", transactionId: "T9" } }, 1000);
++    const [p] = db.list("sms_dispatch"); const d = db.read(p);
++    assert.strictEqual(d.providerId, "T9"); assert.strictEqual(d.msgLen, 19); assert(!JSON.stringify(d).includes("482913"));
++    assert(d.expireAt > d.createdAt);
++    await recordDispatch(db, { product: "x", mobile: "0722222222", message: "m", raw: { status: "success" } }, 2000);
++    assert.strictEqual(db.list("sms_dispatch").length, 2);
++  });
++  await test("webhook security: fails closed without token, rejects bad/missing token, rejects other methods", async () => {
++    const db = new FakeDb();
++    assert.strictEqual((await handleHpWebhook(db, { method: "GET", query: { t: "x" }, body: {}, headers: {} }, "")).status, 503);
++    assert.strictEqual((await handleHpWebhook(db, { method: "GET", query: { t: "wrong" }, body: {}, headers: {} }, "secret")).status, 401);
++    assert.strictEqual((await handleHpWebhook(db, { method: "GET", query: {}, body: {}, headers: {} }, "secret")).status, 401);
++    assert.strictEqual((await handleHpWebhook(db, { method: "DELETE", query: { t: "secret" }, body: {}, headers: {} }, "secret")).status, 405);
++    assert.strictEqual((await handleHpWebhook(db, { method: "POST", query: {}, body: {}, headers: { "x-webhook-token": "secret" } }, "secret")).status, 200);
++    assert.strictEqual(db.list("sms_dlr_inbox").length, 1, "only authenticated requests are stored");
++    assert(!JSON.stringify(db.read(db.list("sms_dlr_inbox")[0])).includes("secret"), "token never persisted");
++  });
++  await test("delivery flow: match by provider id, idempotent replay, never downgrade DELIVERED, late DELIVERED upgrades a failure", async () => {
++    const db = new FakeDb();
++    await recordDispatch(db, { product: "lmm", mobile: "0712345678", message: "rent due", raw: { transactionId: "M1" } }, 1000);
++    const id = db.list("sms_dispatch")[0];
++    assert.strictEqual((await call(db, { query: { msgid: "M1", status: "UNDELIV", errorcode: "13" } })).status, 200);
++    assert.strictEqual(db.read(id).delivery, "UNDELIVERED"); assert.strictEqual(db.read(id).dlrCode, "13");
++    await call(db, { query: { msgid: "M1", status: "UNDELIV", errorcode: "13" } });
++    assert.strictEqual(db.list("sms_dlr_events").length, 1, "replay is one event");
++    await call(db, { query: { msgid: "M1", status: "DELIVRD" } });
++    assert.strictEqual(db.read(id).delivery, "DELIVERED");
++    await call(db, { query: { msgid: "M1", status: "FAILED" } });
++    assert.strictEqual(db.read(id).delivery, "DELIVERED", "never downgraded");
++    const inbox = db.list("sms_dlr_inbox").map((p) => db.read(p)); assert(inbox.every((i) => typeof i.events === "number"));
++  });
++  await test("fallback match by mobile when the callback has no id; unmatched events are kept, not lost", async () => {
++    const db = new FakeDb();
++    await recordDispatch(db, { product: "x", mobile: "0712345678", message: "a", raw: { status: "success" } }, 1000);
++    await call(db, { query: { mobile: "254712345678", status: "DELIVRD" } });
++    assert.strictEqual(db.read(db.list("sms_dispatch")[0]).delivery, "DELIVERED");
++    const r = await applyDlr(db, { providerId: "nope", mobile: null, status: "DELIVERED", rawStatus: "", code: null, description: null, at: 1, rawTime: null });
++    assert.strictEqual(r.matched, false);
++    await call(db, { query: { msgid: "ghost", status: "DELIVRD" } });
++    assert(db.list("sms_dlr_inbox").length >= 2);
++  });
++  await test("product routing: handler runs once per status change, handler errors never fail the webhook", async () => {
++    const db = new FakeDb(); const seen = [];
++    registerSmsProduct("alpha", async (ev, d) => { seen.push([ev.status, d.ref]); });
++    registerSmsProduct("boom", async () => { throw new Error("handler bug"); });
++    await recordDispatch(db, { product: "alpha", ref: "alpha_log/1", mobile: "0711111111", message: "m", raw: { transactionId: "A" } });
++    await recordDispatch(db, { product: "boom", ref: "x/1", mobile: "0722222222", message: "m", raw: { transactionId: "B" } });
++    await call(db, { query: { msgid: "A", status: "DELIVRD" } }); await call(db, { query: { msgid: "A", status: "DELIVRD" } });
++    assert.deepStrictEqual(seen, [["DELIVERED", "alpha_log/1"]]);
++    assert.strictEqual((await call(db, { query: { msgid: "B", status: "DELIVRD" } })).status, 200);
++  });
++  await test("static: every HostPinnacle sender is tracked, webhook binds the secrets bundle", () => {
++    const src = path.join(__dirname, "..", "src"), rd = (f) => fs.readFileSync(path.join(src, f), "utf8");
++    assert(/setDispatchTracker|dispatchTracker/.test(rd("hpSms.ts")), "hpSms must call the tracker");
++    assert(/trackDispatch/.test(rd("mychama/sms.ts")), "MyChama senders must be tracked");
++    assert(/export const hpSmsWebhook = onRequest\(\{[^}]*secrets: BUNDLE_SECRETS/.test(rd("sms/index.ts")), "webhook must bind secrets");
++    assert(!/process\.env/.test(rd("sms/webhook.ts") + rd("sms/index.ts")), "no env credentials");
++    assert(/export \* from "\.\/sms"/.test(rd("index.ts")));
++  });
++  console.log(`\nsms-dlr: ${passed} passed, ${failed} failed`);
++  process.exit(failed ? 1 : 0);
++})();

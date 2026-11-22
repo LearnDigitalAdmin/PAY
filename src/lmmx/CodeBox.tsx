@@ -1,11 +1,11 @@
-// One box for every 4-digit code: "LMM4683", "lmm 4683" or just "4683" (setup, a change) and "LMC7391" / "7391" (cancel a change).
+// One box for every 4-digit code: "LMM4683", "lmm 4683" or just "4683" (setup, a change), "LMC7391" (cancel a change) and "LMW4683" (confirm a withdrawal).
 import { useState } from 'react';
 import { parseLmmxCode } from './contract';
 import { LmmxApiError, errorMessage } from './api';
 import { ERROR_FALLBACK, ERROR_TEXT, S } from './strings';
 import { Alert, Btn, Field, inputClass } from './ui';
 
-export type CodeKind = 'otp' | 'cancel';
+export type CodeKind = 'otp' | 'cancel' | 'withdraw';
 
 export function normaliseCode(raw: string, kind: CodeKind): { code: string } | { error: 'bad' | 'kind' } {
   const parsed = parseLmmxCode(raw);

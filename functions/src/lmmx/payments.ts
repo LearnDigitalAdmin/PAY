@@ -13,13 +13,14 @@ import { getOrCreateFlatSplit } from "../desk/split";
 import { COL, X } from "./config";
 import { LMMX, LMMX_BRAND, LMMX_PAYMENT_REF_PREFIX, LMMX_TOP_DESK, eatDate, fitSms, isValidCredit, kes, quoteCoversCosts, quoteInstalment, shortDate } from "./contract";
 import type { Quote, TenantQuoteOut } from "./contract";
-import { H, readToken, sha256, signToken } from "./crypto";
+import { LMM_SEAL_KEY } from "../lmm/seal";
+import { H, hmacHex, readToken, sha256, signToken } from "./crypto";
 import { fail } from "./errors";
 import { alert, audit, col, db, FV, flags, ledger, now } from "./store";
-import { addBusinessDays, holidays, remainingOf, targetCycle } from "./cycles";
+import { addBusinessDays, cycleSeal, holidays, remainingOf, sealOk, targetCycle } from "./cycles";
 import { loadRecipient, nameOf, normId, phoneOf, sms } from "./tenants";
 import type { CycleDoc, PaymentDoc, RecipientDoc, TenantDoc } from "./types";
-import { settleCycle } from "./settle";
+import { freezeForTamper, settleCycle } from "./settle";
 import { payableBonus } from "./bonuses";
 
 interface QuoteToken { tid: string; cyc: string; c: number; g: number; t: number; s: number; cc: number; lr: number; exp: number }
@@ -40,6 +41,10 @@ async function quoteState(t: TenantDoc, credit: number) {
   if (!quoteCoversCosts(q)) { await alert("AMOUNT_MISMATCH", `LMMX quote does not cover costs for ${t.tenantId}`); return fail("LMMX_E_INTERNAL", "Could not price this payment."); }
   return { tc, q, r, remaining };
 }
+
+/** Signs what a withdrawal's instalment limit depends on: which payment, how much, when, and under which plan. */
+export const paymentSeal = (x: { reference: string; tenantId: string; cycleId: string; creditMinor: number; creditedAt: number; freq: string }): string =>
+  hmacHex(LMM_SEAL_KEY.value(), `pay|${x.reference}|${x.tenantId}|${x.cycleId}|${x.creditMinor}|${x.creditedAt}|${x.freq}`);
 
 export async function makeQuote(t: TenantDoc, credit: number): Promise<TenantQuoteOut> {
   const { tc, q, remaining } = await quoteState(t, credit);
@@ -80,7 +85,7 @@ export async function startPayment(t: TenantDoc, quoteId: unknown, payerPhone: u
   const reference = `${LMMX_PAYMENT_REF_PREFIX}${t.tenantId}_${now().toString(36)}${crypto.randomBytes(3).toString("hex")}`.slice(0, 60);
   const p: PaymentDoc = {
     reference, paymentId: reference, tenantId: t.tenantId, cycleId: tc.cycle.cycleId, quoteId: sha256(String(quoteId)).slice(0, 16), phone: phone.e164, status: "initiating", creditMinor: q.creditMinor, reserveMinor: q.transferReserveMinor,
-    serviceMinor: q.serviceFeeMinor, chargeMinor: q.chargeMinor, feesMinor: q.feesMinor, deskShareMinor: deskShare, ...(deskShare ? { deskUid: t.deskUid, deskCode: t.deskCode, splitCode } : {}), createdAt: now(), payerHash: H("phone", phone.e164),
+    serviceMinor: q.serviceFeeMinor, chargeMinor: q.chargeMinor, feesMinor: q.feesMinor, deskShareMinor: deskShare, ...(deskShare ? { deskUid: t.deskUid, deskCode: t.deskCode, splitCode } : {}), createdAt: now(), payerHash: H("phone", phone.e164), freq: t.frequency,
   };
   await col(COL.payments).doc(reference).create(JSON.parse(JSON.stringify(p)));
   try {
@@ -121,10 +126,12 @@ export async function creditPayment(reference: string, webhookAmount: number): P
     if ((ps.data() as PaymentDoc).status === "credited") return null;
     const c = cs.data() as CycleDoc | undefined, t = ts.data() as TenantDoc | undefined;
     if (!c || !t) return fail("LMMX_E_STATE", "cycle or tenant missing");
+    if (!sealOk(c)) return { tampered: true as const, tenantId: t.tenantId };
     const credited = c.creditedMinor + p.creditMinor;
     const status = credited >= c.rentMinor ? (c.settledMinor === 0 && c.inflightMinor === 0 ? "funded" : c.status) : c.status;
-    tx.update(pref, { status: "credited", creditedAt: now(), availableOn, paystackFeeMinor: v.fees });
-    tx.update(cref, { creditedMinor: FV.increment(p.creditMinor), instalments: FV.increment(1), legReserveCollectedMinor: FV.increment(p.reserveMinor), lastCreditAt: now(), lastAvailableOn: availableOn, status, ...(c.firstCreditAt ? {} : { firstCreditAt: now() }) });
+    const creditedAt = now();
+    tx.update(pref, { status: "credited", creditedAt, availableOn, paystackFeeMinor: v.fees, paySeal: paymentSeal({ reference, tenantId: p.tenantId, cycleId: p.cycleId, creditMinor: p.creditMinor, creditedAt, freq: p.freq ?? t.frequency }), ...(p.freq ? {} : { freq: t.frequency }) });
+    tx.update(cref, { creditedMinor: credited, balSeal: cycleSeal({ ...c, creditedMinor: credited }), instalments: FV.increment(1), legReserveCollectedMinor: FV.increment(p.reserveMinor), lastCreditAt: now(), lastAvailableOn: availableOn, status, ...(c.firstCreditAt ? {} : { firstCreditAt: now() }) });
     const leftNow = Math.max(0, c.rentMinor - credited);
     tx.update(tref, { lastPaymentAt: now(), missedCount: 0, cur: { creditedMinor: credited, remainingMinor: leftNow, dueDate: c.dueDate } });
     ledger(tx, [
@@ -138,6 +145,11 @@ export async function creditPayment(reference: string, webhookAmount: number): P
     return { t, c, credited, instalments: c.instalments + 1 };
   });
   if (!state) return "ignored";
+  if ("tampered" in state) {
+    await pref.update({ status: "rejected" });
+    await freezeForTamper(p.tenantId, `cycle ${p.cycleId} money numbers do not match their seal at credit time (payment ${reference} needs a manual refund)`);
+    return "rejected";
+  }
   await audit({ action: "payment_credited", actor: { type: "system" }, tenantId: p.tenantId, summary: `credited ${p.creditMinor / 100} (charge ${p.chargeMinor / 100}) ref ${reference.slice(-8)}` });
   const left = Math.max(0, state.c.rentMinor - state.credited);
   await sms(`lmmx_rcpt_${reference}`, phoneOf(state.t), fitSms(`${dearLine(nameOf(state.t))} we received ${kes(p.creditMinor)} towards your rent via ${LMMX_BRAND}. ${left > 0 ? `Balance ${kes(left)}. Pay by ${shortDate(state.c.payByDate)}.` : "Your rent is fully covered. Your landlord will be paid."}`));

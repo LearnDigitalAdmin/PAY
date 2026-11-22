@@ -9,12 +9,13 @@ import { recalledKinds } from './route';
 import Dashboard from './Dashboard';
 import HistoryPanel from './HistoryPanel';
 import PayPanel from './PayPanel';
+import MoneyPanel from './MoneyPanel';
 import SettingsPanel from './SettingsPanel';
 import { ERROR_TEXT, S } from './strings';
 import { Alert, Btn, Card, Spinner } from './ui';
 
-type Tab = 'home' | 'pay' | 'history' | 'settings';
-const TABS: Tab[] = ['home', 'pay', 'history', 'settings'];
+type Tab = 'home' | 'pay' | 'money' | 'history' | 'settings';
+const TABS: Tab[] = ['home', 'pay', 'money', 'history', 'settings'];
 
 export default function LmmxApp({ demo = false }: { demo?: boolean }) {
   const navigate = useNavigate();
@@ -60,6 +61,7 @@ export default function LmmxApp({ demo = false }: { demo?: boolean }) {
         {!s && !err && <Card><Spinner label={S.loading} /></Card>}
         {s && tab === 'home' && <Dashboard s={s} onChanged={changed} />}
         {s && tab === 'pay' && <PayPanel s={s} defaultPhone={defaultPhone} onPaid={changed} />}
+        {s && tab === 'money' && <MoneyPanel s={s} defaultPhone={defaultPhone} onChanged={changed} />}
         {s && tab === 'history' && <HistoryPanel reloadKey={tick} />}
         {s && tab === 'settings' && <SettingsPanel s={s} onChanged={changed} />}
         {s && <p className="text-center text-xs text-gray-600">{S.support(s.supportPhone)}</p>}

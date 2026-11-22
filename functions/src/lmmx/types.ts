@@ -7,7 +7,7 @@ export interface TenantDoc {
   email?: string; unitNumber?: string; propertyName?: string;
   consentAt?: number; landlordNoticeAt?: number; rent: { amountMinor: number; effectiveFromDue?: string }; dueDay: number; dueDayChangedCycleId?: string;
   frequency: Frequency; suggestedCreditMinor: number; activeRecipientId: string; pendingRecipientId?: string;
-  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string; lastSmsAt?: number; missedCount?: number;
+  authUid?: string; frozen?: boolean; frozenReason?: string; setupExpiresAt?: number; needsReview?: boolean; lastPaymentAt?: number; lastCycleDue?: string; lastSmsAt?: number; missedCount?: number; walletRecipientId?: string; withdrawSeq?: number; activeSeal?: string;
   cur?: { creditedMinor: number; remainingMinor: number; dueDate: string };
 }
 export interface RecipientDoc {
@@ -16,28 +16,30 @@ export interface RecipientDoc {
   resolvedNameEnc: string; enteredNameEnc: string; nameKey: string; resolvedNameMasked: string; nameMatch: NameMatch;
   contactNameEnc: string; contactKey: string; contactPhoneEnc: string; contactPhoneHash: string;
   status: RecipientStatus; reviewReason?: "name_mismatch" | "shared_recipient" | "other"; verifiedAt?: number; createdAt: number; createdByDesk: string;
-  activeTenantCount: number; deskCodes: string[]; noticeSentAt?: number;
+  activeTenantCount: number; deskCodes: string[]; noticeSentAt?: number; kind?: "wallet"; ownerTenantId?: string;
 }
 export interface CycleDoc {
   cycleId: string; tenantId: string; dueDate: string; payByDate: string; rentMinor: number; status: CycleStatus;
   creditedMinor: number; settledMinor: number; inflightMinor: number; instalments: number; firstCreditAt?: number; lastCreditAt?: number; lastAvailableOn?: string;
-  legRentMinor: number; legReserveCollectedMinor: number; settlementCount: number; createdAt: number; completionBonusPaid?: boolean; warned?: boolean; payByWarned?: boolean; milestonesSent?: number[];
+  legRentMinor: number; legReserveCollectedMinor: number; settlementCount: number; createdAt: number; completionBonusPaid?: boolean; warned?: boolean; payByWarned?: boolean; milestonesSent?: number[]; withdrawnMinor?: number; balSeal?: string; payoutRequested?: boolean;
 }
 export interface PaymentDoc {
   reference: string; paymentId: string; tenantId: string; cycleId: string; quoteId: string; phone: string; status: "initiating" | "pending" | "credited" | "failed" | "rejected";
   creditMinor: number; reserveMinor: number; serviceMinor: number; chargeMinor: number; feesMinor: number; deskShareMinor: number; deskUid?: string; deskCode?: string; splitCode?: string;
-  createdAt: number; creditedAt?: number; availableOn?: string; paystackFeeMinor?: number; payerHash: string;
+  createdAt: number; creditedAt?: number; availableOn?: string; paystackFeeMinor?: number; payerHash: string; freq?: string; paySeal?: string;
 }
 export interface SettlementDoc {
-  id: string; tenantId: string; cycleId: string; recipientId: string; recipientCode: string; amountMinor: number; reason: "full" | "due_date" | "topup";
+  id: string; tenantId: string; cycleId: string; recipientId: string; recipientCode: string; amountMinor: number; reason: "full" | "due_date" | "topup" | "withdraw";
   status: "locked" | "paid" | "failed" | "blocked"; reference: string; attempt: number; transferCode?: string; seal: string; createdAt: number; paidAt?: number; refs: string[]; transferCostMinor: number;
+  /** withdrawals only: the credit taken out of the cycles (amountMinor is what is SENT, after the fee), the fee, where it came from, and the earliest send time */
+  grossMinor?: number; feeMinor?: number; allocations?: { cycleId: string; amountMinor: number }[]; notBefore?: number;
 }
 export interface ChangeDoc {
   changeId: string; tenantId: string; kind: ChangeKind; status: ChangeStatus; initiatedBy: "desk" | "top" | "tenant"; deskCode: string; deskUid: string;
   payloadEnc: string; payloadHash: string; summary: string; createdAt: number; coolingOffUntil?: number; applyAfter?: number; appliedAt?: number; cancelHash?: string; newRecipientId?: string; confirmedAt?: number;
 }
 export interface OtpDoc {
-  tenantId: string; purpose: "setup" | "change" | "cancel"; changeId?: string; payloadHash: string; hash: string; expiresAt: number; attempts: number; totalWrong: number;
+  tenantId: string; purpose: "setup" | "change" | "cancel" | "withdraw"; changeId?: string; payloadHash: string; hash: string; expiresAt: number; attempts: number; totalWrong: number;
   lockedUntil: number; usedAt: number | null; sends: number[]; createdAt: number;
 }
 export interface LeadDoc {

@@ -21,6 +21,7 @@ import * as admin from "firebase-admin";
 import * as crypto from "crypto";
 import { REGION, normalizeKePhone, plotDb, MYCHAMA_ID_PEPPER } from "../mychama/config";
 import { sendHpSmsChecked } from "../mychama/sms";
+import { sendHpSms } from "../hpSms";
 import { BUNDLE_SECRETS } from "../secretsBundle";
 import { checkSafaricomPhone } from "../phone/safaricom";
 
@@ -43,7 +44,16 @@ function hmac(label: string, value: string): string {
   return crypto.createHmac("sha256", MYCHAMA_ID_PEPPER.value()).update(`auth-otp:${label}:${value}`).digest("hex");
 }
 
-function cleanPhone(raw: unknown): string {
+/** Perks customers are walk-in shop customers on any Kenyan network, so (unlike payments) there is no Safaricom-only rule. */
+const isPerks = (data: unknown): boolean => (data as { product?: unknown } | undefined)?.product === "perks";
+
+function cleanPhone(raw: unknown, perks = false): string {
+  if (perks) {
+    if (typeof raw === "string" && (raw.trim().length > 20 || /[^\d\s+\-()]/.test(raw))) throw new HttpsError("invalid-argument", "Enter a valid Kenyan mobile number, for example 0712 345 678.");
+    const p = normalizeKePhone(String(raw ?? "").replace(/[\s()-]/g, ""));
+    if (!KE_MOBILE.test(p)) throw new HttpsError("invalid-argument", "Enter a valid Kenyan mobile number, for example 0712 345 678.");
+    return p;
+  }
   const check = checkSafaricomPhone(raw);
   if (!check.ok) throw new HttpsError("invalid-argument", check.message);
   const phone = normalizeKePhone(check.e164);
@@ -60,7 +70,8 @@ function callerIp(req: { rawRequest?: { headers?: Record<string, unknown>; ip?: 
 export const sendLoginOtp = onCall(
   { region: REGION, cors: true, maxInstances: 20, secrets: OTP_SECRETS },
   async (req): Promise<SendOtpResponse> => {
-    const phone = cleanPhone(req.data?.phone);
+    const perks = isPerks(req.data);
+    const phone = cleanPhone(req.data?.phone, perks);
     const db = plotDb();
     const now = Date.now();
     const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
@@ -100,10 +111,13 @@ export const sendLoginOtp = onCall(
       tx.set(dayRef, { count: admin.firestore.FieldValue.increment(1) }, { merge: true });
     });
 
-    const sent = await sendHpSmsChecked(
-      phone,
-      `Your Samuhia Payments verification code is ${code}. It expires in 5 minutes. Never share this code with anyone.`
-    );
+    const sent = perks
+      ? (await sendHpSms({ mobile: phone.replace(/^\+/, ""), duplicateCheck: false, track: { product: "perks-otp" },
+          message: `Your Samuhia Perks verification code is ${code}. It expires in 5 minutes. Never share this code with anyone.` })).success
+      : await sendHpSmsChecked(
+          phone,
+          `Your Samuhia Payments verification code is ${code}. It expires in 5 minutes. Never share this code with anyone.`
+        );
     if (!sent) {
       // Nothing reached the phone: invalidate the code and lift the cooldown so the person can retry at once.
       await chRef.set({ codeHash: null, lastSentAt: 0 }, { merge: true });
@@ -118,7 +132,8 @@ type Check = { ok: true } | { ok: false; reason: "none" | "expired" | "locked" |
 export const verifyLoginOtp = onCall(
   { region: REGION, cors: true, maxInstances: 20, secrets: OTP_SECRETS },
   async (req): Promise<VerifyOtpResponse> => {
-    const phone = cleanPhone(req.data?.phone);
+    const perks = isPerks(req.data);
+    const phone = cleanPhone(req.data?.phone, perks);
     const code = String(req.data?.code ?? "").replace(/\D/g, "");
     if (code.length !== 6) throw new HttpsError("invalid-argument", "Enter the 6-digit code.");
 

@@ -1,4 +1,6 @@
+import { LMM_SEAL_KEY } from "../lmm/seal";
 import { COL } from "./config";
+import { hmacHex, safeEq } from "./crypto";
 import { LMMX, cycleProjection, earningsTable, eatDate, firstDueDate, nextDueDate } from "./contract";
 import type { CycleView, Frequency } from "./contract";
 import { col, now } from "./store";
@@ -32,9 +34,17 @@ export function addBusinessDays(iso: string, n: number, hol: readonly string[]):
   return new Date(t).toISOString().slice(0, 10);
 }
 
+/** Tamper-evident money fields: credited, settled, in flight and withdrawn are signed together. Every legitimate change re-signs them in the same
+ *  transaction; a payout or withdrawal first checks the signature, so editing these numbers in the database freezes the tenant instead of paying. */
+export const cycleSeal = (c: { cycleId: string; creditedMinor: number; settledMinor: number; inflightMinor: number; withdrawnMinor?: number }): string =>
+  hmacHex(LMM_SEAL_KEY.value(), `cyc|${c.cycleId}|${c.creditedMinor}|${c.settledMinor}|${c.inflightMinor}|${c.withdrawnMinor ?? 0}`);
+export const sealOk = (c: CycleDoc): boolean => typeof c.balSeal === "string" && safeEq(c.balSeal, cycleSeal(c));
+
 export function newCycle(t: Pick<TenantDoc, "tenantId">, due: string, rentMinor: number, hol: readonly string[]): CycleDoc {
+  const id = cycleIdOf(t.tenantId, due);
   return {
-    cycleId: cycleIdOf(t.tenantId, due), tenantId: t.tenantId, dueDate: due, payByDate: subBusinessDays(due, LMMX_LAG, hol), rentMinor, status: "open", creditedMinor: 0, settledMinor: 0, inflightMinor: 0,
+    balSeal: cycleSeal({ cycleId: id, creditedMinor: 0, settledMinor: 0, inflightMinor: 0, withdrawnMinor: 0 }), withdrawnMinor: 0,
+    cycleId: id, tenantId: t.tenantId, dueDate: due, payByDate: subBusinessDays(due, LMMX_LAG, hol), rentMinor, status: "open", creditedMinor: 0, settledMinor: 0, inflightMinor: 0,
     instalments: 0, legRentMinor: rentMinor, legReserveCollectedMinor: 0, settlementCount: 0, createdAt: now(),
   };
 }

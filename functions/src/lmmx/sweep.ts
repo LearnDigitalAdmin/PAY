@@ -9,7 +9,7 @@ import { LMMX, LMMX_BOT_LINK, LMMX_BRAND, daysUntil, eatDate, fitSms, kes, nextD
 import { alert, audit, col, db, flags, now } from "./store";
 import { applyDueChanges, expireChanges } from "./changes";
 import { closeTenant, nameOf, phoneOf, sms } from "./tenants";
-import { holidays, loadCycles, newCycle, remainingOf } from "./cycles";
+import { holidays, loadCycles, newCycle, remainingOf, sealOk } from "./cycles";
 import { reconcileLocked, sendSettlement, settleCycle } from "./settle";
 import { finishMigrations, runPmsMatching } from "./pms";
 import type { CycleDoc, SettlementDoc, TenantDoc } from "./types";
@@ -94,6 +94,8 @@ export async function settlementWorker(): Promise<void> {
     const s = d.data() as SettlementDoc;
     try { if (s.transferCode) { if (now() - s.createdAt > 10 * 60_000) await reconcileLocked(s.id); } else await sendSettlement(s.id); } catch (e) { console.error("LMMX worker", s.id, (e as Error).message); }
   }
+  const asked = await col(COL.cycles).where("payoutRequested", "==", true).limit(300).get();   // "pay my landlord now" requests
+  for (const d of asked.docs) { try { await settleCycle((d.data() as CycleDoc).cycleId); } catch (e) { console.error("LMMX requested payout", d.id, (e as Error).message); } }
   const funded = await col(COL.cycles).where("status", "==", "funded").limit(300).get();
   for (const d of funded.docs) { try { await settleCycle((d.data() as CycleDoc).cycleId); } catch (e) { console.error("LMMX funded settle", d.id, (e as Error).message); } }
 }
@@ -105,6 +107,7 @@ export async function reconcileDaily(): Promise<{ checked: number; bad: number }
   for (const d of cyc.docs) {
     const c = d.data() as CycleDoc; checked++;
     const held = c.creditedMinor - c.settledMinor;
+    if (!sealOk(c)) { bad++; await alert("SEAL_MISMATCH", `LMMX recon: cycle ${c.cycleId} money numbers do not match their seal`); continue; }
     if (c.creditedMinor < 0 || c.settledMinor < 0 || c.inflightMinor < 0 || c.creditedMinor > c.rentMinor || c.settledMinor > c.creditedMinor || c.inflightMinor > held) {
       bad++; await alert("UNEXPECTED", `LMMX recon: cycle ${c.cycleId} numbers do not add up (credited ${c.creditedMinor}, settled ${c.settledMinor}, inflight ${c.inflightMinor})`);
     }

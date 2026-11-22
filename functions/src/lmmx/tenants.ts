@@ -6,7 +6,7 @@ import { sendOnce } from "../lmm/sms";
 import { toMsisdn } from "../phone/safaricom";
 import { COL, X } from "./config";
 import {
-  LMMX, LMMX_TOP_DESK, canonicalJson, kes as kesTxt, earningsTable, eatDate, firstDueDate, isValidCredit, lmmxText, maskId, maskName, maskPhone, normalizeKePhone, validIdNumber,
+  LMMX, LMMX_TOP_DESK, canonicalJson, kes as kesTxt, earningsTable, eatDate, firstDueDate, isValidCredit, lmmxText, maskId, maskName, maskPhone, normalizeKePhone, shortDate, validIdNumber,
 } from "./contract";
 import type { DeskCreateTenantIn, DeskCreateTenantOut, DeskGetTenantOut, DeskListTenantsIn, DeskListTenantsOut, Frequency, TenantLinkOut, TenantSummaryOut, TenantStatus } from "./contract";
 import { H, dec, enc, hmacHex, normName, randId, sha256, safeEq } from "./crypto";
@@ -25,6 +25,8 @@ export const sms = (key: string, phoneE164: string, text: string): Promise<boole
 /** What the tenant's code approves: exactly who is paid, how much, and when. Any change to these makes an old code useless. */
 export const termsHashOf = (t: Pick<TenantDoc, "tenantId" | "dueDay" | "rent">, r: Pick<RecipientDoc, "recipientId" | "acctKey">, rentMinor = t.rent.amountMinor, dueDay = t.dueDay): string =>
   sha256(canonicalJson({ tenantId: t.tenantId, recipientId: r.recipientId, acctKey: r.acctKey, rentMinor, dueDay }));
+/** Signs WHEN the plan became active (it decides when withdrawals open), so editing that date in the database is caught. */
+export const activationSealOf = (tenantId: string, at: number): string => hmacHex(LMM_SEAL_KEY.value(), `act|${tenantId}|${at}`);
 export const termsSigOf = (termsHash: string): string => hmacHex(LMM_SEAL_KEY.value(), `terms|${termsHash}`);
 
 const nameTokens = (full: string): string[] => {
@@ -85,6 +87,11 @@ export async function createTenant(desk: DeskCtx, i: DeskCreateTenantIn): Promis
   if (!desk.isTop && !(await rateOk(`new|${desk.uid}`, LMMX.DESK_NEW_TENANTS_PER_DAY, 86_400_000))) return fail("LMMX_E_RATE", "You have reached today's limit for new tenants.");
 
   const phoneHash = H("phone", phone), idHash = H("id", normId(String(p.idNumber)));
+  // After a withdrawal, nobody on this phone or ID can set up a new plan for 72 hours (applies to every desk, the top desk included).
+  for (const key of [`wdcool_phone_${phoneHash.slice(0, 40)}`, `wdcool_id_${idHash.slice(0, 40)}`]) {
+    const at = (await col(COL.locks).doc(key).get()).data()?.at as number | undefined;
+    if (at && now() - at < LMMX.WITHDRAW_NEW_PLAN_COOLDOWN_MS) return fail("LMMX_E_STATE", `A withdrawal was made recently, so a new plan cannot be set up for this tenant until ${shortDate(eatDate(at + LMMX.WITHDRAW_NEW_PLAN_COOLDOWN_MS))}.`);
+  }
   const rec = await createOrReuseRecipient(desk, phone, i.recipient);
   const needsReview = rec.status === "needs_review";
   if (rec.status !== "verified" && !needsReview) return fail("LMMX_E_RECIPIENT_BLOCKED", "This landlord account cannot be used.");
@@ -183,7 +190,8 @@ export async function activateTenant(t: TenantDoc, r: RecipientDoc, via: OtpVia 
     const tref = col(COL.tenants).doc(t.tenantId), rref = col(COL.recipients).doc(r.recipientId);
     const [ts, rs] = await Promise.all([tx.get(tref), tx.get(rref)]);
     if ((ts.data() as TenantDoc).status !== "awaiting_confirmation" || (rs.data() as RecipientDoc).status !== "verified") fail("LMMX_E_STATE", "This setup changed. Please start again.");
-    tx.update(tref, { status: "active", consentAt: now(), updatedAt: now(), setupExpiresAt: FV.delete(), landlordNoticeAt: now(), cur: { creditedMinor: 0, remainingMinor: cycle.rentMinor, dueDate: due } });
+    const at = now();
+    tx.update(tref, { status: "active", consentAt: at, activeSeal: activationSealOf(t.tenantId, at), updatedAt: now(), setupExpiresAt: FV.delete(), landlordNoticeAt: now(), cur: { creditedMinor: 0, remainingMinor: cycle.rentMinor, dueDate: due } });
     tx.update(rref, { activeTenantCount: FV.increment(1), deskCodes: FV.arrayUnion(t.deskCode) });
     tx.set(col(COL.payRecords).doc(t.tenantId), rec);
     tx.create(col(COL.cycles).doc(cycle.cycleId), cycle);

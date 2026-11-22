@@ -82,6 +82,8 @@ import {
 // ─── MyChama connector / auth wiring (P0) — see docs/mychama/CONNECTOR_CONTRACT.md ───
 export * from "./mychama";
 export * from "./auth";
+export * from "./sms"; // shared HostPinnacle delivery tracking + webhook (see docs/sms/HP_WEBHOOK.md)
+export * from "./perks"; // Samuhia Perks loyalty backend (self-contained folder; see docs/perks/BACKEND.md)
 
 
 // ============= CONFIGURATION =============

@@ -1,0 +1,147 @@
+diff --git a/docs/perks/DEPLOY.md b/docs/perks/DEPLOY.md
+new file mode 100644
+index 0000000..069d8ae
+--- /dev/null
++++ b/docs/perks/DEPLOY.md
+@@ -0,0 +1,48 @@
++# Perks + delivery webhook: deploy runbook (PAY and PMS)
++
++Only 3 functions are new. Everything below deploys just those, never the other 100+.
++
++| Function | Status | Purpose |
++|---|---|---|
++| `perks_op` | new | operator actions |
++| `perks_me` | new | customer's own account |
++| `hpSmsWebhook` | new | HostPinnacle delivery reports (shared by all products) |
++
++Optional, only to start delivery-tracking their SMS (they keep working unchanged if not redeployed): `sendLoginOtp`, `mychamaLinkRequestCode`, `lmm_dailySweep`, `lmmx_dailySweep`, `lwBotApi`, `crScheduler`. Payment/reconcile callbacks that also send SMS (`paystackCallback`, `chargeSmsTopUp`, `reconcileMyChamaIntents`, `mychamaPaystackCallback`, `reconcileMyChamaIntentsV2`) are not included by the script; redeploy them by name later if wanted.
++
++## Steps (in this order)
++```bash
++# 0. Apply the patches (PAY, then PMS). --check first; patches are applied in this order.
++cd PAY && for p in perks-backend-pay hp-webhook-pay perks-deploy-pay; do git apply --check ../$p.patch && git apply ../$p.patch; done
++cd ../PMS && for p in perks-rules-pms hp-webhook-pms; do git apply --check ../$p.patch && git apply ../$p.patch; done
++
++# 1. Rules + indexes (PMS)
++cd PMS/plot-rules && firebase deploy --only firestore:rules --project plot-9fd6e
++cd .. && firebase deploy --only firestore:indexes --project plot-9fd6e      # indexes take a few minutes to build
++
++# 2. Webhook token into the bundle (openssl-generated, never overwrites)
++cd ../PAY && bash scripts/hp-webhook-secret.sh
++
++# 3. Build, test, deploy ONLY the new functions
++bash scripts/deploy-perks.sh                    # add --with-senders to also redeploy the 6 SMS-sending functions
++
++# 4. Allow the shop owner as Perks operator (uid from Firebase Console > Authentication)
++cd functions && gcloud auth application-default login && GOOGLE_CLOUD_PROJECT=plot-9fd6e node scripts/perks-operators.js add <UID>
++
++# 5. Auto-expire delivery records (90 days)
++for c in sms_dispatch sms_dlr_inbox sms_dlr_events; do gcloud firestore fields ttls update expireAt --collection-group=$c --enable-ttl --project plot-9fd6e; done
++
++# 6. Callback URL for the HostPinnacle portal (prints the token: run privately)
++cd .. && bash scripts/hp-webhook-secret.sh url
++```
++## Smoke test the webhook
++```bash
++URL="$(bash scripts/hp-webhook-secret.sh url)"
++curl -s -o /dev/null -w "no token  -> %{http_code} (expect 401)\n" "${URL%%\?*}"
++curl -s -o /dev/null -w "with token -> %{http_code} (expect 200)\n" "$URL&msgid=SMOKE1&mobile=254700000000&status=DELIVRD"
++```
++Then check Firestore `sms_dlr_inbox` for the new row (`events: 1`, `matched: 0` because SMOKE1 is not a real send). Send one real SMS and confirm a real report arrives with `matched: 1`; if not, see "Verify with real traffic" in `docs/sms/HP_WEBHOOK.md`.
++
++## Rotate or roll back
++- New token: `bash scripts/hp-webhook-secret.sh rotate`, redeploy `hpSmsWebhook`, update the HostPinnacle URL.
++- Remove: `firebase functions:delete perks_op perks_me hpSmsWebhook --region africa-south1 --project plot-9fd6e`.
+diff --git a/functions/scripts/perks-operators.js b/functions/scripts/perks-operators.js
+new file mode 100644
+index 0000000..495bb7b
+--- /dev/null
++++ b/functions/scripts/perks-operators.js
+@@ -0,0 +1,19 @@
++// Sets who may use the Perks operator screens: Firestore doc perks_config/operators = { uids: [...] }. Safe to re-run.
++//   cd functions && node scripts/perks-operators.js                 -> show the list
++//   cd functions && node scripts/perks-operators.js add <uid>       -> allow a Firebase Auth uid
++//   cd functions && node scripts/perks-operators.js remove <uid>    -> remove it
++// Find the uid in Firebase Console > Authentication. Needs: gcloud auth application-default login  and  GOOGLE_CLOUD_PROJECT=plot-9fd6e
++const admin = require("firebase-admin");
++admin.initializeApp({ projectId: process.env.GOOGLE_CLOUD_PROJECT || "plot-9fd6e" });
++(async () => {
++  const [cmd, uid] = process.argv.slice(2);
++  const ref = admin.firestore().doc("perks_config/operators");
++  const cur = ((await ref.get()).data() || {}).uids || [];
++  let next = cur;
++  if (cmd === "add" || cmd === "remove") {
++    if (!uid || !/^[A-Za-z0-9]{10,64}$/.test(uid)) throw new Error("give a Firebase Auth uid, e.g. node scripts/perks-operators.js add AbC123...");
++    next = cmd === "add" ? [...new Set([...cur, uid])] : cur.filter((u) => u !== uid);
++    await ref.set({ uids: next, updatedAt: Date.now() }, { merge: true });
++  } else if (cmd) throw new Error("usage: perks-operators.js [add|remove <uid>]");
++  console.log("perks_config/operators uids:", next);
++})().catch((e) => { console.error(e.message || e); process.exit(1); });
+diff --git a/scripts/deploy-perks.sh b/scripts/deploy-perks.sh
+new file mode 100755
+index 0000000..c205113
+--- /dev/null
++++ b/scripts/deploy-perks.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++# Deploys ONLY the Perks + delivery-webhook functions (not the other 100+). Builds and tests first.
++#   bash scripts/deploy-perks.sh                  perks_op, perks_me, hpSmsWebhook   (the 3 new functions)
++#   bash scripts/deploy-perks.sh --with-senders   ...plus the SMS-sending functions whose sends should now be delivery-tracked
++# Payment/reconcile callbacks are deliberately NOT included; redeploy those by name only when you want their SMS tracked.
++set -euo pipefail
++PROJECT="${PROJECT:-plot-9fd6e}"
++cd "$(dirname "$0")/.."
++ONLY="functions:perks_op,functions:perks_me,functions:hpSmsWebhook"
++if [ "${1:-}" = "--with-senders" ]; then
++  ONLY="$ONLY,functions:sendLoginOtp,functions:mychamaLinkRequestCode,functions:lmm_dailySweep,functions:lmmx_dailySweep,functions:lwBotApi,functions:crScheduler"
++fi
++( cd functions && npm run build && node test/perks.check.js && node test/sms-dlr.check.js && node test/no-env-credentials.check.js )
++echo "Deploying: $ONLY"
++firebase deploy --only "$ONLY" --project "$PROJECT"
+diff --git a/scripts/hp-webhook-secret.sh b/scripts/hp-webhook-secret.sh
+new file mode 100755
+index 0000000..0de6311
+--- /dev/null
++++ b/scripts/hp-webhook-secret.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++# Manages HP_WEBHOOK_TOKEN inside the shared secret bundle `app-secrets-bundle` (same convention as lmmx-secrets.sh).
++#   bash scripts/hp-webhook-secret.sh           add the token if missing (generated with openssl; never overwrites an existing one)
++#   bash scripts/hp-webhook-secret.sh rotate    replace it with a new one (then update the HostPinnacle callback URL and redeploy hpSmsWebhook)
++#   bash scripts/hp-webhook-secret.sh url       print the full callback URL for the HostPinnacle portal (PRINTS THE TOKEN, run it privately)
++# Needs: gcloud (logged in with access to the project), python3, openssl.
++set -euo pipefail
++PROJECT="${PROJECT:-plot-9fd6e}"; SECRET="${SECRET:-app-secrets-bundle}"; REGION="${REGION:-africa-south1}"; CMD="${1:-ensure}"
++for t in gcloud python3 openssl; do command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }; done
++umask 077
++tmp="$(mktemp)"; trap 'shred -u "$tmp" 2>/dev/null || rm -f "$tmp"' EXIT
++gcloud secrets versions access latest --secret="$SECRET" --project="$PROJECT" > "$tmp"
++case "$CMD" in
++  ensure|rotate)
++    NEW="$(openssl rand -hex 32)"
++    status="$(NEW="$NEW" MODE="$CMD" python3 - "$tmp" <<'PY'
++import json, os, sys
++p = sys.argv[1]
++b = json.load(open(p))
++if not isinstance(b, dict): raise SystemExit("the secret is not a JSON object")
++k = "HP_WEBHOOK_TOKEN"
++if b.get(k) and os.environ["MODE"] != "rotate":
++    print("exists")
++else:
++    b[k] = os.environ["NEW"]; json.dump(b, open(p, "w")); print("set")
++PY
++)"
++    if [ "$status" = "exists" ]; then echo "HP_WEBHOOK_TOKEN already exists in $SECRET. Nothing changed (use: bash scripts/hp-webhook-secret.sh rotate)."; exit 0; fi
++    gcloud secrets versions add "$SECRET" --project="$PROJECT" --data-file="$tmp" >/dev/null
++    echo "HP_WEBHOOK_TOKEN written to $SECRET (value not shown)."
++    echo "Next: deploy the functions so they read the new version (bash scripts/deploy-perks.sh), then: bash scripts/hp-webhook-secret.sh url"
++    ;;
++  url)
++    token="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("HP_WEBHOOK_TOKEN",""))' "$tmp")"
++    [ -n "$token" ] || { echo "HP_WEBHOOK_TOKEN is not set yet. Run: bash scripts/hp-webhook-secret.sh" >&2; exit 1; }
++    base="$(gcloud functions describe hpSmsWebhook --gen2 --region="$REGION" --project="$PROJECT" --format='value(serviceConfig.uri)' 2>/dev/null || true)"
++    [ -n "$base" ] || { echo "hpSmsWebhook is not deployed yet. Run: bash scripts/deploy-perks.sh" >&2; exit 1; }
++    echo "${base%/}/?t=${token}"
++    ;;
++  *) echo "usage: $0 [ensure|rotate|url]" >&2; exit 2 ;;
++esac

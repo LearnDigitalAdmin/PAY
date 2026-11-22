@@ -18,6 +18,7 @@ import { confirmChange, cancelChangeByCode, cancelChangeByDesk, requestChange, s
 import { confirmSetup, createTenant, getTenantView, listTenants, loadRecipient, normId, ownedTenant, pendingChangeView, resendSetupOtp, setupStatus, tenantLink, tenantSummary } from "./tenants";
 import { projections, remainingOf, loadCycles } from "./cycles";
 import * as top from "./top";
+import { confirmWithdraw, requestLandlordPayout, startWithdraw, summaryBalance } from "./payouts";
 import { onTransferEvent } from "./settle";
 import { auditAnchor, dailySweep, reconcileDaily, settlementWorker } from "./sweep";
 import type { ChangeDoc, LeadDoc, TenantDoc } from "./types";
@@ -110,7 +111,14 @@ export const lmmx_tenant_link = fn("lmmx_tenant_link", async (r) => {
   if (!phone) return fail("LMMX_E_AUTH", "Please sign in with your phone number.");
   return tenantLink(r, phone, bad(r.data), callerIp(r));
 });
-export const lmmx_tenant_summary = fn("lmmx_tenant_summary", async (r) => tenantSummary(await requireTenant(r, ["awaiting_confirmation", "active", "paused", "frozen"])));
+export const lmmx_tenant_summary = fn("lmmx_tenant_summary", async (r) => {
+  const c = await requireTenant(r, ["awaiting_confirmation", "active", "paused", "frozen"]);
+  return { ...(await tenantSummary(c)), ...(c.tenant.status === "active" || c.tenant.status === "paused" ? await summaryBalance(c.tenant) : {}) };
+});
+/** Pay my landlord what is available now, or withdraw it to my own M-PESA (code to the phone on record first). Nobody types an amount; both go out within 24 hours. */
+export const lmmx_tenant_payLandlord = fn("lmmx_tenant_payLandlord", async (r) => requestLandlordPayout((await requireTenant(r, ["active", "paused"])).tenant, "tenant"), { timeoutSeconds: 90 });
+export const lmmx_tenant_withdrawStart = fn("lmmx_tenant_withdrawStart", async (r) => startWithdraw((await requireTenant(r, ["active", "paused"])).tenant, bad(r.data).phone, "tenant"));
+export const lmmx_tenant_withdrawConfirm = fn("lmmx_tenant_withdrawConfirm", async (r) => confirmWithdraw((await requireTenant(r, ["active", "paused"])).tenant, String(bad(r.data).otp ?? ""), "tenant"), { timeoutSeconds: 120 });
 export const lmmx_tenant_history = fn("lmmx_tenant_history", async (r) => { const c = await requireTenant(r, ["active", "paused", "frozen"]); return historyPage(c.tenantId, r.data?.cursor); });
 export const lmmx_tenant_quote = fn("lmmx_tenant_quote", async (r) => { const c = await requireTenant(r, ["active"]); return makeQuote(c.tenant, Number(bad(r.data).creditMinor)); });
 export const lmmx_tenant_pay = fn("lmmx_tenant_pay", async (r) => { const c = await requireTenant(r, ["active"]); return startPayment(c.tenant, bad(r.data).quoteId, r.data.payerPhone); }, { timeoutSeconds: 90 });
@@ -167,7 +175,8 @@ export const lmmx_bot_lookup = fn("lmmx_bot_lookup", async (r): Promise<BotLooku
     if (t.status === "awaiting_confirmation") return { kind: "standalone", standalone: { firstName: "", rentMinor: t.rent.amountMinor, remainingMinor: t.rent.amountMinor, dueDate: "", payByDate: "", suggestedCreditMinor: t.suggestedCreditMinor, awaitingSetup: true } };
     const cyc = await loadCycles(t.tenantId); const cur = cyc.find((c) => remainingOf(c) > 0) ?? cyc[0];
     const s = await tenantSummary({ uid: "", tenantId: t.tenantId, tenant: t, phone, ip: "" });
-    return { kind: "standalone", standalone: { firstName: s.firstName, rentMinor: t.rent.amountMinor, remainingMinor: cur ? remainingOf(cur) : t.rent.amountMinor, dueDate: cur?.dueDate ?? "", payByDate: cur?.payByDate ?? "", suggestedCreditMinor: s.suggestedCreditMinor, ...(t.frozen ? { frozen: true } : {}) } };
+    const bal: { availableMinor: number; withdrawFeeMinor: number; withdrawEligibleAt?: number } = t.status === "active" || t.status === "paused" ? await summaryBalance(t) : { availableMinor: 0, withdrawFeeMinor: 0 };
+    return { kind: "standalone", standalone: { availableMinor: bal.availableMinor, withdrawFeeMinor: bal.withdrawFeeMinor, ...(bal.withdrawEligibleAt ? { withdrawEligibleAt: bal.withdrawEligibleAt } : {}), firstName: s.firstName, rentMinor: t.rent.amountMinor, remainingMinor: cur ? remainingOf(cur) : t.rent.amountMinor, dueDate: cur?.dueDate ?? "", payByDate: cur?.payByDate ?? "", suggestedCreditMinor: s.suggestedCreditMinor, ...(t.frozen ? { frozen: true } : {}) } };
   }
   // PMS stores a tenant's National ID (`localId`) as a NUMBER on most accounts and as a string on some, so ask for both forms.
   const idForms: (string | number)[] = [id, ...(/^\d+$/.test(id) ? [Number(id)] : [])];
@@ -180,6 +189,12 @@ export const lmmx_bot_lookup = fn("lmmx_bot_lookup", async (r): Promise<BotLooku
 const botTenantOrFail = async (d: Record<string, unknown>): Promise<TenantDoc> => (await botTenant(botPhone(d.phone), String(d.idNumber ?? ""))) ?? fail("LMMX_E_NOT_FOUND", "We could not find your account.");
 export const lmmx_bot_quote = fn("lmmx_bot_quote", async (r) => { const d = bad(r.data) as unknown as Record<string, unknown>; await verifyBot("lmmx_bot_quote", d); return makeQuote(await botTenantOrFail(d), Number(d.creditMinor)); });
 export const lmmx_bot_pay = fn("lmmx_bot_pay", async (r) => { const d = bad(r.data) as unknown as Record<string, unknown>; await verifyBot("lmmx_bot_pay", d); return startPayment(await botTenantOrFail(d), d.quoteId, d.payerPhone); }, { timeoutSeconds: 90 });
+export const lmmx_bot_payLandlord = fn("lmmx_bot_payLandlord", async (r) => { const d = bad(r.data) as unknown as Record<string, unknown>; await verifyBot("lmmx_bot_payLandlord", d); return requestLandlordPayout(await botTenantOrFail(d), "bot"); }, { timeoutSeconds: 90 });
+export const lmmx_bot_withdrawStart = fn("lmmx_bot_withdrawStart", async (r) => {
+  const d = bad(r.data) as unknown as Record<string, unknown>; await verifyBot("lmmx_bot_withdrawStart", d);
+  const t = await botTenantOrFail(d);
+  return startWithdraw(t, d.phone, "bot");   // the WhatsApp number must BE the phone on record; the code is texted there
+});
 export const lmmx_bot_joinInfo = fn("lmmx_bot_joinInfo", async (r) => {
   await verifyBot("lmmx_bot_joinInfo", (r.data ?? {}) as unknown as Record<string, unknown>);
   return { supportPhones: [X.SUPPORT_PHONE], text: "To join Lipa Mdogo Mdogo, visit a Samuhia desk agent near you with your ID and your landlord's payment details, or call us." };
@@ -202,6 +217,11 @@ export const lmmx_bot_confirmCode = fn("lmmx_bot_confirmCode", async (r): Promis
       const ch = (await pendingChangeView(t.tenantId));
       if (ch && ch.status === "awaiting_tenant_otp") { await confirmChange({ changeId: ch.changeId, otp: parsed.code, via: "bot", tenantId: t.tenantId }); return { result: "change_confirmed", summary: ch.summary }; }
       return { result: "not_found" };
+    }
+    if (parsed.kind === "withdraw") {
+      if (t.status !== "active" && t.status !== "paused") return { result: "not_found" };
+      const w = await confirmWithdraw(t, parsed.code, "bot");
+      return { result: "withdraw_requested", summary: `KES ${w.netMinor / 100}` };
     }
     const ch = await pendingChangeView(t.tenantId);
     if (!ch) return { result: "not_found" };
