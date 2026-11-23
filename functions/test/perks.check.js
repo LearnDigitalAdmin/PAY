@@ -130,7 +130,7 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
   });
   await test("SMS: campaign advert only with marketing consent, opt-out pointer (no STOP keyword), retry works", async () => {
     const db = fresh();
-    const k = await op(db, "saveCampaign", { name: "Samuhia Perks", advert: "Enjoy more rewards at Samuhia Cyber.", destinationUrl: "https://perks.samuhia.co.ke" });
+    const k = await op(db, "saveCampaign", { name: "Samuhia Perks", advert: "Enjoy more rewards at Rexnet Cyber.", destinationUrl: "https://perks.samuhia.co.ke" });
     await op(db, "setActiveCampaign", { id: k.id });
     await sale(db, "0712345678", [svc(100)]);
     assert(sent.length >= 2, "welcome + sale"); assert(sent.every((m) => !/https?:/.test(m.message)), "no advert without consent");
@@ -201,7 +201,7 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
     const db = fresh();
     const a = await op(db, "createCustomer", { phone: "0712345678" });
     assert.strictEqual(a.created, true); assert(a.customer.referralCode);
-    assert(sent.some((m) => /Welcome to Samuhia Perks/.test(m.message) && m.message.includes(a.customer.referralCode)));
+    assert(sent.some((m) => /welcome to Samuhia Perks at Rexnet Cyber/i.test(m.message) && m.message.includes(a.customer.referralCode)));
     const n = sent.length, b = await op(db, "createCustomer", { phone: "+254712345678" });
     assert.strictEqual(b.created, false); assert.strictEqual(sent.length, n, "no second welcome");
     await rejects(() => op(db, "createCustomer", { phone: "12" }), "invalid-argument");
@@ -215,6 +215,14 @@ const bal = (db, phone) => (db.read(`perks_customers/${R.customerId(phone)}`) ||
     const none = (await op(db, "list", { collection: "tx", since: Date.now() + 60_000 })).items; assert.strictEqual(none.length, 0);
     const some = (await op(db, "list", { collection: "tx", since: Date.now() - 60_000 })).items; assert.strictEqual(some.length, 2);
     await rejects(() => op(db, "list", { collection: "authOtp" }), "invalid-argument");
+  });
+  await test("default SMS wording greets the customer and names Rexnet Cyber (the name on the shop door)", async () => {
+    const db = fresh();
+    await sale(db, "0712345678", [svc(2000)]);
+    await op(db, "redeem", { phone: "0712345678", points: 100, idempotencyKey: key() });
+    assert(sent.length >= 3, "welcome, receipt, redemption");
+    assert(sent.every((m) => /^Dear customer, /.test(m.message) && /Rexnet Cyber/.test(m.message)), sent.map((m) => m.message).join(" | "));
+    assert(!sent.some((m) => /Samuhia Cyber/.test(m.message)));
   });
   await test("static: portable folder, credentials from the bundle only, SMS functions bind secrets", () => {
     const dir = path.join(__dirname, "..", "src", "perks");

@@ -44,12 +44,12 @@ export const qualifiesReferral = (eligible: number, s: PerksSettings) => eligibl
 
 export const ALLOWED_PLACEHOLDERS = ["phone", "amount", "service", "pointsEarned", "pointsBalance", "balanceValue", "pointsRedeemed", "discount", "referralCode", "referrerReward", "inviteeReward", "voucherCode", "voucherValue"];
 export const DEFAULT_TEMPLATES: Record<NotificationType, string> = {
-  sale: "Samuhia Cyber: KES {{amount}} received. You earned {{pointsEarned}} pts. Balance {{pointsBalance}} pts (KES {{balanceValue}}).",
-  redeem: "Samuhia Cyber: you redeemed {{pointsRedeemed}} pts for KES {{discount}} off. Balance {{pointsBalance}} pts.",
-  referralReferrer: "Samuhia Perks: your referral qualified! You earned {{referrerReward}} pts. Balance {{pointsBalance}} pts.",
-  referralInvitee: "Samuhia Perks: welcome bonus! You earned {{inviteeReward}} pts. Balance {{pointsBalance}} pts.",
-  voucher: "Samuhia Perks: you won voucher {{voucherCode}} worth {{voucherValue}}. Show it at Samuhia Cyber.",
-  welcome: "Welcome to Samuhia Perks! Your referral code is {{referralCode}}. Earn points on every visit.",
+  sale: "Dear customer, Rexnet Cyber received KES {{amount}}. You earned {{pointsEarned}} pts. Balance {{pointsBalance}} pts (KES {{balanceValue}}).",
+  redeem: "Dear customer, Rexnet Cyber redeemed {{pointsRedeemed}} pts for KES {{discount}} off. Balance {{pointsBalance}} pts.",
+  referralReferrer: "Dear customer, Rexnet Cyber: your referral qualified! You earned {{referrerReward}} pts. Balance {{pointsBalance}} pts.",
+  referralInvitee: "Dear customer, welcome bonus from Rexnet Cyber: {{inviteeReward}} pts added. Balance {{pointsBalance}} pts.",
+  voucher: "Dear customer, Rexnet Cyber has a voucher for you: {{voucherCode}} worth {{voucherValue}}. Show it at the shop.",
+  welcome: "Dear customer, welcome to Samuhia Perks at Rexnet Cyber! Your referral code is {{referralCode}}. Earn points on every visit.",
 };
 export const TEMPLATE_IDS = Object.keys(DEFAULT_TEMPLATES) as NotificationType[];
 
