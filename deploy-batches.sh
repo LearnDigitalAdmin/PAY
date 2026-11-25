@@ -142,3 +142,6 @@ else
   echo "  bash deploy-batches.sh ${failed[*]}"
   exit 1
 fi
+
+
+
