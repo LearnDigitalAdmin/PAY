@@ -1,8 +1,9 @@
 // The Landlord Watch calculation engine. PURE: no Firestore, no clock except `now`, no secrets. It produces the
 // UNMASKED ("open") snapshot; mask.ts lowers it to what a given actor may see. Definitions: contract section 5.
 //
-// Commission is a percentage of BASE RENT only (never water, power or other charges). A part-paid invoice counts its
-// full base rent, exactly like the PMS landlord transcript does (rentAmount of every invoice that is paid or part-paid).
+// Commission is a percentage of BASE RENT only (never water, power or other charges), and only of the base rent that was
+// really COLLECTED: money paid on an invoice settles its base rent first, then its bills (rent-first, the same allocation as
+// the PMS accounting engine: PMS src/services/accounting). A part-paid invoice therefore counts what was paid, not its full rent.
 import { REMITTANCE_DAY, TREND_MONTHS } from "./constants";
 import { count, dayLabel, money, monthLabel, pct, round2, shiftMonth, STR, toDay } from "./format";
 import type {
@@ -45,7 +46,7 @@ export function totalsFor(invoices: RawInvoice[], ratePct: number): Totals {
     collected += i.amountPaid;
     pending += Math.max(0, i.totalAmount - i.amountPaid);
     baseRentBilled += i.rentAmount;
-    if (paidAny(i)) baseRentCollected += i.rentAmount;
+    baseRentCollected += Math.min(Math.max(0, i.amountPaid), Math.max(0, i.rentAmount));   // rent-first
   }
   const rate = Math.max(0, ratePct) / 100;
   return {
@@ -139,14 +140,18 @@ export function buildOpenSnapshot(input: CalcInput): Snapshot {
     const consistent = pays.length > 0 && Math.abs(pays.reduce((s, p) => s + p.amount, 0) - inv.amountPaid) <= 0.01;
     // When payment records are missing or disagree with the invoice, treat the invoice total as one payment on its paid date.
     const entries = consistent ? pays.map((p) => ({ amount: p.amount, date: p.date })) : [{ amount: inv.amountPaid, date: toDay(inv.paidDate) ?? pays[0]?.date ?? null }];
-    const dates = entries.map((e) => e.date).filter((d): d is string => !!d).sort();
-    const first = dates[0] ?? null;
     // An unknown date is given the benefit of the doubt (counted as on time).
     for (const e of entries) {
       if (e.date === null || e.date <= due) byDue += e.amount; else afterDue += e.amount;
     }
-    const commission = inv.rentAmount * rate;
-    if (first === null || first <= due) commByDue += commission; else commAfterDue += commission;
+    // Commission follows the rent actually collected: each payment settles the invoice's base rent first (in date order),
+    // and the commission on that slice belongs to the same side of the due date as the payment that collected it.
+    let rentLeft = Math.max(0, inv.rentAmount);
+    for (const e of [...entries].sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""))) {
+      const slice = Math.min(Math.max(0, e.amount), rentLeft);
+      rentLeft -= slice;
+      if (e.date === null || e.date <= due) commByDue += slice * rate; else commAfterDue += slice * rate;
+    }
   }
 
   // ---- trend: the last 6 months ending at `month` ----

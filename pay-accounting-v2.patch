@@ -1,0 +1,559 @@
+diff --git a/DEPLOY_ACCOUNTING_V2.md b/DEPLOY_ACCOUNTING_V2.md
+new file mode 100644
+index 0000000..bdfddf4
+--- /dev/null
++++ b/DEPLOY_ACCOUNTING_V2.md
+@@ -0,0 +1,39 @@
++# Accounting v2 (PAY side): new rent fee schedule, cost contract, billing callable
++
++What changed in PAY
++- Platform fee on rent by plan: free 0.75 | solo 0.50 | business 0.40 | pro 0.25 | enterprise 0.15 (was 0.95 / 0.95 / 0.65 / 0.40 / 0.20). The Starter plan has no row: legacy `starter` / `low` pay the Free rate.
++- Every rent transaction now carries `collectionCostMinor` and `feeVersion: 2` (same number as `deductionsMinor`, named for who bears it: the account holder, i.e. an agency takes it out of its commission).
++- New read-only callable `pmsAccountingBilling`: the signed-in account holder's own plan and SMS payments, for the agent's expense accounts.
++- Landlord Watch estimate path: commission is on rent actually collected, rent-first (a part-paid invoice no longer counts its full rent). Same rule as the PMS engine.
++
++## 1. Apply, build, test (PAY repo root)
++```bash
++git apply --check pay-accounting-v2.patch && git apply pay-accounting-v2.patch
++cd functions && npm ci && npm run build
++for t in rent-flat-split desk-money rent-settlement desk-rentbatch landlord-watch-calc landlord-watch-service pms-billing; do node test/$t.check.js || break; done
++```
++Expected: 8 / 16 / 12 / 9 / 19 / 17 / 6 passed. (`desk-webhooks` has one failing MyChama commission test that fails the same way before this patch: unrelated.)
++
++## 2. Deploy ONLY the affected functions (PAY repo root; the other 90+ are not redeployed)
++```bash
++FUNCS="processPayment setupAccount desk_runRentBatch pmsAccountingBilling lwGetSnapshot lwTranscriptStart lwTranscriptPay lwTranscriptVerifyOtp lwTranscriptStatus lwBotApi"
++DRY_RUN=1 SKIP_BUILD=1 bash deploy-batches.sh $FUNCS      # preview the batches
++bash deploy-batches.sh $FUNCS                              # for real
++```
++Why these ten: `processPayment` and `desk_runRentBatch` start rent charges (new fees + cost fields); `setupAccount` sets the subaccount percentage from the same table;
++`pmsAccountingBilling` is new; the six `lw*` functions compute Landlord Watch snapshots/transcripts (new collected-rent rule).
++NOT needed: `paystackCallback` and the schedulers (they only read amounts stored on each payment), the other `lw*` functions (no snapshot maths), everything else.
++Equivalent plain CLI: `firebase deploy --only functions:processPayment,functions:setupAccount,...`.
++
++Accounts already set up keep the percentage stored on their Paystack subaccount until `setupAccount` runs again for them; rent CHARGES use the flat split from the new table immediately.
++
++## 3. Tenant payment screen (PAY hosting, optional but keeps the preview honest)
++```bash
++npm run build && firebase deploy --only hosting
++```
++
++## Order of rollout (whole project)
++1. PAY functions (this file, step 2).
++2. PMS Firestore rules + indexes (`firebase deploy --only firestore:rules,firestore:indexes --project plot-9fd6e`) BEFORE releasing the PMS app, or expense/income sync will be refused until you do.
++3. PMS app release.
++4. Outside these two repos: stop selling Starter in `processWebSubscription` (CYBER) and the Firestore `plans` collection; update samuhia.co.ke/pricing (it still quotes 1.5% platform fee for rent).
+diff --git a/functions/src/desk/rentCharge.ts b/functions/src/desk/rentCharge.ts
+index cf35a2a..eb31223 100644
+--- a/functions/src/desk/rentCharge.ts
++++ b/functions/src/desk/rentCharge.ts
+@@ -1,14 +1,16 @@
+ // The ONE function that starts a rent STK push. processPayment (landlord / tenant initiated) calls it, and so will the
+ // desk-initiated batch runner. Extracted from processPayment — the Paystack call, the records and the payload are the
+ // same; what changed is the money: see ./rentFees — the tenant is charged rent + a capped surcharge, the landlord's
+-// subaccount receives EXACTLY rent - (its part of Paystack's fee + the plan's convenience fee, 0.2%-0.95%), via a flat split.
++// subaccount receives EXACTLY rent - (its part of Paystack's fee + the plan's convenience fee, 0.15%-0.75%), via a flat split.
++// That deduction is the COLLECTION COST. An agency bears it out of its commission, not out of the landlord's rent (see ./rentFees):
++// it is stored in full on the payment record and the transaction document so PMS can account for it per payment.
+ import * as admin from "firebase-admin";
+ import axios from "axios";
+ import { HttpsError } from "firebase-functions/v2/https";
+ import { deskDb } from "./db";
+ import { getDeskConfig } from "./config";
+ import { resolveDeskOwner } from "./owner";
+-import { rentFees, RENT_FEE_RULES } from "./rentFees";
++import { rentFees, RENT_FEE_RULES, RENT_FEE_SCHEDULE_VERSION } from "./rentFees";
+ import { checkSafaricomPhone } from "../phone/safaricom";
+ import { floorPct2, toBps } from "./money";
+ import { getOrCreateFlatSplit, type FlatSub } from "./split";
+@@ -112,6 +114,7 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
+     // collected = `amount` (the rent); the landlord is deducted, the tenant paid the surcharge on top
+     tenantFee: fees.tenantFeeMinor / 100, chargedAmount: fees.chargeMinor / 100, landlordPaystackFee: fees.landlordPaystackMinor / 100,
+     convenienceFee: fees.convenienceMinor / 100, totalDeductions: fees.deductionsMinor / 100, netPayout: fees.netPayoutMinor / 100,
++    collectionCost: fees.collectionCostMinor / 100, feeVersion: RENT_FEE_SCHEDULE_VERSION,
+   };
+   await db.collection("payments").doc(userId).collection("billingMonths").doc(billingMonth).set(
+     { payments: admin.firestore.FieldValue.arrayUnion(paymentRecord), lastUpdated: admin.firestore.FieldValue.serverTimestamp() },
+@@ -126,6 +129,8 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
+     rentMinor: fees.rentMinor, tenantFeeMinor: fees.tenantFeeMinor, chargeMinor: fees.chargeMinor,
+     paystackEstimateMinor: fees.paystackEstimateMinor, landlordPaystackMinor: fees.landlordPaystackMinor,
+     conveniencePct: fees.conveniencePct, convenienceMinor: fees.convenienceMinor, deductionsMinor: fees.deductionsMinor, netPayoutMinor: fees.netPayoutMinor, agentMinor,
++    // v2 accounting contract: what collecting this payment cost the account holder (PMS cuts it from an agency's commission)
++    collectionCostMinor: fees.collectionCostMinor, feeVersion: RENT_FEE_SCHEDULE_VERSION,
+     createdAt: admin.firestore.FieldValue.serverTimestamp(),
+   };
+   if (deskCommission) txnDoc.deskCommission = deskCommission;
+diff --git a/functions/src/desk/rentFees.ts b/functions/src/desk/rentFees.ts
+index daf681e..85b5f75 100644
+--- a/functions/src/desk/rentFees.ts
++++ b/functions/src/desk/rentFees.ts
+@@ -4,12 +4,20 @@
+  *   tenant surcharge   = min(KES 150, 0.5% of the rent)            -> added on top: the tenant pays rent + surcharge
+  *   Paystack estimate  = 1.5% of the rent (capped KES 3,000)       -> what the landlord + tenant together cover
+  *   landlord Paystack  = estimate - surcharge                      -> the part of Paystack's fee the landlord covers
+- *   convenience fee    = platform cut by the landlord's PLAN (see CONVENIENCE_PCT_BY_TIER), % of the rent
+- *                        enterprise 0.2 | pro 0.4 | business 0.65 | everyone else 0.95   -> Samuhia's fee, paid by the landlord
+- *   landlord deduction = landlord Paystack + convenience fee
+- *   net payout         = rent - landlord deduction                 -> settled EXACTLY to the landlord's subaccount
++ *   convenience fee    = platform cut by the account holder's PLAN (see CONVENIENCE_PCT_BY_TIER), % of the rent
++ *                        free 0.75 | solo 0.50 | business 0.40 | pro 0.25 | enterprise 0.15   -> Samuhia's fee
++ *   collection cost    = landlord Paystack + convenience fee       (a.k.a. `deductionsMinor`; v2 also stores it as `collectionCostMinor`)
++ *   net payout         = rent - collection cost                    -> settled EXACTLY to the account holder's subaccount
+  *
+- * Rent 50,000 (enterprise, 0.2%): tenant pays 50,150 | Paystack estimate 750 -> landlord covers 600 | convenience 100 | deduction 700 | net 49,300.
++ * WHO BEARS THE COST (fee schedule v2). The "account holder" is the PMS user whose subaccount receives the payout.
++ *   - A landlord managing their own property bears the cost: it is simply their cost of collecting rent.
++ *   - An AGENCY managing a property for a landlord bears it OUT OF ITS COMMISSION. The landlord's entitlement is
++ *     rent - commission - agreed costs, with NO transaction or platform fee in it. The payout above is therefore smaller than
++ *     the landlord's entitlement, and the gap is the agency's cost. PMS does that accounting from `collectionCostMinor`
++ *     (see PMS src/services/accounting). PAY itself does not know whether the account holder is an agency: it only fixes the
++ *     numbers and records them, so the books can be rebuilt from the transaction document alone.
++ *
++ * Rent 50,000 (enterprise, 0.15%): tenant pays 50,150 | Paystack estimate 750 -> landlord covers 600 | convenience 75 | cost 675 | net 49,325.
+  * The invoice is always credited the RENT (`rentMinor`), never the surcharge.
+  */
+ import { pctHalfUp } from "./money";
+@@ -17,16 +25,25 @@ import { pctHalfUp } from "./money";
+ export const RENT_FEE_RULES = {
+   tenantPct: 0.5, tenantCapMinor: 15_000,        // KES 150
+   paystackPct: 1.5, paystackCapMinor: 300_000,   // KES 3,000
+-  conveniencePct: 0.2,   // the enterprise (lowest) cut; what rentFees() uses when no tier is passed
++  conveniencePct: 0.15,   // the enterprise (lowest) cut; what rentFees() uses when no tier is passed
+ } as const;
+ 
+-/** Platform cut on rent, % of the rent, by the landlord's plan (users/{uid}.tier, lower-case). Anything else pays the default. */
++/** Bump when the schedule changes. Stored on every transaction (`feeVersion`) so history is never re-priced. */
++export const RENT_FEE_SCHEDULE_VERSION = 2;
++
++/**
++ * Platform cut on rent, % of the rent, by the account holder's plan (users/{uid}.tier, lower-case).
++ * The Starter plan is retired (it has no row): a legacy `starter` / `low` account, or any unknown tier, pays the Free rate.
++ * Mirrored in PMS src/services/accounting/feeSchedule.ts; functions/test/rent-flat-split.check.js and the PMS test pin both.
++ */
+ export const CONVENIENCE_PCT_BY_TIER: Readonly<Record<string, number>> = {
+-  enterprise: 0.2,
+-  pro: 0.4, professional: 0.4,
+-  business: 0.65,
++  free: 0.75,
++  solo: 0.5,
++  business: 0.4,
++  pro: 0.25, professional: 0.25,
++  enterprise: 0.15,
+ };
+-export const DEFAULT_CONVENIENCE_PCT = 0.95;   // free, starter, solo, unknown
++export const DEFAULT_CONVENIENCE_PCT = 0.75;   // free, retired starter/low, unknown
+ 
+ export function conveniencePctForTier(tier: unknown): number {
+   const key = typeof tier === "string" ? tier.trim().toLowerCase() : "";
+@@ -42,10 +59,13 @@ export interface RentFees {
+   conveniencePct: number;           // the plan's platform cut that was applied
+   convenienceMinor: number;         // conveniencePct of the rent
+   deductionsMinor: number;         // landlordPaystack + convenience
++  /** Same number as deductionsMinor, named for what it is: the cost of collecting this payment, borne by the account holder
++   *  (an agency takes it out of its commission, never out of the landlord's rent). */
++  collectionCostMinor: number;
+   netPayoutMinor: number;          // rent - deductions: exactly what the landlord's subaccount receives
+ }
+ 
+-/** `tier` = the landlord's plan. Pass it on every real charge; omitted (tests, tools) means the enterprise 0.2%. */
++/** `tier` = the account holder's plan. Pass it on every real charge; omitted (tests, tools) means the enterprise 0.15%. */
+ export function rentFees(rentMinor: number, tier?: unknown): RentFees {
+   if (!Number.isSafeInteger(rentMinor) || rentMinor <= 0) throw new RangeError("rent must be a positive integer minor unit");
+   const R = RENT_FEE_RULES;
+@@ -57,6 +77,7 @@ export function rentFees(rentMinor: number, tier?: unknown): RentFees {
+   const deductionsMinor = landlordPaystackMinor + convenienceMinor;
+   return {
+     rentMinor, tenantFeeMinor, chargeMinor: rentMinor + tenantFeeMinor, paystackEstimateMinor,
+-    landlordPaystackMinor, conveniencePct, convenienceMinor, deductionsMinor, netPayoutMinor: rentMinor - deductionsMinor,
++    landlordPaystackMinor, conveniencePct, convenienceMinor, deductionsMinor, collectionCostMinor: deductionsMinor,
++    netPayoutMinor: rentMinor - deductionsMinor,
+   };
+ }
+diff --git a/functions/src/index.ts b/functions/src/index.ts
+index fd37d53..05dd2b8 100644
+--- a/functions/src/index.ts
++++ b/functions/src/index.ts
+@@ -61,6 +61,8 @@ export {
+ import { settleTranscriptPayment, failTranscriptPayment } from "./landlordWatch/payments";
+ // Compliance reports (MRI working paper, annual rental income summary): KES 200 or one free per property per month on Business+.
+ export { crQuote, crOrder, crCheckout, crStatus, crList, crServerApi, crScheduler } from "./compliance";
++// PMS agent accounts: the account holder's own plan + SMS payments (read-only callable).
++export { pmsAccountingBilling } from "./pmsAccounting";
+ import { settleReportPayment, failReportPayment } from "./compliance/payments";
+ import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
+ import { landlordRentSms, tenantRentSms, settlementDate } from "./desk/rentSettlement";
+@@ -1369,7 +1371,7 @@ export const setupAccount = onCall({
+ 
+     // The subaccount's percentage_charge is a FALLBACK only: rent charges use a flat split (rentCharge.ts), which ignores it.
+     // It is set from the same single fee table as every real charge (rentFees.ts: the plan's platform fee), so a path that
+-    // ever used it would still charge the published rate. Unknown tiers pay the default 0.95%.
++    // ever used it would still charge the published rate. Unknown tiers pay the default 0.75%.
+     const commissionRate = conveniencePctForTier(userTier);
+ 
+     console.log(`Setting up account for user ${userId} with tier ${userTier} at ${commissionRate}%`);
+diff --git a/functions/src/landlordWatch/calc.ts b/functions/src/landlordWatch/calc.ts
+index 3feefc1..48d9e88 100644
+--- a/functions/src/landlordWatch/calc.ts
++++ b/functions/src/landlordWatch/calc.ts
+@@ -1,8 +1,9 @@
+ // The Landlord Watch calculation engine. PURE: no Firestore, no clock except `now`, no secrets. It produces the
+ // UNMASKED ("open") snapshot; mask.ts lowers it to what a given actor may see. Definitions: contract section 5.
+ //
+-// Commission is a percentage of BASE RENT only (never water, power or other charges). A part-paid invoice counts its
+-// full base rent, exactly like the PMS landlord transcript does (rentAmount of every invoice that is paid or part-paid).
++// Commission is a percentage of BASE RENT only (never water, power or other charges), and only of the base rent that was
++// really COLLECTED: money paid on an invoice settles its base rent first, then its bills (rent-first, the same allocation as
++// the PMS accounting engine: PMS src/services/accounting). A part-paid invoice therefore counts what was paid, not its full rent.
+ import { REMITTANCE_DAY, TREND_MONTHS } from "./constants";
+ import { count, dayLabel, money, monthLabel, pct, round2, shiftMonth, STR, toDay } from "./format";
+ import type {
+@@ -45,7 +46,7 @@ export function totalsFor(invoices: RawInvoice[], ratePct: number): Totals {
+     collected += i.amountPaid;
+     pending += Math.max(0, i.totalAmount - i.amountPaid);
+     baseRentBilled += i.rentAmount;
+-    if (paidAny(i)) baseRentCollected += i.rentAmount;
++    baseRentCollected += Math.min(Math.max(0, i.amountPaid), Math.max(0, i.rentAmount));   // rent-first
+   }
+   const rate = Math.max(0, ratePct) / 100;
+   return {
+@@ -139,14 +140,18 @@ export function buildOpenSnapshot(input: CalcInput): Snapshot {
+     const consistent = pays.length > 0 && Math.abs(pays.reduce((s, p) => s + p.amount, 0) - inv.amountPaid) <= 0.01;
+     // When payment records are missing or disagree with the invoice, treat the invoice total as one payment on its paid date.
+     const entries = consistent ? pays.map((p) => ({ amount: p.amount, date: p.date })) : [{ amount: inv.amountPaid, date: toDay(inv.paidDate) ?? pays[0]?.date ?? null }];
+-    const dates = entries.map((e) => e.date).filter((d): d is string => !!d).sort();
+-    const first = dates[0] ?? null;
+     // An unknown date is given the benefit of the doubt (counted as on time).
+     for (const e of entries) {
+       if (e.date === null || e.date <= due) byDue += e.amount; else afterDue += e.amount;
+     }
+-    const commission = inv.rentAmount * rate;
+-    if (first === null || first <= due) commByDue += commission; else commAfterDue += commission;
++    // Commission follows the rent actually collected: each payment settles the invoice's base rent first (in date order),
++    // and the commission on that slice belongs to the same side of the due date as the payment that collected it.
++    let rentLeft = Math.max(0, inv.rentAmount);
++    for (const e of [...entries].sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""))) {
++      const slice = Math.min(Math.max(0, e.amount), rentLeft);
++      rentLeft -= slice;
++      if (e.date === null || e.date <= due) commByDue += slice * rate; else commAfterDue += slice * rate;
++    }
+   }
+ 
+   // ---- trend: the last 6 months ending at `month` ----
+diff --git a/functions/src/pmsAccounting/billing.ts b/functions/src/pmsAccounting/billing.ts
+new file mode 100644
+index 0000000..a380142
+--- /dev/null
++++ b/functions/src/pmsAccounting/billing.ts
+@@ -0,0 +1,61 @@
++// What the PMS account holder has PAID Samuhia for the app itself: plan subscriptions and SMS credits.
++// PMS shows these as business expenses in the agent's accounts. Both source collections are server-only (Firestore rules deny
++// every client), so the PMS app reads them through the callable in ./index.ts. This file is PURE: no Firestore, no clock.
++
++export interface BillingRow {
++  kind: "subscription" | "sms";
++  reference: string;
++  /** KES actually paid (gross, what left the account holder's M-Pesa). */
++  amount: number;
++  /** ISO timestamp of the completed payment. */
++  paidAt: string;
++  planId?: string;
++  planName?: string;
++  /** How many months this payment covers, for spreading an annual plan over its year. 1 for monthly plans and SMS. */
++  periodMonths: number;
++  tokens?: number;
++}
++
++type Doc = Record<string, unknown>;
++const num = (v: unknown): number => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
++const str = (v: unknown): string => (typeof v === "string" ? v : "");
++
++/** Firestore Timestamp | Date | ISO string | millis -> ISO string ("" when unknown). */
++export function toIso(v: unknown): string {
++  if (!v) return "";
++  if (typeof v === "string") { const d = new Date(v); return Number.isNaN(d.getTime()) ? "" : d.toISOString(); }
++  if (typeof v === "number") return new Date(v).toISOString();
++  const o = v as { toDate?: () => Date; seconds?: number; _seconds?: number };
++  if (typeof o.toDate === "function") return o.toDate().toISOString();
++  const sec = o.seconds ?? o._seconds;
++  return typeof sec === "number" ? new Date(sec * 1000).toISOString() : "";
++}
++
++/** subscriptions/{SUB_…}. Paystack's real amount (kobo) wins over any amount field the writer stored. */
++export function subscriptionRow(reference: string, d: Doc): BillingRow | null {
++  if (str(d.status) !== "success") return null;
++  const resp = (d.paystackResponse ?? {}) as Doc;
++  const kes = num(resp.amount) > 0 ? num(resp.amount) / 100 : num(d.amount);
++  const paidAt = toIso(d.completedAt) || toIso(d.paidAt) || toIso(d.createdAt);
++  if (!(kes > 0) || !paidAt) return null;
++  const days = num(d.daysToAdd) || 30;
++  return {
++    kind: "subscription", reference, amount: Math.round(kes * 100) / 100, paidAt,
++    planId: str(d.planId) || undefined, planName: str(d.planName) || undefined,
++    periodMonths: days >= 300 ? 12 : Math.max(1, Math.round(days / 30)),
++  };
++}
++
++/** sms-topup-transactions/{SMS_…} (PMS top-ups only; MyRegister ones live in another project). */
++export function smsRow(reference: string, d: Doc): BillingRow | null {
++  if (str(d.status) !== "success") return null;
++  const kes = num(d.grossAmount) > 0 ? num(d.grossAmount) : num(d.amountKes) > 0 ? num(d.amountKes) : num(d.amount);
++  const paidAt = toIso(d.completedAt) || toIso(d.createdAt);
++  if (!(kes > 0) || !paidAt) return null;
++  return { kind: "sms", reference, amount: Math.round(kes * 100) / 100, paidAt, periodMonths: 1, tokens: num(d.tokens) || undefined };
++}
++
++/** Newest first, capped, so a very old account cannot return an unbounded payload. */
++export function mergeBilling(rows: Array<BillingRow | null>, cap = 500): BillingRow[] {
++  return rows.filter((r): r is BillingRow => r !== null).sort((a, b) => b.paidAt.localeCompare(a.paidAt)).slice(0, cap);
++}
+diff --git a/functions/src/pmsAccounting/index.ts b/functions/src/pmsAccounting/index.ts
+new file mode 100644
+index 0000000..12b3225
+--- /dev/null
++++ b/functions/src/pmsAccounting/index.ts
+@@ -0,0 +1,36 @@
++// pmsAccountingBilling — the signed-in PMS account holder's own plan and SMS payments, for the agent's expense accounts.
++//   request : {}                      (the caller is identified by their sign-in, never by a client-supplied id)
++//   response: { rows: BillingRow[] }  newest first
++// Read-only; it never changes anything, so it is safe to retry and safe to deploy on its own.
++import { onCall, HttpsError, type CallableRequest } from "firebase-functions/v2/https";
++import { REGION, plotDb } from "../mychama/config";
++import type * as admin from "firebase-admin";
++import { mergeBilling, smsRow, subscriptionRow, type BillingRow } from "./billing";
++
++/** Same mapping as the Firestore rules and compliance/api.ts resolveLandlordId (kept local so this function stays light: no Chromium import). */
++async function resolveLandlordId(db: admin.firestore.Firestore, auth: NonNullable<CallableRequest<unknown>["auth"]>): Promise<string> {
++  const claim = auth.token as Record<string, unknown>;
++  if (claim.role === "landlord" && typeof claim.agentId === "string" && claim.agentId) {
++    if ((await db.collection("users").doc(claim.agentId).get()).exists) return claim.agentId;
++  }
++  const byAuth = await db.collection("users").where("firebaseAuthUid", "==", auth.uid).limit(1).get();
++  if (!byAuth.empty) return byAuth.docs[0].id;
++  if ((await db.collection("users").doc(auth.uid).get()).exists) return auth.uid;
++  throw new Error("no landlord account");
++}
++
++export const pmsAccountingBilling = onCall({ region: REGION, memory: "256MiB", timeoutSeconds: 30, maxInstances: 10, cors: true },
++  async (req: CallableRequest<unknown>): Promise<{ rows: BillingRow[] }> => {
++    if (!req.auth) throw new HttpsError("unauthenticated", "Please sign in.");
++    const db = plotDb();
++    let userId: string;
++    try { userId = await resolveLandlordId(db, req.auth); } catch { throw new HttpsError("permission-denied", "No account found for this sign-in."); }
++    const [subs, sms] = await Promise.all([
++      db.collection("subscriptions").where("userId", "==", userId).where("status", "==", "success").limit(300).get(),
++      db.collection("sms-topup-transactions").where("userId", "==", userId).where("status", "==", "success").limit(300).get(),
++    ]);
++    return { rows: mergeBilling([
++      ...subs.docs.map((d) => subscriptionRow(d.id, d.data())),
++      ...sms.docs.map((d) => smsRow(d.id, d.data())),
++    ]) };
++  });
+diff --git a/functions/test/desk-money.check.js b/functions/test/desk-money.check.js
+index a6fcf6d..ac11911 100644
+--- a/functions/test/desk-money.check.js
++++ b/functions/test/desk-money.check.js
+@@ -67,14 +67,14 @@ ok("DEFAULT_DESK_CONFIG equals the kernel's defaults; mergeConfig deep-merges",
+   assert.strictEqual(m.platformCutPct, 3); assert.strictEqual(m.subShareByRank.clerk, 20); assert.strictEqual(m.subShareByRank.senior, 30);
+ });
+ 
+-ok("rent fees: 50000 -> tenant pays 50150, landlord deducted 700 (600 + 100), net 49300", () => {
++ok("rent fees: 50000 -> tenant pays 50150, landlord deducted 675 (600 + 75), net 49325", () => {
+   const f = RF.rentFees(5000000);
+   assert.deepStrictEqual([f.tenantFeeMinor, f.chargeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor],
+-    [15000, 5015000, 60000, 10000, 70000, 4930000]);
++    [15000, 5015000, 60000, 7500, 67500, 4932500]);
+ });
+-ok("rent fees: surcharge is min(150, 0.5%); small rent 10000 -> 50 / 100 / 20", () => {
++ok("rent fees: surcharge is min(150, 0.5%); small rent 10000 -> 50 / 100 / 15", () => {
+   const f = RF.rentFees(1000000);
+-  assert.deepStrictEqual([f.tenantFeeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.netPayoutMinor], [5000, 10000, 2000, 988000]);
++  assert.deepStrictEqual([f.tenantFeeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.netPayoutMinor], [5000, 10000, 1500, 988500]);
+ });
+ ok("rent fees: money always adds up, Paystack estimate capped at 3000", () => {
+   for (const r of [100, 101, 999, 12345, 800000, 3333333, 40000000, 99999999]) {
+@@ -86,13 +86,14 @@ ok("rent fees: money always adds up, Paystack estimate capped at 3000", () => {
+   assert.throws(() => RF.rentFees(0)); assert.throws(() => RF.rentFees(1.5));
+ });
+ 
+-ok("rent fees: platform cut by plan — enterprise 0.2, pro 0.4, business 0.65, everything else 0.95", () => {
++ok("rent fees: platform cut by plan — enterprise 0.15, pro 0.25, business 0.4, solo 0.5, free/retired starter/unknown 0.75", () => {
+   const cut = (tier) => RF.rentFees(1000000, tier).convenienceMinor;   // KES 10,000 rent
+-  assert.deepStrictEqual(["enterprise", "pro", "business", "solo", "starter", "free", "", undefined === 1 ? 0 : "weird"].map(cut), [2000, 4000, 6500, 9500, 9500, 9500, 9500, 9500]);
+-  assert.strictEqual(cut("PRO"), 4000); assert.strictEqual(cut(" Business "), 6500);
+-  const f = RF.rentFees(1000000, "business");   // tenant 50, landlord Paystack 100, cut 65 -> deduction 165, net 9,835
+-  assert.deepStrictEqual([f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor, f.conveniencePct], [10000, 6500, 16500, 983500, 0.65]);
+-  assert.strictEqual(RF.rentFees(1000000).conveniencePct, 0.2);   // no tier = the enterprise baseline
++  assert.deepStrictEqual(["enterprise", "pro", "business", "solo", "starter", "free", "", undefined === 1 ? 0 : "weird"].map(cut), [1500, 2500, 4000, 5000, 7500, 7500, 7500, 7500]);
++  assert.strictEqual(cut("PRO"), 2500); assert.strictEqual(cut(" Business "), 4000);
++  const f = RF.rentFees(1000000, "business");   // tenant 50, landlord Paystack 100, cut 40 -> deduction 140, net 9,860
++  assert.deepStrictEqual([f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor, f.conveniencePct], [10000, 4000, 14000, 986000, 0.4]);
++  assert.strictEqual(RF.rentFees(1000000).conveniencePct, 0.15);   // no tier = the enterprise baseline
++  assert.strictEqual(f.collectionCostMinor, f.deductionsMinor);   // v2: the same number, named for who bears it
+ });
+ ok("phones: Safaricom only; 701234567 (leading 0 lost) and every spelling format to 2547XXXXXXXX", () => {
+   const P = require(path.join(__dirname, "..", "lib", "phone", "safaricom"));
+diff --git a/functions/test/landlord-watch-calc.check.js b/functions/test/landlord-watch-calc.check.js
+index 1bfb5aa..77f2c0b 100644
+--- a/functions/test/landlord-watch-calc.check.js
++++ b/functions/test/landlord-watch-calc.check.js
+@@ -42,15 +42,15 @@ ok("invoice counts", () => {
+   assert.deepStrictEqual([s.invoices.total.v, s.invoices.paid.v, s.invoices.partial.v, s.invoices.unpaid.v, s.invoices.noInvoice.v], [4, 2, 1, 1, 1]);
+ });
+ ok("commission is on BASE RENT only", () => {
+-  assert.strictEqual(s.baseRent.billed.v, 52000); assert.strictEqual(s.baseRent.collected.v, 34000);
+-  assert.strictEqual(s.commission.onCollected.v, 3400); assert.strictEqual(s.commission.onExpected.v, 5200);
++  assert.strictEqual(s.baseRent.billed.v, 52000); assert.strictEqual(s.baseRent.collected.v, 27500);   // rent-first: iB paid 5,000 of 11,500 counts 5,000, not its full rent
++  assert.strictEqual(s.commission.onCollected.v, 2750); assert.strictEqual(s.commission.onExpected.v, 5200);
+ });
+ ok("net expected / payable / still to collect", () => {
+-  assert.strictEqual(s.net.expected.v, 51300); assert.strictEqual(s.net.payable.v, 25600); assert.strictEqual(s.net.stillToCollect.v, 25700);
++  assert.strictEqual(s.net.expected.v, 51300); assert.strictEqual(s.net.payable.v, 26250); assert.strictEqual(s.net.stillToCollect.v, 25050);
+ });
+ ok("estimate statement when the agent has no transcript", () => {
+   assert.strictEqual(s.statement.source, "estimate");
+-  assert.strictEqual(s.statement.income.v, 29000); assert.strictEqual(s.statement.deductions.v, 3400); assert.strictEqual(s.statement.netPayable.v, 25600);
++  assert.strictEqual(s.statement.income.v, 29000); assert.strictEqual(s.statement.deductions.v, 2750); assert.strictEqual(s.statement.netPayable.v, 26250);
+   assert.strictEqual(s.statement.items[1].label, "Agent commission (10% of base rent)");
+ });
+ ok("occupancy is in UNITS", () => {
+@@ -61,7 +61,7 @@ ok("remittance is by the 15th", () => {
+   const r = s.remittance;
+   assert.strictEqual(r.dueDate, "2026-10-15");
+   assert.strictEqual(r.collectedByDue.v, 20000); assert.strictEqual(r.collectedAfterDue.v, 9000);
+-  assert.strictEqual(r.netByDue.v, 17450); assert.strictEqual(r.netAfterDue.v, 8150);
++  assert.strictEqual(r.netByDue.v, 18100); assert.strictEqual(r.netAfterDue.v, 8150);
+   assert.strictEqual(r.netByDue.v + r.netAfterDue.v, s.net.payable.v);
+ });
+ ok("tenant rows: unpaid first, statuses, late flag", () => {
+@@ -72,12 +72,18 @@ ok("tenant rows: unpaid first, statuses, late flag", () => {
+ });
+ ok("trend has 6 months ending at the requested month", () => {
+   assert.strictEqual(snap.trend.length, 6); assert.strictEqual(snap.trend[5].month, "2026-10"); assert.strictEqual(snap.trend[0].month, "2026-05");
+-  assert.strictEqual(snap.trend[5].netPayable.v, 25600);
++  assert.strictEqual(snap.trend[5].netPayable.v, 26250);
+ });
+ ok("rate 0 means no commission (never 100%)", () => {
+   const z = buildOpenSnapshot({ ...base, property: { ...property, commissionRatePct: 0 } });
+   assert.strictEqual(z.summary.commission.onCollected.v, 0); assert.strictEqual(z.summary.net.payable.v, 29000);
+ });
++ok("rent-first: a part-paid invoice earns commission only on what was paid; bills come after rent", () => {
++  const one = (paid) => buildOpenSnapshot({ ...base, invoices: [inv("i1", "A", 10000, 12000, paid, "2026-10-05", null)], payments: [], tenants: [tenants[0]] }).summary;
++  assert.strictEqual(one(4000).baseRent.collected.v, 4000); assert.strictEqual(one(4000).commission.onCollected.v, 400);
++  assert.strictEqual(one(10000).baseRent.collected.v, 10000);   // rent fully paid, bills untouched
++  assert.strictEqual(one(12000).baseRent.collected.v, 10000); assert.strictEqual(one(12000).commission.onCollected.v, 1000);
++});
+ ok("a new tenant with no invoice is NOT unpaid", () => {
+   const n = buildOpenSnapshot({ ...base, invoices: [], payments: [], tenants: [tenants[4]] });
+   assert.strictEqual(n.summary.invoices.unpaid.v, 0); assert.strictEqual(n.summary.pending.v, 0); assert.strictEqual(n.tenants[0].status, "no_invoice");
+diff --git a/functions/test/pms-billing.check.js b/functions/test/pms-billing.check.js
+new file mode 100644
+index 0000000..95e74cc
+--- /dev/null
++++ b/functions/test/pms-billing.check.js
+@@ -0,0 +1,43 @@
++/* PMS agent accounts: the plan + SMS payments the account holder made (pmsAccounting/billing.ts is pure).
++ * Run:  cd functions && npm run build && node test/pms-billing.check.js   (exit 1 on failure) */
++const assert = require("assert");
++const path = require("path");
++const fs = require("fs");
++const B = require(path.join(__dirname, "..", "lib", "pmsAccounting", "billing"));
++let passed = 0, failed = 0;
++const ok = (name, fn) => { try { fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
++const ts = (iso) => ({ toDate: () => new Date(iso) });
++
++ok("a successful monthly plan payment: Paystack's real amount (kobo) wins over a stored amount", () => {
++  const r = B.subscriptionRow("SUB_1", { status: "success", amount: 1, paystackResponse: { amount: 190000 }, completedAt: ts("2026-10-03T08:00:00Z"), planId: "business", planName: "Business", daysToAdd: 30 });
++  assert.deepStrictEqual(r, { kind: "subscription", reference: "SUB_1", amount: 1900, paidAt: "2026-10-03T08:00:00.000Z", planId: "business", planName: "Business", periodMonths: 1 });
++});
++ok("an annual plan covers 12 months (so PMS spreads its cost over the year)", () => {
++  assert.strictEqual(B.subscriptionRow("SUB_2", { status: "success", amount: 19000, completedAt: "2026-01-02T00:00:00Z", daysToAdd: 365 }).periodMonths, 12);
++});
++ok("pending, failed and malformed payments are never expenses", () => {
++  assert.strictEqual(B.subscriptionRow("S", { status: "pending", amount: 1900, completedAt: "2026-10-03T00:00:00Z" }), null);
++  assert.strictEqual(B.subscriptionRow("S", { status: "failed", amount: 1900 }), null);
++  assert.strictEqual(B.subscriptionRow("S", { status: "success", amount: 0, completedAt: "2026-10-03T00:00:00Z" }), null);
++  assert.strictEqual(B.subscriptionRow("S", { status: "success", amount: 100 }), null);     // no date
++  assert.strictEqual(B.smsRow("M", { status: "pending", grossAmount: 70 }), null);
++});
++ok("SMS top-up: gross amount paid, tokens bought", () => {
++  const r = B.smsRow("SMS_1", { status: "success", grossAmount: 350, tokens: 500, completedAt: ts("2026-10-09T10:00:00Z") });
++  assert.deepStrictEqual([r.kind, r.amount, r.tokens, r.periodMonths], ["sms", 350, 500, 1]);
++});
++ok("merged newest first and capped", () => {
++  const rows = [B.smsRow("a", { status: "success", grossAmount: 1, completedAt: "2026-01-01T00:00:00Z" }), null,
++    B.smsRow("b", { status: "success", grossAmount: 1, completedAt: "2026-03-01T00:00:00Z" }), B.smsRow("c", { status: "success", grossAmount: 1, completedAt: "2026-02-01T00:00:00Z" })];
++  assert.deepStrictEqual(B.mergeBilling(rows).map((r) => r.reference), ["b", "c", "a"]);
++  assert.strictEqual(B.mergeBilling(rows, 2).length, 2);
++});
++ok("the callable identifies the caller from the sign-in only, and is read-only", () => {
++  const t = fs.readFileSync(path.join(__dirname, "..", "src", "pmsAccounting", "index.ts"), "utf8");
++  assert.ok(/if \(!req\.auth\) throw new HttpsError\("unauthenticated"/.test(t));
++  assert.ok(!/req\.data/.test(t), "must not trust a client-supplied id");
++  assert.ok(!/\.(set|update|delete|add)\(/.test(t), "must not write");
++});
++
++console.log(`\n${passed} passed, ${failed} failed`);
++process.exit(failed ? 1 : 0);
+diff --git a/functions/test/rent-flat-split.check.js b/functions/test/rent-flat-split.check.js
+index 01cf041..8494fc1 100644
+--- a/functions/test/rent-flat-split.check.js
++++ b/functions/test/rent-flat-split.check.js
+@@ -8,18 +8,30 @@ const { conveniencePctForTier, rentFees } = require(path.join(__dirname, "..", "
+ let passed = 0, failed = 0;
+ const ok = (name, fn) => { try { fn(); passed++; console.log("  ✓", name); } catch (e) { failed++; console.error("  ✗", name, "\n", e); } };
+ 
+-ok("platform fee by plan: free/starter/solo 0.95, business 0.65, pro 0.4, enterprise 0.2; unknown 0.95", () => {
+-  const want = { free: 0.95, starter: 0.95, solo: 0.95, business: 0.65, pro: 0.4, professional: 0.4, enterprise: 0.2 };
++ok("platform fee by plan (schedule v2): free 0.75, solo 0.5, business 0.4, pro 0.25, enterprise 0.15; retired starter/low and unknown pay the free rate", () => {
++  const want = { free: 0.75, solo: 0.5, business: 0.4, pro: 0.25, professional: 0.25, enterprise: 0.15, starter: 0.75, low: 0.75 };
+   for (const [t, pct] of Object.entries(want)) assert.strictEqual(conveniencePctForTier(t), pct, t);
+-  for (const t of ["", "SOLO", " Pro ", undefined, null, "toString", "__proto__"]) assert.ok([0.95, 0.4].includes(conveniencePctForTier(t)), String(t));
+-  assert.strictEqual(conveniencePctForTier("toString"), 0.95); assert.strictEqual(conveniencePctForTier("__proto__"), 0.95);
++  for (const t of ["", undefined, null, "toString", "__proto__", "constructor"]) assert.strictEqual(conveniencePctForTier(t), 0.75, String(t));
++  assert.strictEqual(conveniencePctForTier("SOLO"), 0.5); assert.strictEqual(conveniencePctForTier(" Pro "), 0.25);
+ });
+-ok("KES 10,000 rent: landlord receives 9,805 / 9,835 / 9,860 / 9,880 (starter / business / pro / enterprise)", () => {
++ok("the Starter plan has no row in the schedule", () => {
++  const { CONVENIENCE_PCT_BY_TIER } = require(path.join(__dirname, "..", "lib", "desk", "rentFees"));
++  assert.deepStrictEqual(Object.keys(CONVENIENCE_PCT_BY_TIER).sort(), ["business", "enterprise", "free", "pro", "professional", "solo"]);
++});
++ok("KES 10,000 rent: account holder receives 9,825 / 9,850 / 9,860 / 9,875 / 9,885 (free / solo / business / pro / enterprise)", () => {
+   const net = (t) => rentFees(1_000_000, t).netPayoutMinor / 100;
+-  assert.deepStrictEqual(["starter", "business", "pro", "enterprise"].map(net), [9805, 9835, 9860, 9880]);
++  assert.deepStrictEqual(["free", "solo", "business", "pro", "enterprise"].map(net), [9825, 9850, 9860, 9875, 9885]);
++  // PMS src/services/accounting/feeSchedule.ts is pinned to these SAME numbers in its own test
++});
++ok("KES 100,000 rent: the tenant surcharge is capped at 150, so the account holder's Paystack share is 1,350 (not 1,000)", () => {
++  const f = rentFees(10_000_000, "solo");
++  assert.deepStrictEqual([f.tenantFeeMinor, f.paystackEstimateMinor, f.landlordPaystackMinor, f.convenienceMinor, f.collectionCostMinor],
++    [15_000, 150_000, 135_000, 50_000, 185_000]);
+ });
+-ok("no fee is capped: KES 100,000 rent at solo takes the full 0.95%", () => {
+-  assert.strictEqual(rentFees(10_000_000, "solo").convenienceMinor, 95_000);
++ok("collection cost is stored on the charge record and the transaction document (what PMS cuts from an agency's commission)", () => {
++  const t = src("desk/rentCharge.ts");
++  assert.ok(/collectionCostMinor: fees\.collectionCostMinor, feeVersion: RENT_FEE_SCHEDULE_VERSION/.test(t));
++  assert.ok(/collectionCost: fees\.collectionCostMinor \/ 100/.test(t));
+ });
+ ok("the legacy rent-take table, its KES 250 cap path and ./desk/rent are gone from src", () => {
+   for (const f of fs.readdirSync(path.join(__dirname, "..", "src"), { recursive: true }).filter((n) => String(n).endsWith(".ts"))) {
+diff --git a/src/Firebase.tsx b/src/Firebase.tsx
+index 366e730..f0467a8 100644
+--- a/src/Firebase.tsx
++++ b/src/Firebase.tsx
+@@ -648,11 +648,12 @@ export class AgentService {
+ // Payment Service
+ export class PaymentService {
+   // Rent fee split (mirrors functions/src/desk/rentFees.ts — the server is authoritative). Integer minor units.
+-  //   tenant pays rent + min(KES 150, 0.5%); landlord covers the rest of Paystack's ~1.5% plus a 0.2% convenience fee.
+-    // Platform cut by the landlord's plan (mirrors functions/src/desk/rentFees.ts): enterprise 0.2, pro 0.4, business 0.65, else 0.95
++  //   tenant pays rent + min(KES 150, 0.5%); the account holder covers the rest of Paystack's ~1.5% plus the plan's platform fee (0.15%-0.75%).
++  // Platform cut by the account holder's plan (mirrors functions/src/desk/rentFees.ts, fee schedule v2):
++  // free 0.75, solo 0.50, business 0.40, pro 0.25, enterprise 0.15. The retired Starter plan and unknown plans pay the Free rate.
+   static conveniencePctForTier(tier?: string): number {
+     const t = String(tier ?? '').trim().toLowerCase();
+-    return t === 'enterprise' ? 0.2 : (t === 'pro' || t === 'professional') ? 0.4 : t === 'business' ? 0.65 : 0.95;
++    return t === 'enterprise' ? 0.15 : (t === 'pro' || t === 'professional') ? 0.25 : t === 'business' ? 0.4 : t === 'solo' ? 0.5 : 0.75;
+   }
+ 
+   static calculateFees(amount: number, invoiceBalance: number, tier?: string): {

@@ -648,11 +648,12 @@ export class AgentService {
 // Payment Service
 export class PaymentService {
   // Rent fee split (mirrors functions/src/desk/rentFees.ts — the server is authoritative). Integer minor units.
-  //   tenant pays rent + min(KES 150, 0.5%); landlord covers the rest of Paystack's ~1.5% plus a 0.2% convenience fee.
-    // Platform cut by the landlord's plan (mirrors functions/src/desk/rentFees.ts): enterprise 0.2, pro 0.4, business 0.65, else 0.95
+  //   tenant pays rent + min(KES 150, 0.5%); the account holder covers the rest of Paystack's ~1.5% plus the plan's platform fee (0.15%-0.75%).
+  // Platform cut by the account holder's plan (mirrors functions/src/desk/rentFees.ts, fee schedule v2):
+  // free 0.75, solo 0.50, business 0.40, pro 0.25, enterprise 0.15. The retired Starter plan and unknown plans pay the Free rate.
   static conveniencePctForTier(tier?: string): number {
     const t = String(tier ?? '').trim().toLowerCase();
-    return t === 'enterprise' ? 0.2 : (t === 'pro' || t === 'professional') ? 0.4 : t === 'business' ? 0.65 : 0.95;
+    return t === 'enterprise' ? 0.15 : (t === 'pro' || t === 'professional') ? 0.25 : t === 'business' ? 0.4 : t === 'solo' ? 0.5 : 0.75;
   }
 
   static calculateFees(amount: number, invoiceBalance: number, tier?: string): {

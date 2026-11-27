@@ -42,15 +42,15 @@ ok("invoice counts", () => {
   assert.deepStrictEqual([s.invoices.total.v, s.invoices.paid.v, s.invoices.partial.v, s.invoices.unpaid.v, s.invoices.noInvoice.v], [4, 2, 1, 1, 1]);
 });
 ok("commission is on BASE RENT only", () => {
-  assert.strictEqual(s.baseRent.billed.v, 52000); assert.strictEqual(s.baseRent.collected.v, 34000);
-  assert.strictEqual(s.commission.onCollected.v, 3400); assert.strictEqual(s.commission.onExpected.v, 5200);
+  assert.strictEqual(s.baseRent.billed.v, 52000); assert.strictEqual(s.baseRent.collected.v, 27500);   // rent-first: iB paid 5,000 of 11,500 counts 5,000, not its full rent
+  assert.strictEqual(s.commission.onCollected.v, 2750); assert.strictEqual(s.commission.onExpected.v, 5200);
 });
 ok("net expected / payable / still to collect", () => {
-  assert.strictEqual(s.net.expected.v, 51300); assert.strictEqual(s.net.payable.v, 25600); assert.strictEqual(s.net.stillToCollect.v, 25700);
+  assert.strictEqual(s.net.expected.v, 51300); assert.strictEqual(s.net.payable.v, 26250); assert.strictEqual(s.net.stillToCollect.v, 25050);
 });
 ok("estimate statement when the agent has no transcript", () => {
   assert.strictEqual(s.statement.source, "estimate");
-  assert.strictEqual(s.statement.income.v, 29000); assert.strictEqual(s.statement.deductions.v, 3400); assert.strictEqual(s.statement.netPayable.v, 25600);
+  assert.strictEqual(s.statement.income.v, 29000); assert.strictEqual(s.statement.deductions.v, 2750); assert.strictEqual(s.statement.netPayable.v, 26250);
   assert.strictEqual(s.statement.items[1].label, "Agent commission (10% of base rent)");
 });
 ok("occupancy is in UNITS", () => {
@@ -61,7 +61,7 @@ ok("remittance is by the 15th", () => {
   const r = s.remittance;
   assert.strictEqual(r.dueDate, "2026-10-15");
   assert.strictEqual(r.collectedByDue.v, 20000); assert.strictEqual(r.collectedAfterDue.v, 9000);
-  assert.strictEqual(r.netByDue.v, 17450); assert.strictEqual(r.netAfterDue.v, 8150);
+  assert.strictEqual(r.netByDue.v, 18100); assert.strictEqual(r.netAfterDue.v, 8150);
   assert.strictEqual(r.netByDue.v + r.netAfterDue.v, s.net.payable.v);
 });
 ok("tenant rows: unpaid first, statuses, late flag", () => {
@@ -72,11 +72,17 @@ ok("tenant rows: unpaid first, statuses, late flag", () => {
 });
 ok("trend has 6 months ending at the requested month", () => {
   assert.strictEqual(snap.trend.length, 6); assert.strictEqual(snap.trend[5].month, "2026-10"); assert.strictEqual(snap.trend[0].month, "2026-05");
-  assert.strictEqual(snap.trend[5].netPayable.v, 25600);
+  assert.strictEqual(snap.trend[5].netPayable.v, 26250);
 });
 ok("rate 0 means no commission (never 100%)", () => {
   const z = buildOpenSnapshot({ ...base, property: { ...property, commissionRatePct: 0 } });
   assert.strictEqual(z.summary.commission.onCollected.v, 0); assert.strictEqual(z.summary.net.payable.v, 29000);
+});
+ok("rent-first: a part-paid invoice earns commission only on what was paid; bills come after rent", () => {
+  const one = (paid) => buildOpenSnapshot({ ...base, invoices: [inv("i1", "A", 10000, 12000, paid, "2026-10-05", null)], payments: [], tenants: [tenants[0]] }).summary;
+  assert.strictEqual(one(4000).baseRent.collected.v, 4000); assert.strictEqual(one(4000).commission.onCollected.v, 400);
+  assert.strictEqual(one(10000).baseRent.collected.v, 10000);   // rent fully paid, bills untouched
+  assert.strictEqual(one(12000).baseRent.collected.v, 10000); assert.strictEqual(one(12000).commission.onCollected.v, 1000);
 });
 ok("a new tenant with no invoice is NOT unpaid", () => {
   const n = buildOpenSnapshot({ ...base, invoices: [], payments: [], tenants: [tenants[4]] });

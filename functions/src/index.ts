@@ -61,6 +61,8 @@ export {
 import { settleTranscriptPayment, failTranscriptPayment } from "./landlordWatch/payments";
 // Compliance reports (MRI working paper, annual rental income summary): KES 200 or one free per property per month on Business+.
 export { crQuote, crOrder, crCheckout, crStatus, crList, crServerApi, crScheduler } from "./compliance";
+// PMS agent accounts: the account holder's own plan + SMS payments (read-only callable).
+export { pmsAccountingBilling } from "./pmsAccounting";
 import { settleReportPayment, failReportPayment } from "./compliance/payments";
 import { planDeskSmsCharge, recordSmsPurchaseEvent, releaseSmsReservationFor, releaseFirstPurchaseReservation } from "./desk/sms";
 import { landlordRentSms, tenantRentSms, settlementDate } from "./desk/rentSettlement";
@@ -1369,7 +1371,7 @@ export const setupAccount = onCall({
 
     // The subaccount's percentage_charge is a FALLBACK only: rent charges use a flat split (rentCharge.ts), which ignores it.
     // It is set from the same single fee table as every real charge (rentFees.ts: the plan's platform fee), so a path that
-    // ever used it would still charge the published rate. Unknown tiers pay the default 0.95%.
+    // ever used it would still charge the published rate. Unknown tiers pay the default 0.75%.
     const commissionRate = conveniencePctForTier(userTier);
 
     console.log(`Setting up account for user ${userId} with tier ${userTier} at ${commissionRate}%`);

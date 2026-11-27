@@ -67,14 +67,14 @@ ok("DEFAULT_DESK_CONFIG equals the kernel's defaults; mergeConfig deep-merges", 
   assert.strictEqual(m.platformCutPct, 3); assert.strictEqual(m.subShareByRank.clerk, 20); assert.strictEqual(m.subShareByRank.senior, 30);
 });
 
-ok("rent fees: 50000 -> tenant pays 50150, landlord deducted 700 (600 + 100), net 49300", () => {
+ok("rent fees: 50000 -> tenant pays 50150, landlord deducted 675 (600 + 75), net 49325", () => {
   const f = RF.rentFees(5000000);
   assert.deepStrictEqual([f.tenantFeeMinor, f.chargeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor],
-    [15000, 5015000, 60000, 10000, 70000, 4930000]);
+    [15000, 5015000, 60000, 7500, 67500, 4932500]);
 });
-ok("rent fees: surcharge is min(150, 0.5%); small rent 10000 -> 50 / 100 / 20", () => {
+ok("rent fees: surcharge is min(150, 0.5%); small rent 10000 -> 50 / 100 / 15", () => {
   const f = RF.rentFees(1000000);
-  assert.deepStrictEqual([f.tenantFeeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.netPayoutMinor], [5000, 10000, 2000, 988000]);
+  assert.deepStrictEqual([f.tenantFeeMinor, f.landlordPaystackMinor, f.convenienceMinor, f.netPayoutMinor], [5000, 10000, 1500, 988500]);
 });
 ok("rent fees: money always adds up, Paystack estimate capped at 3000", () => {
   for (const r of [100, 101, 999, 12345, 800000, 3333333, 40000000, 99999999]) {
@@ -86,13 +86,14 @@ ok("rent fees: money always adds up, Paystack estimate capped at 3000", () => {
   assert.throws(() => RF.rentFees(0)); assert.throws(() => RF.rentFees(1.5));
 });
 
-ok("rent fees: platform cut by plan — enterprise 0.2, pro 0.4, business 0.65, everything else 0.95", () => {
+ok("rent fees: platform cut by plan — enterprise 0.15, pro 0.25, business 0.4, solo 0.5, free/retired starter/unknown 0.75", () => {
   const cut = (tier) => RF.rentFees(1000000, tier).convenienceMinor;   // KES 10,000 rent
-  assert.deepStrictEqual(["enterprise", "pro", "business", "solo", "starter", "free", "", undefined === 1 ? 0 : "weird"].map(cut), [2000, 4000, 6500, 9500, 9500, 9500, 9500, 9500]);
-  assert.strictEqual(cut("PRO"), 4000); assert.strictEqual(cut(" Business "), 6500);
-  const f = RF.rentFees(1000000, "business");   // tenant 50, landlord Paystack 100, cut 65 -> deduction 165, net 9,835
-  assert.deepStrictEqual([f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor, f.conveniencePct], [10000, 6500, 16500, 983500, 0.65]);
-  assert.strictEqual(RF.rentFees(1000000).conveniencePct, 0.2);   // no tier = the enterprise baseline
+  assert.deepStrictEqual(["enterprise", "pro", "business", "solo", "starter", "free", "", undefined === 1 ? 0 : "weird"].map(cut), [1500, 2500, 4000, 5000, 7500, 7500, 7500, 7500]);
+  assert.strictEqual(cut("PRO"), 2500); assert.strictEqual(cut(" Business "), 4000);
+  const f = RF.rentFees(1000000, "business");   // tenant 50, landlord Paystack 100, cut 40 -> deduction 140, net 9,860
+  assert.deepStrictEqual([f.landlordPaystackMinor, f.convenienceMinor, f.deductionsMinor, f.netPayoutMinor, f.conveniencePct], [10000, 4000, 14000, 986000, 0.4]);
+  assert.strictEqual(RF.rentFees(1000000).conveniencePct, 0.15);   // no tier = the enterprise baseline
+  assert.strictEqual(f.collectionCostMinor, f.deductionsMinor);   // v2: the same number, named for who bears it
 });
 ok("phones: Safaricom only; 701234567 (leading 0 lost) and every spelling format to 2547XXXXXXXX", () => {
   const P = require(path.join(__dirname, "..", "lib", "phone", "safaricom"));

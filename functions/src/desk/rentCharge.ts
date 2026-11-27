@@ -1,14 +1,16 @@
 // The ONE function that starts a rent STK push. processPayment (landlord / tenant initiated) calls it, and so will the
 // desk-initiated batch runner. Extracted from processPayment — the Paystack call, the records and the payload are the
 // same; what changed is the money: see ./rentFees — the tenant is charged rent + a capped surcharge, the landlord's
-// subaccount receives EXACTLY rent - (its part of Paystack's fee + the plan's convenience fee, 0.2%-0.95%), via a flat split.
+// subaccount receives EXACTLY rent - (its part of Paystack's fee + the plan's convenience fee, 0.15%-0.75%), via a flat split.
+// That deduction is the COLLECTION COST. An agency bears it out of its commission, not out of the landlord's rent (see ./rentFees):
+// it is stored in full on the payment record and the transaction document so PMS can account for it per payment.
 import * as admin from "firebase-admin";
 import axios from "axios";
 import { HttpsError } from "firebase-functions/v2/https";
 import { deskDb } from "./db";
 import { getDeskConfig } from "./config";
 import { resolveDeskOwner } from "./owner";
-import { rentFees, RENT_FEE_RULES } from "./rentFees";
+import { rentFees, RENT_FEE_RULES, RENT_FEE_SCHEDULE_VERSION } from "./rentFees";
 import { checkSafaricomPhone } from "../phone/safaricom";
 import { floorPct2, toBps } from "./money";
 import { getOrCreateFlatSplit, type FlatSub } from "./split";
@@ -112,6 +114,7 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
     // collected = `amount` (the rent); the landlord is deducted, the tenant paid the surcharge on top
     tenantFee: fees.tenantFeeMinor / 100, chargedAmount: fees.chargeMinor / 100, landlordPaystackFee: fees.landlordPaystackMinor / 100,
     convenienceFee: fees.convenienceMinor / 100, totalDeductions: fees.deductionsMinor / 100, netPayout: fees.netPayoutMinor / 100,
+    collectionCost: fees.collectionCostMinor / 100, feeVersion: RENT_FEE_SCHEDULE_VERSION,
   };
   await db.collection("payments").doc(userId).collection("billingMonths").doc(billingMonth).set(
     { payments: admin.firestore.FieldValue.arrayUnion(paymentRecord), lastUpdated: admin.firestore.FieldValue.serverTimestamp() },
@@ -126,6 +129,8 @@ export async function initiateRentCharge(input: RentChargeInput): Promise<RentCh
     rentMinor: fees.rentMinor, tenantFeeMinor: fees.tenantFeeMinor, chargeMinor: fees.chargeMinor,
     paystackEstimateMinor: fees.paystackEstimateMinor, landlordPaystackMinor: fees.landlordPaystackMinor,
     conveniencePct: fees.conveniencePct, convenienceMinor: fees.convenienceMinor, deductionsMinor: fees.deductionsMinor, netPayoutMinor: fees.netPayoutMinor, agentMinor,
+    // v2 accounting contract: what collecting this payment cost the account holder (PMS cuts it from an agency's commission)
+    collectionCostMinor: fees.collectionCostMinor, feeVersion: RENT_FEE_SCHEDULE_VERSION,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
   if (deskCommission) txnDoc.deskCommission = deskCommission;
